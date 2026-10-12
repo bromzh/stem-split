@@ -1,18 +1,36 @@
-[package]
-name = "stem-split"
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+# Standalone experiments with their own dependencies and lock files.
+exclude = ["spikes"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+publish = false
 
-[dependencies]
+[workspace.dependencies]
+stem-split-core = { path = "crates/core" }
+# The glow (OpenGL) renderer instead of the default wgpu: for a form-like UI it
+# halves the binary and uses a fraction of the memory. See docs/ARCHITECTURE.md.
+eframe = { version = "0.36", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+tempfile = "3"
+thiserror = "2"
 
 # Enforced project rules, see docs/GUIDELINES.md.
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # No panics: every fallible operation goes through `Result`/`Option`.
 unwrap_used = "deny"

@@ -1,0 +1,13 @@
+[package]
+name = "stem-split"
+description = "Desktop application for splitting audio into stems."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+stem-split-core.workspace = true
+eframe.workspace = true
+
+[lints]
+workspace = true
