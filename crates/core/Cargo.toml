@@ -6,6 +6,10 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+hound.workspace = true
+log.workspace = true
+rubato.workspace = true
+symphonia.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

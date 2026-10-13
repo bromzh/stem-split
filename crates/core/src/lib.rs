@@ -3,4 +3,7 @@
 //! The crate has no GUI dependencies: it takes validated requests and reports
 //! typed progress, results and errors, leaving presentation to the caller.
 
+pub mod audio;
 pub mod domain;
+
+mod partial;

@@ -20,6 +20,24 @@ eframe = { version = "0.36", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+hound = "3.5"
+log = "0.4"
+rubato = "5"
+# Only the containers and codecs behind `AudioFormat`; the default set lacks
+# MP3 and AAC and brings formats the application does not offer.
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac",
+    "alac",
+    "all-meta",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "opt-simd",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
 tempfile = "3"
 thiserror = "2"
 
