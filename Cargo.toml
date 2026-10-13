@@ -20,9 +20,12 @@ eframe = { version = "0.36", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+directories = "6"
+hex-literal = "1"
 hound = "3.5"
 log = "0.4"
 rubato = "5"
+sha2 = "0.11"
 # Only the containers and codecs behind `AudioFormat`; the default set lacks
 # MP3 and AAC and brings formats the application does not offer.
 symphonia = { version = "0.6", default-features = false, features = [
@@ -40,6 +43,13 @@ symphonia = { version = "0.6", default-features = false, features = [
 ] }
 tempfile = "3"
 thiserror = "2"
+# rustls with the operating system's certificate verifier: self-contained to
+# build, yet honours certificates installed on the machine. No gzip: the
+# only downloads are binary model files.
+ureq = { version = "3", default-features = false, features = [
+    "platform-verifier",
+    "rustls",
+] }
 
 # Enforced project rules, see docs/GUIDELINES.md.
 [workspace.lints.rust]

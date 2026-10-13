@@ -5,5 +5,9 @@
 
 pub mod audio;
 pub mod domain;
+pub mod model;
 
+mod cancel;
 mod partial;
+
+pub use cancel::CancelToken;
