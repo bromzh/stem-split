@@ -5,7 +5,9 @@
 
 pub mod audio;
 pub mod domain;
+pub mod job;
 pub mod model;
+pub mod separate;
 
 mod cancel;
 mod partial;

@@ -146,6 +146,17 @@ pub struct LocalModel {
 }
 
 impl LocalModel {
+    #[must_use]
+    pub const fn first(&self) -> &LocalGraph {
+        &self.first
+    }
+
+    /// The graphs after the first.
+    #[must_use]
+    pub fn rest(&self) -> &[LocalGraph] {
+        &self.rest
+    }
+
     /// Graphs in the order they are run.
     pub fn graphs(&self) -> impl Iterator<Item = &LocalGraph> {
         iter::once(&self.first).chain(&self.rest)

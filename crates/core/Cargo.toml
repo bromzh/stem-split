@@ -10,11 +10,17 @@ directories.workspace = true
 hex-literal.workspace = true
 hound.workspace = true
 log.workspace = true
+ort.workspace = true
+realfft.workspace = true
 rubato.workspace = true
 sha2.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ort = { workspace = true, features = ["directml"] }
+ort-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

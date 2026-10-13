@@ -24,6 +24,22 @@ directories = "6"
 hex-literal = "1"
 hound = "3.5"
 log = "0.4"
+# Still a release candidate, so the version is pinned exactly. ONNX Runtime is
+# downloaded at build time and linked statically; `copy-dylibs` places the
+# DirectML library next to the binaries. The `directml` feature is added for
+# Windows in crates/core/Cargo.toml.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "api-27",
+    "copy-dylibs",
+    "download-binaries",
+    "std",
+    "tls-rustls",
+] }
+# Not used from code. Depending on it directly makes Cargo run its build
+# script, which downloads DirectML.dll, before the build script of the core
+# crate, which copies that file next to test and example binaries.
+ort-sys = { version = "=2.0.0-rc.13", default-features = false }
+realfft = "3.5"
 rubato = "5"
 sha2 = "0.11"
 # Only the containers and codecs behind `AudioFormat`; the default set lacks
