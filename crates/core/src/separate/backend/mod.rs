@@ -17,7 +17,7 @@ use super::{
     CHANNELS, ChunkStems, SEGMENT_FRAMES, Segment, Separator,
     stft::{self, BINS, Stft, StftError},
 };
-use crate::domain::{Stem, StemLayout};
+use crate::domain::{Stem, StemLayout, macros::closed_enum};
 
 /// Input: normalized waveform, `[1, 2, SEGMENT_FRAMES]`.
 const MIX: &str = "mix";
@@ -49,15 +49,17 @@ const PLAUSIBLE_GAIN: f64 = 10.0;
 /// noise floor dominates, are not rejected.
 const PLAUSIBLE_FLOOR: f64 = 1.0;
 
-/// Which device the user wants the model to run on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DevicePreference {
-    /// The GPU if it works, otherwise the CPU.
-    #[default]
-    Auto,
-    /// The GPU; fail if it cannot be used.
-    Gpu,
-    Cpu,
+closed_enum! {
+    /// Which device the user wants the model to run on.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum DevicePreference {
+        /// The GPU if it works, otherwise the CPU.
+        #[default]
+        Auto,
+        /// The GPU; fail if it cannot be used.
+        Gpu,
+        Cpu,
+    }
 }
 
 /// The device a model actually runs on.

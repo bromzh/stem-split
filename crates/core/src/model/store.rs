@@ -108,6 +108,11 @@ pub struct DownloadProgress {
 
 impl DownloadProgress {
     #[must_use]
+    pub const fn new(downloaded: ByteCount, total: ByteCount) -> Self {
+        Self { downloaded, total }
+    }
+
+    #[must_use]
     pub const fn downloaded(self) -> ByteCount {
         self.downloaded
     }
@@ -332,10 +337,7 @@ impl ModelStore {
         for graph in missing {
             let mut on_block = |bytes: u64| {
                 downloaded = downloaded.saturating_add(bytes);
-                on_progress(DownloadProgress {
-                    downloaded: ByteCount::new(downloaded),
-                    total,
-                });
+                on_progress(DownloadProgress::new(ByteCount::new(downloaded), total));
             };
             match self.download(graph, &mut on_block, cancel)? {
                 Fetch::Complete => {}

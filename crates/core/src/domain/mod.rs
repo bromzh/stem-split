@@ -8,7 +8,7 @@ mod audio_format;
 mod digest;
 mod frames;
 mod input;
-mod macros;
+pub(crate) mod macros;
 mod model;
 mod output;
 mod stem;

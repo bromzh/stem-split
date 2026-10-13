@@ -38,8 +38,10 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
 # Not used from code. Depending on it directly makes Cargo run its build
 # script, which downloads DirectML.dll, before the build script of the core
 # crate, which copies that file next to test and example binaries.
+open = "5"
 ort-sys = { version = "=2.0.0-rc.13", default-features = false }
 realfft = "3.5"
+rfd = "0.17"
 rubato = "5"
 sha2 = "0.11"
 # Only the containers and codecs behind `AudioFormat`; the default set lacks

@@ -8,6 +8,12 @@ publish.workspace = true
 [dependencies]
 stem-split-core.workspace = true
 eframe.workspace = true
+log.workspace = true
+open.workspace = true
+rfd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
