@@ -275,7 +275,7 @@ mod tests {
 
         assert_eq!(end, PassEnd::Cancelled);
         assert_eq!(separator.calls, 0);
-        assert!(output.is_empty());
+        assert_eq!(output, Vec::<[f32; 2]>::new());
         Ok(())
     }
 

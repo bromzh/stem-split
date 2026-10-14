@@ -266,7 +266,7 @@ impl OrtSeparator {
         mix.extend_from_slice(segment.left());
         mix.extend_from_slice(segment.right());
 
-        let mut planes = spectrogram.chunks_exact_mut(PLANE);
+        let mut planes = spectrogram.as_chunks_mut::<PLANE>().0.iter_mut();
         let (Some(left_real), Some(left_imaginary), Some(right_real), Some(right_imaginary)) =
             (planes.next(), planes.next(), planes.next(), planes.next())
         else {
@@ -319,8 +319,11 @@ impl OrtSeparator {
         let mut samples = wav.to_vec();
         let (plane_pairs, _) = spectral.as_chunks::<PLANE>();
         let (channel_planes, _) = plane_pairs.as_chunks::<2>();
-        for (channel, [real, imaginary]) in
-            samples.chunks_exact_mut(SEGMENT_FRAMES).zip(channel_planes)
+        for (channel, [real, imaginary]) in samples
+            .as_chunks_mut::<SEGMENT_FRAMES>()
+            .0
+            .iter_mut()
+            .zip(channel_planes)
         {
             stft.inverse(real, imaginary, restored)?;
             for (sample, &spectral_part) in channel.iter_mut().zip(restored.iter()) {
@@ -412,7 +415,9 @@ fn is_plausible(segment: &Segment, stems: &ChunkStems) -> bool {
     let limit = PLAUSIBLE_GAIN * mix + PLAUSIBLE_FLOOR;
     stems
         .samples()
-        .chunks_exact(CHANNELS * SEGMENT_FRAMES)
+        .as_chunks::<{ CHANNELS * SEGMENT_FRAMES }>()
+        .0
+        .iter()
         .all(|stem| {
             // A non-finite sample makes the level NaN, which fails the comparison.
             rms(stem.iter().copied()) <= limit

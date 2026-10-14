@@ -476,7 +476,7 @@ mod tests {
     fn existing_outputs_lists_only_files_that_are_there() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let request = request_in(directory.path(), ModelId::Htdemucs, OverwritePolicy::Refuse)?;
-        assert!(request.existing_outputs().is_empty());
+        assert_eq!(request.existing_outputs(), Vec::<PathBuf>::new());
 
         fs::write(request.stem_path(Stem::Bass), b"old")?;
         // A stem this model does not produce is not an output of the job.

@@ -97,7 +97,7 @@ mod tests {
         let tags: HashSet<&str> = Stem::ALL.iter().map(|stem| stem.file_tag()).collect();
         assert_eq!(tags.len(), Stem::ALL.len());
         for tag in tags {
-            assert!(!tag.is_empty());
+            assert_ne!(tag, "");
             assert!(tag.bytes().all(|byte| byte.is_ascii_lowercase()));
         }
     }

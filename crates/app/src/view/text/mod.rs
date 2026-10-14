@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(codes.len(), Locale::ALL.len());
         for &locale in Locale::ALL {
             assert_eq!(Locale::from_code(locale.code()), Some(locale));
-            assert!(!locale.name().is_empty());
+            assert_ne!(locale.name(), "");
         }
         assert_eq!(Locale::from_code("de"), None);
         assert_eq!(Locale::from_code(""), None);
@@ -836,7 +836,7 @@ mod tests {
             let advice = failure(locale, &unsupported()).summary;
             let processor = device_preference(locale, DevicePreference::Cpu);
             assert!(advice.contains(processor), "{locale:?}: {advice}");
-            assert!(!failure(locale, &no_cache()).summary.is_empty());
+            assert_ne!(failure(locale, &no_cache()).summary, "");
         }
     }
 }

@@ -486,7 +486,7 @@ mod tests {
 
         assert_eq!(app.locale, Locale::Ru);
         assert_eq!(app.screen.form().settings(app.locale), settings);
-        assert!(inputs_of(&app.screen).is_empty());
+        assert_eq!(inputs_of(&app.screen), Vec::<&std::path::Path>::new());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Простое настольное приложение для разделения аудио на стемы: вокал, ударные, бас и остальное. Написано на Rust с интерфейсом на egui. Нейросеть работает локально, файлы никуда не отправляются.
 
-> **Статус:** все этапы плана выполнены. Приложение работает и собирается в архив для Windows. Ход работ — в [docs/PLAN.md](docs/PLAN.md).
+> **Статус:** все этапы плана выполнены. Приложение собирается в архив для Windows и DMG для macOS на Apple Silicon. Ход работ — в [docs/PLAN.md](docs/PLAN.md).
 
 ## Что умеет
 
@@ -23,11 +23,11 @@
 
 Ограничения: моно и стерео, длительность до 3 часов. У файлов M4A (AAC) результат может начинаться на 20–50 мс позже, чем исходник в других программах: используемый декодер не убирает задержку кодировщика.
 
-Модель скачивается при первом использовании и сохраняется в кэше: `htdemucs` — 169 МБ, `htdemucs_6s` — 110 МБ, `htdemucs_ft` — 675 МБ. Каждый файл проверяется по SHA-256. На Windows кэш лежит в `%LOCALAPPDATA%\stem-split\cache\models`.
+Модель скачивается при первом использовании и сохраняется в кэше: `htdemucs` — 169 МБ, `htdemucs_6s` — 110 МБ, `htdemucs_ft` — 675 МБ. Каждый файл проверяется по SHA-256. На Windows кэш лежит в `%LOCALAPPDATA%\stem-split\cache\models`, на macOS — в `~/Library/Caches/stem-split/models`.
 
 ## Как это устроено
 
-Инференс идёт через [ONNX Runtime](https://onnxruntime.ai/) на моделях [HTDemucs](https://github.com/facebookresearch/demucs) в виде [ONNX-экспорта](https://huggingface.co/HRSadeghi/demucs-onnx). На Windows используется видеокарта через DirectML, при её отсутствии — процессор. Python и ffmpeg не нужны.
+Инференс идёт через [ONNX Runtime](https://onnxruntime.ai/) на моделях [HTDemucs](https://github.com/facebookresearch/demucs) в виде [ONNX-экспорта](https://huggingface.co/HRSadeghi/demucs-onnx). На Windows используется видеокарта через DirectML, на macOS — CoreML с доступом к GPU и Neural Engine. При отказе ускорения обработка переходит на процессор. CoreML может выполнять часть графа на CPU; ускорение зависит от модели. Python и ffmpeg не нужны.
 
 На тестовой машине (Ryzen 5 2600, GTX 1660 SUPER) трек длиной 106 секунд моделью `htdemucs` делится за 13 с на видеокарте и за 55 с на процессоре; `htdemucs_ft` на видеокарте — за 39 с.
 
@@ -41,9 +41,23 @@ cargo run --release -p stem-split-core --example separate -- song.flac --model h
 
 ## Требования
 
-- Windows 10 или 11, 64 бита. Код пишется переносимым, но другие системы пока не проверяются.
-- Для ускорения — видеокарта с поддержкой DirectX 12. Без неё обработка идёт на процессоре и занимает больше времени.
+- Windows 10 или 11, 64 бита, либо macOS 12 или новее на Apple Silicon (M1 и новее). Готовая macOS-сборка не поддерживает Intel; Linux пока не проверяется.
+- Для ускорения на Windows — видеокарта с поддержкой DirectX 12; на macOS — CoreML. Без ускорения обработка идёт на процессоре и занимает больше времени.
 - Для сборки — Rust 1.96 или новее.
+
+## Установка готовой версии
+
+Скачайте пакет своей платформы из [GitHub Releases](https://github.com/bromzh/stem-split/releases).
+
+На Windows распакуйте ZIP и оставьте все файлы рядом с `stem-split.exe`.
+
+На macOS откройте DMG, перетащите `stem-split.app` на ярлык Applications, извлеките образ и запустите приложение из «Программы». В DMG есть `README.txt` с инструкцией на английском и русском. Сборка подписана ad-hoc, но не сертификатом Apple Developer ID и не нотариализована, поэтому Gatekeeper может её заблокировать:
+
+1. Попробуйте открыть установленное приложение.
+2. В macOS 13 и новее откройте «Системные настройки → Конфиденциальность и безопасность», в macOS 12 — «Защита и безопасность → Основные».
+3. У сообщения о stem-split нажмите «Всё равно открыть» (`Open Anyway`) и подтвердите запуск.
+
+Если проверенная загрузка всё ещё блокируется как «повреждённая», в `README.txt` описано снятие quarantine только с этого приложения. Не отключайте Gatekeeper глобально.
 
 ## Сборка и запуск
 
@@ -54,6 +68,7 @@ cargo run --release
 Файл можно передать сразу: `cargo run --release -- song.flac`.
 
 ## Сборка релиза
+### Windows
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\package.ps1
@@ -63,13 +78,23 @@ powershell -ExecutionPolicy Bypass -File tools\package.ps1
 
 Для упаковки нужна Visual Studio или Build Tools: оттуда берутся библиотеки Visual C++.
 
+### macOS (Apple Silicon)
+
+```sh
+bash tools/package-macos.sh
+```
+
+Нужны Rust и Xcode Command Line Tools (`xcode-select --install`). Скрипт запускается на Apple Silicon без Rosetta, собирает с `--locked` для `aarch64-apple-darwin` и создаёт `dist/stem-split-<версия>-macos-arm64.dmg` и файл `.dmg.sha256`. Внутри DMG — `stem-split.app`, ярлык Applications, лицензия и двуязычная инструкция по установке и Gatekeeper.
+
+В `.app` один исполняемый файл: ONNX Runtime встроен статически, отдельные сторонние dylib не нужны. Скрипт проверяет зависимости и ad-hoc подпись; нотариализация Apple не выполняется. Модели в пакет не входят и скачиваются при первом использовании.
+
 Где приложение хранит своё:
 
-| Что | Где |
-|---|---|
-| Модели | `%LOCALAPPDATA%\stem-split\cache\models` |
-| Настройки и положение окна | `%APPDATA%\stem-split\data\app.ron` |
-| Журнал последнего запуска | `%LOCALAPPDATA%\stem-split\data\stem-split.log` |
+| Что | Windows | macOS |
+|---|---|---|
+| Модели | `%LOCALAPPDATA%\stem-split\cache\models` | `~/Library/Caches/stem-split/models` |
+| Настройки и положение окна | `%APPDATA%\stem-split\data\app.ron` | `~/Library/Application Support/stem-split/app.ron` |
+| Журнал последнего запуска | `%LOCALAPPDATA%\stem-split\data\stem-split.log` | `~/Library/Application Support/stem-split/stem-split.log` |
 
 ## Разработка
 
