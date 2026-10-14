@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 
-use super::macros::closed_enum;
+use crate::closed_enum;
 
 closed_enum! {
     /// Input formats the application accepts, recognized by file extension.

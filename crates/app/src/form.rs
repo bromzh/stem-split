@@ -12,6 +12,8 @@ use stem_split_core::{
     separate::DevicePreference,
 };
 
+use crate::{settings::Settings, view::text::Locale};
+
 /// Why the file or folder the user last picked was not accepted.
 #[derive(Debug)]
 pub(crate) enum Problem {
@@ -35,6 +37,26 @@ pub(crate) struct Form {
 }
 
 impl Form {
+    /// A form with no file chosen and the remembered choices filled in.
+    pub(crate) fn with(settings: &Settings) -> Self {
+        Self {
+            output: settings.output.clone(),
+            model: settings.model,
+            device: settings.device,
+            ..Self::default()
+        }
+    }
+
+    /// The choices worth remembering, together with the current language.
+    pub(crate) fn settings(&self, locale: Locale) -> Settings {
+        Settings {
+            locale,
+            model: self.model,
+            device: self.device,
+            output: self.output.clone(),
+        }
+    }
+
     pub(crate) const fn input(&self) -> Option<&InputFile> {
         self.input.as_ref()
     }
@@ -122,6 +144,27 @@ mod tests {
     use stem_split_core::domain::Stem;
 
     use super::*;
+
+    #[test]
+    fn form_starts_from_the_remembered_choices_and_reports_them_back() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let settings = Settings {
+            locale: Locale::Ru,
+            model: ModelId::HtdemucsFt,
+            device: DevicePreference::Cpu,
+            output: OutputChoice::Custom(OutputDir::new(directory.path())?),
+        };
+
+        let form = Form::with(&settings);
+
+        assert!(form.input().is_none());
+        assert!(form.problem().is_none());
+        assert_eq!(form.model(), ModelId::HtdemucsFt);
+        assert_eq!(form.device(), DevicePreference::Cpu);
+        assert_eq!(form.settings(Locale::Ru), settings);
+        Ok(())
+    }
 
     #[test]
     fn empty_form_describes_no_job() {

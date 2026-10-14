@@ -12,13 +12,15 @@ use std::{
 
 use eframe::egui;
 use stem_split_core::{
-    domain::{ModelId, OutputChoice},
+    domain::{ByteCount, ModelId, OutputChoice},
     job::{Progress, SeparationOutput},
+    model::Usage,
     separate::DevicePreference,
 };
 
 use self::text::{Locale, Message, Text};
 use crate::{
+    downloads::Downloads,
     form::{Form, Problem},
     worker::Failure,
 };
@@ -27,6 +29,19 @@ const ROW_SPACING: f32 = 10.0;
 const COLUMN_SPACING: f32 = 12.0;
 const SECTION_SPACING: f32 = 12.0;
 const COMBO_WIDTH: f32 = 320.0;
+/// How dark the window gets while a file is dragged over it: 0 is not at
+/// all, 255 is black.
+const DROP_SHADE: u8 = 190;
+const DROP_HINT_SIZE: f32 = 22.0;
+/// The picture on the language button. The bundled emoji fonts have it.
+const GLOBE: &str = "\u{1F310}";
+const GLOBE_SIZE: f32 = 16.0;
+/// The pictures on the buttons for downloaded models, from the same bundled
+/// icon font so that they match.
+const OPEN_FOLDER: &str = "\u{1F5C1}";
+const WASTEBASKET: &str = "\u{1F5D1}";
+/// How wide the question before deleting the models may grow.
+const QUESTION_WIDTH: f32 = 260.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditingAction {
@@ -35,6 +50,9 @@ pub(crate) enum EditingAction {
     OutputBesideInput,
     Model(ModelId),
     Device(DevicePreference),
+    Language(Locale),
+    OpenDownloads,
+    ClearDownloads,
     Start,
 }
 
@@ -89,8 +107,22 @@ fn show_file_names<'a>(ui: &mut egui::Ui, files: impl Iterator<Item = &'a Path>)
     }
 }
 
+/// Gives a button that shows only a picture a name in words. A picture says
+/// nothing to a screen reader; the caller shows the words in a tooltip too.
+fn name_picture(response: egui::Response, name: &str) -> egui::Response {
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), name)
+    });
+    response
+}
+
 /// The file to split: a button to choose it, its name, and its folder.
-fn file_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAction> {
+fn file_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    _downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
     let mut action = None;
     ui.label(Text::File.get(locale));
     ui.vertical(|ui| {
@@ -111,7 +143,12 @@ fn file_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAct
 }
 
 /// Where the stems go: next to the file, or a folder of the user's choice.
-fn output_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAction> {
+fn output_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    _downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
     let mut action = None;
     ui.label(Text::Output.get(locale));
     ui.vertical(|ui| {
@@ -143,34 +180,112 @@ fn output_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingA
     action
 }
 
-/// The model, and a notice if it still has to be downloaded.
-fn model_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAction> {
+/// The model, the buttons for downloaded models, and a notice if the model
+/// still has to be downloaded.
+fn model_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
     let mut action = None;
     let heading = ui.label(Text::Model.get(locale));
     ui.vertical(|ui| {
-        egui::ComboBox::from_id_salt("model")
-            .width(COMBO_WIDTH)
-            .selected_text(text::model_label(locale, form.model()))
-            .show_ui(ui, |ui| {
-                for &model in ModelId::ALL {
-                    let label = text::model_label(locale, model);
-                    if ui.selectable_label(model == form.model(), label).clicked() {
-                        action = Some(EditingAction::Model(model));
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("model")
+                .width(COMBO_WIDTH)
+                .selected_text(text::model_label(locale, form.model()))
+                .show_ui(ui, |ui| {
+                    for &model in ModelId::ALL {
+                        let label = text::model_label(locale, model);
+                        if ui.selectable_label(model == form.model(), label).clicked() {
+                            action = Some(EditingAction::Model(model));
+                        }
                     }
-                }
-            })
-            .response
-            // Names the list for screen readers, which otherwise announce
-            // only its current value.
-            .labelled_by(heading.id);
+                })
+                .response
+                // Names the list for screen readers, which otherwise announce
+                // only its current value.
+                .labelled_by(heading.id);
+            if let Some(downloads) = downloads {
+                action = downloads_buttons(ui, locale, downloads).or(action);
+            }
+        });
         if let Some(size) = form.download() {
             ui.weak(text::download_notice(locale, size));
+        }
+        if let Some(problem) = downloads.and_then(Downloads::problem) {
+            let message = text::downloads_problem(locale, problem);
+            show_message(ui, &message, ui.visuals().error_fg_color);
         }
     });
     action
 }
 
-fn device_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAction> {
+/// Two small buttons after the model list: one shows the folder the models
+/// are downloaded to, the other deletes them after asking.
+fn downloads_buttons(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    downloads: &Downloads,
+) -> Option<EditingAction> {
+    let mut action = None;
+    let usage = downloads.usage();
+    let folder = downloads.directory().display();
+
+    // A folder that does not exist yet has nothing to show. Its path is in
+    // the tooltip all the same: that is where the models will go.
+    let exists = usage != Some(Usage::NoDirectory);
+    let open = ui.add_enabled(exists, egui::Button::new(OPEN_FOLDER));
+    if open.clicked() {
+        action = Some(EditingAction::OpenDownloads);
+    }
+    name_picture(open, Text::OpenDownloads.get(locale))
+        .on_hover_text(format!("{}\n{folder}", Text::OpenDownloads.get(locale)))
+        .on_disabled_hover_text(format!("{}\n{folder}", Text::NothingDownloaded.get(locale)));
+
+    let stored = match usage {
+        Some(Usage::Files(size)) if size != ByteCount::ZERO => Some(size),
+        Some(Usage::Files(_) | Usage::NoDirectory) | None => None,
+    };
+    // Deleting asks first, in a small window that opens from the button and
+    // closes at a click anywhere else.
+    let clear = ui
+        .add_enabled_ui(stored.is_some(), |ui| {
+            let button = egui::Button::new(WASTEBASKET);
+            let (response, _) =
+                egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                    let Some(size) = stored else { return };
+                    ui.set_max_width(QUESTION_WIDTH);
+                    ui.add(egui::Label::new(text::clear_question(locale, size)).wrap());
+                    // Coloured as a warning: this one cannot be undone.
+                    let delete = egui::RichText::new(Text::Delete.get(locale))
+                        .color(ui.visuals().error_fg_color);
+                    if ui.button(delete).clicked() {
+                        action = Some(EditingAction::ClearDownloads);
+                        ui.close();
+                    }
+                });
+            response
+        })
+        .inner;
+    let unavailable = match usage {
+        Some(Usage::Files(_) | Usage::NoDirectory) => Text::NothingDownloaded,
+        // Being deleted right now, or the folder cannot be read.
+        None => Text::ClearDownloads,
+    };
+    name_picture(clear, Text::ClearDownloads.get(locale))
+        .on_hover_text(Text::ClearDownloads.get(locale))
+        .on_disabled_hover_text(unavailable.get(locale));
+    action
+}
+
+fn device_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    _downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
     let mut action = None;
     let heading = ui.label(Text::Device.get(locale));
     egui::ComboBox::from_id_salt("device")
@@ -192,8 +307,56 @@ fn device_row(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingA
     action
 }
 
+/// The interface language: a faint globe in the corner that opens the list
+/// of languages, each under its own name.
+///
+/// It is kept out of the way on purpose. A language is chosen once, and the
+/// form should not spend a row on it; a picture instead of a word can be
+/// found by someone who cannot read the current language.
+fn language_menu(ui: &mut egui::Ui, locale: Locale) -> Option<EditingAction> {
+    let mut action = None;
+    let globe = egui::RichText::new(GLOBE).size(GLOBE_SIZE).weak();
+    let button = egui::Button::new(globe).frame(false);
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        for &language in Locale::ALL {
+            if ui
+                .selectable_label(language == locale, language.name())
+                .clicked()
+            {
+                action = Some(EditingAction::Language(language));
+                ui.close();
+            }
+        }
+    });
+    let name = Text::Language.get(locale);
+    name_picture(response, name).on_hover_text(name);
+    action
+}
+
+/// Covers the window while a file is dragged over it, to show that it can
+/// be dropped.
+pub(crate) fn drop_hint(context: &egui::Context, locale: Locale) {
+    let area = context.content_rect();
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop hint"));
+    let painter = context.layer_painter(layer);
+    painter.rect_filled(area, 0.0, egui::Color32::from_black_alpha(DROP_SHADE));
+    painter.text(
+        area.center(),
+        egui::Align2::CENTER_CENTER,
+        Text::DropHint.get(locale),
+        egui::FontId::proportional(DROP_HINT_SIZE),
+        egui::Color32::WHITE,
+    );
+}
+
 /// The main form: what to split, where to put the result, and how.
-pub(crate) fn editing(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAction> {
+/// `downloads` is absent when there is no model store to show.
+pub(crate) fn editing(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
     let mut action = None;
     egui::Grid::new("form")
         .num_columns(2)
@@ -202,7 +365,7 @@ pub(crate) fn editing(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<
             for row in [file_row, output_row, model_row, device_row] {
                 // At most one widget is clicked in a frame, so a later row
                 // never overwrites an earlier one's action.
-                action = row(ui, locale, form).or(action);
+                action = row(ui, locale, form, downloads).or(action);
                 ui.end_row();
             }
         });
@@ -218,10 +381,20 @@ pub(crate) fn editing(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<
 
     ui.add_space(SECTION_SPACING);
     let start = egui::Button::new(Text::Split.get(locale));
-    if ui.add_enabled(form.input().is_some(), start).clicked() {
+    // A job must not start while the models it needs are being deleted.
+    let clearing = downloads.is_some_and(Downloads::is_clearing);
+    if ui
+        .add_enabled(form.input().is_some() && !clearing, start)
+        .clicked()
+    {
         action = Some(EditingAction::Start);
     }
-    action
+    // Whatever height is left goes to a layout that fills from the bottom
+    // and aligns to the right: its only widget lands in that corner.
+    let corner = egui::Layout::bottom_up(egui::Align::Max);
+    ui.with_layout(corner, |ui| language_menu(ui, locale))
+        .inner
+        .or(action)
 }
 
 /// Asks before replacing results of an earlier run.

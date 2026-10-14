@@ -1,6 +1,7 @@
 /// Declares a fieldless enum together with `ALL`, the list of its variants in
 /// declaration order. Generating both from one list means `ALL` cannot fall
 /// behind when a variant is added.
+#[macro_export]
 macro_rules! closed_enum {
     (
         $(#[$meta:meta])*
@@ -25,5 +26,3 @@ macro_rules! closed_enum {
         }
     };
 }
-
-pub(crate) use closed_enum;

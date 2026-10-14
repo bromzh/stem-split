@@ -17,6 +17,8 @@ eframe = { version = "0.36", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
+    # Keeps the window position and the settings between launches.
+    "persistence",
     "wayland",
     "x11",
 ] }
@@ -44,6 +46,7 @@ realfft = "3.5"
 rfd = "0.17"
 rubato = "5"
 sha2 = "0.11"
+sys-locale = "0.3"
 # Only the containers and codecs behind `AudioFormat`; the default set lacks
 # MP3 and AAC and brings formats the application does not offer.
 symphonia = { version = "0.6", default-features = false, features = [
@@ -61,6 +64,7 @@ symphonia = { version = "0.6", default-features = false, features = [
 ] }
 tempfile = "3"
 thiserror = "2"
+winresource = "0.1"
 # rustls with the operating system's certificate verifier: self-contained to
 # build, yet honours certificates installed on the machine. No gzip: the
 # only downloads are binary model files.

@@ -1,6 +1,6 @@
 use std::{iter, num::NonZeroUsize};
 
-use super::macros::closed_enum;
+use crate::closed_enum;
 
 closed_enum! {
     /// One separated part of a mix.

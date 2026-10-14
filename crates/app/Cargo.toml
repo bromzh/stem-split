@@ -7,10 +7,15 @@ publish.workspace = true
 
 [dependencies]
 stem-split-core.workspace = true
+directories.workspace = true
 eframe.workspace = true
 log.workspace = true
 open.workspace = true
 rfd.workspace = true
+sys-locale.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

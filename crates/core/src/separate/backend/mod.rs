@@ -17,7 +17,10 @@ use super::{
     CHANNELS, ChunkStems, SEGMENT_FRAMES, Segment, Separator,
     stft::{self, BINS, Stft, StftError},
 };
-use crate::domain::{Stem, StemLayout, macros::closed_enum};
+use crate::{
+    closed_enum,
+    domain::{Stem, StemLayout},
+};
 
 /// Input: normalized waveform, `[1, 2, SEGMENT_FRAMES]`.
 const MIX: &str = "mix";

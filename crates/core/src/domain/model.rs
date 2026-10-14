@@ -1,4 +1,5 @@
-use super::{macros::closed_enum, stem::StemLayout};
+use super::stem::StemLayout;
+use crate::closed_enum;
 
 closed_enum! {
     /// Separation models the application can run.

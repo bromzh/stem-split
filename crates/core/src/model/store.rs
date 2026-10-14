@@ -98,6 +98,40 @@ impl From<PartialFileError> for ModelStoreError {
     }
 }
 
+/// Why the files of the store could not be measured or deleted.
+#[derive(Debug, thiserror::Error)]
+pub enum CacheError {
+    #[error("cannot read the model directory `{}`: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("cannot delete `{}`: {source}", path.display())]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// How much room the store takes on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    /// Nothing was ever downloaded: the directory does not exist yet.
+    NoDirectory,
+    /// The files in the directory take this many bytes; none after
+    /// [`ModelStore::clear`].
+    Files(ByteCount),
+}
+
+/// A file found in the store's directory.
+#[derive(Debug)]
+struct StoredFile {
+    path: PathBuf,
+    size: u64,
+}
+
 /// How far a download has come. Counts cover every file of the model that
 /// had to be fetched, not just the current one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +232,7 @@ enum Transport {
 /// A file appears in the store only after its size and SHA-256 digest have
 /// been checked, under a name derived from that digest. Finding a file with
 /// the right name and size is therefore enough to trust it later.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelStore {
     directory: PathBuf,
     base_url: String,
@@ -261,6 +295,88 @@ impl ModelStore {
     #[must_use]
     pub fn is_cached(&self, model: ModelId) -> bool {
         model.spec().graphs().all(|graph| self.has(graph))
+    }
+
+    /// How much room the files in the directory take: the models, files of
+    /// models this version no longer uses, and downloads left unfinished by
+    /// a process that was killed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Read`] if the directory exists but cannot be
+    /// listed.
+    pub fn usage(&self) -> Result<Usage, CacheError> {
+        let Some(files) = self.files()? else {
+            return Ok(Usage::NoDirectory);
+        };
+        let total = files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.size));
+        Ok(Usage::Files(ByteCount::new(total)))
+    }
+
+    /// Deletes every file in the directory and returns how much room that
+    /// freed. The directory itself stays, and so do subdirectories, which
+    /// the store never creates. Each model is downloaded again the next time
+    /// it is used.
+    ///
+    /// Must not run while a job uses the store: a model it has found in
+    /// place could disappear before it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Read`] if the directory cannot be listed, and
+    /// [`CacheError::Remove`] for the first file that cannot be deleted. The
+    /// files deleted before it stay deleted.
+    pub fn clear(&self) -> Result<ByteCount, CacheError> {
+        let Some(files) = self.files()? else {
+            return Ok(ByteCount::ZERO);
+        };
+        let mut freed = 0_u64;
+        for file in files {
+            match fs::remove_file(&file.path) {
+                Ok(()) => freed = freed.saturating_add(file.size),
+                // Gone since it was listed: what was asked for is done.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(CacheError::Remove {
+                        path: file.path,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(ByteCount::new(freed))
+    }
+
+    /// The regular files in the directory, or `None` if it does not exist.
+    fn files(&self) -> Result<Option<Vec<StoredFile>>, CacheError> {
+        let unreadable = |source| CacheError::Read {
+            path: self.directory.clone(),
+            source,
+        };
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unreadable(error)),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(unreadable)?;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                // Deleted between the listing and this look.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(unreadable(error)),
+            };
+            if metadata.is_file() {
+                files.push(StoredFile {
+                    path: entry.path(),
+                    size: metadata.len(),
+                });
+            }
+        }
+        Ok(Some(files))
     }
 
     /// Makes sure every file of `model` is in the store, downloading the
@@ -846,6 +962,65 @@ mod tests {
         for &model in ModelId::ALL {
             assert!(!store.is_cached(model));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn store_that_never_downloaded_has_no_directory_and_nothing_to_clear()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = ModelStore::new(directory.path().join("never-created"));
+
+        assert_eq!(store.usage()?, Usage::NoDirectory);
+        assert_eq!(store.clear()?, ByteCount::ZERO);
+        // Clearing does not create the directory either.
+        assert!(!store.directory().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_deletes_every_file_and_reports_the_room_freed() -> Result<(), Box<dyn Error>> {
+        let content = payload(3_000);
+        let graph = spec_for("cached", &content);
+        let directory = tempfile::tempdir()?;
+        let store = ModelStore::new(directory.path().join("models"));
+        fs::create_dir(store.directory())?;
+        fs::write(store.path_of(&graph), &content)?;
+        // A model of an older version and a download a killed process left.
+        fs::write(
+            store.directory().join("retired-0123456789abcdef.onnx"),
+            [0_u8; 700],
+        )?;
+        fs::write(store.directory().join("unfinished.part"), [0_u8; 300])?;
+        // The store never makes subdirectories; one that is there is not its.
+        let foreign = store.directory().join("keep");
+        fs::create_dir(&foreign)?;
+        fs::write(foreign.join("note.txt"), [0_u8; 50])?;
+
+        assert_eq!(store.usage()?, Usage::Files(ByteCount::new(4_000)));
+        assert!(store.has(&graph));
+
+        assert_eq!(store.clear()?, ByteCount::new(4_000));
+
+        assert!(!store.has(&graph));
+        assert_eq!(store.usage()?, Usage::Files(ByteCount::ZERO));
+        assert_eq!(entries(store.directory())?, ["keep"]);
+        assert_eq!(entries(&foreign)?, ["note.txt"]);
+        Ok(())
+    }
+
+    #[test]
+    fn store_whose_directory_is_a_file_cannot_be_read() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("models");
+        fs::write(&path, b"not a directory")?;
+        let store = ModelStore::new(&path);
+
+        assert!(
+            matches!(store.usage(), Err(CacheError::Read { path: reported, .. }) if reported == path)
+        );
+        assert!(matches!(store.clear(), Err(CacheError::Read { .. })));
+        assert!(path.is_file(), "the file in the way is not deleted");
         Ok(())
     }
 
