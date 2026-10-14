@@ -69,7 +69,7 @@ closed_enum! {
 /// The device a model actually runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDevice {
-    /// A GPU through `DirectML`.
+    /// A GPU through `DirectML` on Windows or `CoreML` on macOS.
     DirectMl,
     Cpu,
 }

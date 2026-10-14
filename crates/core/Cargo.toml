@@ -23,6 +23,9 @@ ureq.workspace = true
 ort = { workspace = true, features = ["directml"] }
 ort-sys.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { workspace = true, features = ["coreml"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
