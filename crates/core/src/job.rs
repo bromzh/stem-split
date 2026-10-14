@@ -10,7 +10,7 @@ use crate::{
     },
     model::{DownloadProgress, Ensured, LocalGraph, ModelStore, ModelStoreError, StemSelection},
     separate::{
-        ActiveDevice, DevicePreference, InferenceError, OrtSeparator, Separator,
+        ActiveDevice, CpuThreads, DevicePreference, InferenceError, OrtSeparator, Separator,
         pipeline::{self, PassEnd, PassError, Target, Track},
         plan::{ChunkPlan, Normalization},
     },
@@ -24,9 +24,12 @@ pub struct SeparationRequest {
     model: ModelId,
     device: DevicePreference,
     overwrite: OverwritePolicy,
+    cpu_threads: CpuThreads,
 }
 
 impl SeparationRequest {
+    /// A request whose CPU sessions use every core; see
+    /// [`SeparationRequest::with_cpu_threads`] for jobs that run side by side.
     #[must_use]
     pub fn new(
         input: InputFile,
@@ -41,7 +44,20 @@ impl SeparationRequest {
             model,
             device,
             overwrite,
+            cpu_threads: CpuThreads::all(),
         }
+    }
+
+    /// The same request with CPU sessions limited to `threads`.
+    #[must_use]
+    pub fn with_cpu_threads(mut self, threads: CpuThreads) -> Self {
+        self.cpu_threads = threads;
+        self
+    }
+
+    #[must_use]
+    pub const fn cpu_threads(&self) -> CpuThreads {
+        self.cpu_threads
     }
 
     #[must_use]
@@ -80,6 +96,24 @@ impl SeparationRequest {
             .filter(|path| path.exists())
             .collect()
     }
+}
+
+/// How many model runs the job is expected to take, from the length its
+/// file states, so that the time of several jobs can be estimated before
+/// they start. `None` when the file does not state its length.
+///
+/// The count is the one [`Progress::Separating`] will report, unless
+/// resampling changes the length enough to add or drop a chunk.
+#[must_use]
+pub fn expected_runs(request: &SeparationRequest) -> Option<NonZeroUsize> {
+    let length = audio::stated_length(&request.input)?;
+    let frames = length
+        .as_nanos()
+        .saturating_mul(u128::from(SampleRate::MODEL.hertz().get()))
+        / 1_000_000_000;
+    let frames = NonZeroUsize::new(usize::try_from(frames).ok()?)?;
+    let passes = NonZeroUsize::new(request.model.spec().graphs().count())?;
+    Some(ChunkPlan::new(frames).count().saturating_mul(passes))
 }
 
 /// What a running job is doing.
@@ -221,7 +255,7 @@ pub fn run(
         path: request.input.path().to_path_buf(),
     })?;
 
-    let pass = |graph| pass_for(graph, layout, request.device);
+    let pass = |graph| pass_for(graph, layout, request.device, request.cpu_threads);
     separate_into(
         frames,
         &ChunkPlan::new(frame_count),
@@ -238,10 +272,11 @@ fn pass_for(
     graph: &LocalGraph,
     layout: StemLayout,
     device: DevicePreference,
+    threads: CpuThreads,
 ) -> Pass<impl FnOnce() -> Result<OrtSeparator, InferenceError>> {
     Pass {
         emits: graph.emits(),
-        load: move || OrtSeparator::load(graph.path(), layout, device),
+        load: move || OrtSeparator::load(graph.path(), layout, device, threads),
     }
 }
 

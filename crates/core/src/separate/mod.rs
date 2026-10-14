@@ -13,7 +13,7 @@ mod stft;
 
 use std::num::NonZeroUsize;
 
-pub use self::backend::{ActiveDevice, DevicePreference, InferenceError, OrtSeparator};
+pub use self::backend::{ActiveDevice, CpuThreads, DevicePreference, InferenceError, OrtSeparator};
 
 /// Length of the window every supported model works on: 7.8 s at 44.1 kHz.
 pub const SEGMENT_FRAMES: usize = 343_980;

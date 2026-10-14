@@ -9,16 +9,17 @@
 mod en;
 mod ru;
 
-use std::{io, path::Path, time::Duration};
+use std::{io, num::NonZeroUsize, path::Path, time::Duration};
 
 use stem_split_core::{
+    batch::OutputClash,
     closed_enum,
     domain::{ByteCount, InputFileError, ModelId, OutputDirError},
     job::Progress,
     separate::{ActiveDevice, DevicePreference},
 };
 
-use crate::{downloads::DownloadsProblem, worker::Failure};
+use crate::{downloads::DownloadsProblem, timing::Clock, worker::Failure};
 
 /// Decimal megabytes, the unit download sizes are usually quoted in.
 const BYTES_PER_MEGABYTE: u64 = 1_000_000;
@@ -106,6 +107,10 @@ closed_enum! {
         ExistingFilesHeading,
         DoneHeading,
         FailedHeading,
+        NoFileSplit,
+        Waiting,
+        FileFailed,
+        FileCancelled,
         DropHint,
     }
 }
@@ -224,26 +229,101 @@ pub(crate) const fn device_preference(locale: Locale, device: DevicePreference) 
     }
 }
 
-/// What a running job is doing, in one line.
-pub(crate) fn progress_status(locale: Locale, progress: Progress) -> String {
+/// What one file of a batch is doing, short enough for its progress bar.
+pub(crate) fn row_status(locale: Locale, progress: Progress) -> String {
     match locale {
-        Locale::En => en::progress_status(progress),
-        Locale::Ru => ru::progress_status(progress),
+        Locale::En => en::row_status(progress),
+        Locale::Ru => ru::row_status(progress),
     }
 }
 
-/// The time a job has taken so far and, when it can be estimated, the time
-/// its current stage still needs.
-pub(crate) fn time_status(
-    locale: Locale,
-    elapsed: Duration,
-    remaining: Option<Duration>,
-) -> String {
-    let elapsed = clock(elapsed);
-    let remaining = remaining.map(|remaining| clock(at_least_a_second(remaining)));
+/// The bar of a file that is done: where it was computed.
+pub(crate) fn completed_on(locale: Locale, device: ActiveDevice) -> String {
     match locale {
-        Locale::En => en::time_status(&elapsed, remaining.as_deref()),
-        Locale::Ru => ru::time_status(&elapsed, remaining.as_deref()),
+        Locale::En => en::completed_on(device),
+        Locale::Ru => ru::completed_on(device),
+    }
+}
+
+/// The time on the clock as text: elapsed, and remaining rounded up and
+/// never shown as zero.
+fn clock_parts(time: Clock) -> (String, Option<String>) {
+    (
+        clock(time.elapsed),
+        time.remaining
+            .map(|remaining| clock(at_least_a_second(remaining))),
+    )
+}
+
+/// The time next to the bar of one file: how long it has run and, when
+/// that can be estimated, how long its current stage still needs.
+pub(crate) fn row_time(locale: Locale, time: Clock) -> String {
+    let (elapsed, remaining) = clock_parts(time);
+    match locale {
+        Locale::En => en::row_time(&elapsed, remaining.as_deref()),
+        Locale::Ru => ru::row_time(&elapsed, remaining.as_deref()),
+    }
+}
+
+/// The time of a whole batch, under the rows of its files.
+pub(crate) fn batch_time_status(locale: Locale, time: Clock) -> String {
+    let (elapsed, remaining) = clock_parts(time);
+    match locale {
+        Locale::En => en::batch_time_status(&elapsed, remaining.as_deref()),
+        Locale::Ru => ru::batch_time_status(&elapsed, remaining.as_deref()),
+    }
+}
+
+/// How many files are chosen, next to the button that chose them.
+pub(crate) fn files_chosen(locale: Locale, count: NonZeroUsize) -> String {
+    match locale {
+        Locale::En => en::files_chosen(count.get()),
+        Locale::Ru => ru::files_chosen(count.get()),
+    }
+}
+
+/// The heading over the results of a batch of `total` files.
+pub(crate) fn results_heading(locale: Locale, completed: usize, total: usize) -> String {
+    if completed >= total {
+        Text::DoneHeading.get(locale).to_owned()
+    } else if completed == 0 {
+        let heading = if total == 1 {
+            Text::FailedHeading
+        } else {
+            Text::NoFileSplit
+        };
+        heading.get(locale).to_owned()
+    } else {
+        match locale {
+            Locale::En => en::partly_done(completed, total),
+            Locale::Ru => ru::partly_done(completed, total),
+        }
+    }
+}
+
+/// How long a whole batch took, from its start to its last file.
+pub(crate) fn total_summary(locale: Locale, took: Duration) -> String {
+    let took = clock(to_the_nearest_second(took));
+    match locale {
+        Locale::En => en::total_summary(&took),
+        Locale::Ru => ru::total_summary(&took),
+    }
+}
+
+/// Why two files cannot be split together.
+pub(crate) fn clash_problem(locale: Locale, clash: &OutputClash) -> Message {
+    let (first, second) = (file_name(clash.first()), file_name(clash.second()));
+    match locale {
+        Locale::En => en::clash_problem(&first, &second),
+        Locale::Ru => ru::clash_problem(&first, &second),
+    }
+}
+
+/// The line after the first few files that cannot be split.
+pub(crate) fn more_problems(locale: Locale, count: usize) -> String {
+    match locale {
+        Locale::En => en::more_problems(count),
+        Locale::Ru => ru::more_problems(count),
     }
 }
 
@@ -473,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_status_describes_each_stage() {
+    fn row_status_describes_each_stage() {
         let total = NonZeroUsize::MIN.saturating_add(18);
         let separating = |done, device| Progress::Separating {
             done,
@@ -485,45 +565,33 @@ mod tests {
             ByteCount::new(168_683_222),
         ));
 
-        assert_eq!(progress_status(EN, Progress::Decoding), "Reading the file…");
+        assert_eq!(row_status(EN, Progress::Decoding), "Reading the file…");
+        assert_eq!(row_status(EN, Progress::LoadingModel), "Loading the model…");
+        assert_eq!(row_status(EN, Progress::Finalizing), "Writing the files…");
         assert_eq!(
-            progress_status(EN, Progress::LoadingModel),
-            "Loading the model…"
-        );
-        assert_eq!(
-            progress_status(EN, Progress::Finalizing),
-            "Writing the files…"
-        );
-        assert_eq!(
-            progress_status(EN, downloading),
+            row_status(EN, downloading),
             "Downloading the model: 45 of 169 MB"
         );
         assert_eq!(
-            progress_status(EN, separating(7, ActiveDevice::DirectMl)),
-            "Splitting: part 7 of 19, on the graphics card"
+            row_status(EN, separating(7, ActiveDevice::DirectMl)),
+            "Part 7 of 19 · graphics card"
         );
         assert_eq!(
-            progress_status(EN, separating(19, ActiveDevice::Cpu)),
-            "Splitting: part 19 of 19, on the processor"
+            row_status(EN, separating(19, ActiveDevice::Cpu)),
+            "Part 19 of 19 · processor"
         );
 
-        assert_eq!(progress_status(RU, Progress::Decoding), "Чтение файла…");
+        assert_eq!(row_status(RU, Progress::Decoding), "Чтение файла…");
+        assert_eq!(row_status(RU, Progress::LoadingModel), "Подготовка модели…");
+        assert_eq!(row_status(RU, Progress::Finalizing), "Запись файлов…");
+        assert_eq!(row_status(RU, downloading), "Загрузка модели: 45 из 169 МБ");
         assert_eq!(
-            progress_status(RU, Progress::LoadingModel),
-            "Подготовка модели…"
-        );
-        assert_eq!(progress_status(RU, Progress::Finalizing), "Запись файлов…");
-        assert_eq!(
-            progress_status(RU, downloading),
-            "Загрузка модели: 45 из 169 МБ"
+            row_status(RU, separating(7, ActiveDevice::DirectMl)),
+            "Часть 7 из 19 · видеокарта"
         );
         assert_eq!(
-            progress_status(RU, separating(7, ActiveDevice::DirectMl)),
-            "Разделение: часть 7 из 19, на видеокарте"
-        );
-        assert_eq!(
-            progress_status(RU, separating(19, ActiveDevice::Cpu)),
-            "Разделение: часть 19 из 19, на процессоре"
+            row_status(RU, separating(19, ActiveDevice::Cpu)),
+            "Часть 19 из 19 · процессор"
         );
     }
 
@@ -537,35 +605,127 @@ mod tests {
         assert_eq!(clock(Duration::from_secs(2 * 3600 + 3 * 60 + 4)), "2:03:04");
     }
 
-    #[test]
-    fn time_status_gives_elapsed_time_and_the_estimate_when_there_is_one() {
-        let elapsed = Duration::from_secs(72);
-        let remaining = Some(Duration::from_secs(45));
+    fn time(elapsed: u64, remaining: Option<u64>) -> Clock {
+        Clock {
+            elapsed: Duration::from_secs(elapsed),
+            remaining: remaining.map(Duration::from_secs),
+        }
+    }
 
-        assert_eq!(time_status(EN, elapsed, None), "Elapsed 1:12");
+    #[test]
+    fn row_time_gives_elapsed_time_and_the_estimate_when_there_is_one() {
+        assert_eq!(row_time(EN, time(72, None)), "1:12");
+        assert_eq!(row_time(EN, time(72, Some(45))), "1:12 · ~0:45 left");
+        assert_eq!(row_time(RU, time(72, None)), "1:12");
+        assert_eq!(row_time(RU, time(72, Some(45))), "1:12 · ещё ~0:45");
+    }
+
+    #[test]
+    fn batch_time_names_the_whole_batch() {
         assert_eq!(
-            time_status(EN, elapsed, remaining),
-            "Elapsed 1:12 · about 0:45 left"
+            batch_time_status(EN, time(72, Some(45))),
+            "All files: elapsed 1:12 · about 0:45 left"
         );
-        assert_eq!(time_status(RU, elapsed, None), "Прошло 1:12");
         assert_eq!(
-            time_status(RU, elapsed, remaining),
-            "Прошло 1:12 · осталось около 0:45"
+            batch_time_status(EN, time(72, None)),
+            "All files: elapsed 1:12"
+        );
+        assert_eq!(
+            batch_time_status(RU, time(72, Some(45))),
+            "Все файлы: прошло 1:12 · осталось около 0:45"
         );
     }
 
     #[test]
     fn remaining_time_is_rounded_up_and_never_shown_as_zero() {
-        let elapsed = Duration::from_secs(3);
+        let clock = |remaining| Clock {
+            elapsed: Duration::from_secs(3),
+            remaining: Some(remaining),
+        };
 
         assert_eq!(
-            time_status(EN, elapsed, Some(Duration::from_millis(4_200))),
-            "Elapsed 0:03 · about 0:05 left"
+            row_time(EN, clock(Duration::from_millis(4_200))),
+            "0:03 · ~0:05 left"
+        );
+        assert_eq!(row_time(EN, clock(Duration::ZERO)), "0:03 · ~0:01 left");
+    }
+
+    #[test]
+    fn rows_say_briefly_what_their_file_is_doing() {
+        let total = NonZeroUsize::MIN.saturating_add(18);
+        let separating = Progress::Separating {
+            done: 7,
+            total,
+            device: ActiveDevice::DirectMl,
+        };
+
+        assert_eq!(row_status(EN, separating), "Part 7 of 19 · graphics card");
+        assert_eq!(row_status(RU, separating), "Часть 7 из 19 · видеокарта");
+        assert_eq!(row_status(EN, Progress::Decoding), "Reading the file…");
+        assert_eq!(completed_on(RU, ActiveDevice::Cpu), "Готово · процессор");
+    }
+
+    #[test]
+    fn counts_of_files_agree_with_their_number() {
+        let count = |n| NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
+        assert_eq!(files_chosen(EN, count(3)), "3 files");
+        assert_eq!(files_chosen(RU, count(2)), "2 файла");
+        assert_eq!(files_chosen(RU, count(5)), "5 файлов");
+        assert_eq!(files_chosen(RU, count(21)), "21 файл");
+        assert_eq!(
+            more_problems(EN, 1),
+            "…and 1 more file that cannot be split."
         );
         assert_eq!(
-            time_status(EN, elapsed, Some(Duration::ZERO)),
-            "Elapsed 0:03 · about 0:01 left"
+            more_problems(RU, 4),
+            "…и ещё 4 файла, которые нельзя разделить."
         );
+    }
+
+    #[test]
+    fn results_heading_tells_how_many_files_were_split() {
+        assert_eq!(results_heading(EN, 3, 3), "Done");
+        assert_eq!(results_heading(EN, 0, 1), "The file was not split");
+        assert_eq!(results_heading(EN, 0, 4), "No file was split");
+        assert_eq!(results_heading(EN, 2, 5), "2 of 5 files split");
+        assert_eq!(results_heading(RU, 2, 5), "Разделено файлов: 2 из 5");
+        assert_eq!(
+            total_summary(RU, Duration::from_millis(83_400)),
+            "На все файлы ушло 1:23."
+        );
+    }
+
+    #[test]
+    fn clash_names_both_files() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut files = Vec::new();
+        for name in ["song.mp3", "song.flac"] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, b"")?;
+            files.push(stem_split_core::domain::InputFile::new(path)?);
+        }
+        let inputs = stem_split_core::domain::InputFiles::new(files).ok_or("no files")?;
+        let clash = stem_split_core::batch::Batch::new(
+            &inputs,
+            &stem_split_core::domain::OutputChoice::BesideInput,
+            ModelId::Htdemucs,
+            DevicePreference::Auto,
+            stem_split_core::domain::OverwritePolicy::Refuse,
+        )
+        .err()
+        .ok_or("the files should clash")?;
+
+        assert!(
+            clash_problem(EN, &clash)
+                .summary
+                .starts_with("\"song.mp3\" and \"song.flac\" would")
+        );
+        assert!(
+            clash_problem(RU, &clash)
+                .summary
+                .starts_with("У «song.mp3» и «song.flac»")
+        );
+        Ok(())
     }
 
     #[test]

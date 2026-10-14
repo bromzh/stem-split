@@ -11,7 +11,7 @@ mod wav;
 use std::time::Duration;
 
 pub use self::{
-    decode::{DecodeError, decode},
+    decode::{DecodeError, decode, stated_length},
     resample::{ResampleError, resample},
     wav::{WavWriter, WriteError},
 };

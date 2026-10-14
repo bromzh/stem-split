@@ -6,7 +6,7 @@
 //!     --model htdemucs --device auto --output stems --replace
 //! ```
 
-use std::{cell::Cell, env, path::PathBuf, process::ExitCode, time::Instant};
+use std::{cell::Cell, env, num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Instant};
 
 use stem_split_core::{
     CancelToken,
@@ -16,13 +16,13 @@ use stem_split_core::{
     },
     job::{self, JobEnd, JobError, Progress, SeparationRequest},
     model::{ModelStore, ModelStoreError},
-    separate::DevicePreference,
+    separate::{CpuThreads, DevicePreference},
 };
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error(
-        "usage: separate <input> [--model NAME] [--device auto|gpu|cpu] [--output DIR] [--replace]"
+        "usage: separate <input> [--model NAME] [--device auto|gpu|cpu] [--output DIR] [--replace] [--threads N]"
     )]
     Usage,
     #[error("unknown model `{0}`")]
@@ -64,6 +64,7 @@ fn parse(mut arguments: impl Iterator<Item = String>) -> Result<SeparationReques
     let mut device = DevicePreference::default();
     let mut output = OutputChoice::default();
     let mut overwrite = OverwritePolicy::default();
+    let mut threads = CpuThreads::all();
 
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
@@ -89,12 +90,15 @@ fn parse(mut arguments: impl Iterator<Item = String>) -> Result<SeparationReques
                 output = OutputChoice::Custom(OutputDir::new(directory)?);
             }
             "--replace" => overwrite = OverwritePolicy::Replace,
+            "--threads" => {
+                let count = arguments.next().ok_or(Error::Usage)?;
+                let count = count.parse::<NonZeroUsize>().map_err(|_| Error::Usage)?;
+                threads = CpuThreads::new(count);
+            }
             _ => return Err(Error::Usage),
         }
     }
-    Ok(SeparationRequest::new(
-        input, &output, model, device, overwrite,
-    ))
+    Ok(SeparationRequest::new(input, &output, model, device, overwrite).with_cpu_threads(threads))
 }
 
 fn run() -> Result<(), Error> {

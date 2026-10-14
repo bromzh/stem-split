@@ -3,16 +3,15 @@
 //! This is the only place that knows which execution providers exist on which
 //! platform; everything above it works with "a GPU session, if there is one".
 
-use std::{num::NonZeroUsize, path::Path, thread};
+use std::path::Path;
 
 use ort::session::Session;
 
-/// A session on the CPU, using every logical core. On the machine the
-/// settings were measured on, that is about a tenth faster than ONNX
-/// Runtime's default of one thread per physical core.
-pub(super) fn cpu_session(graph: &Path) -> ort::Result<Session> {
-    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let mut builder = Session::builder()?.with_intra_threads(threads)?;
+use super::CpuThreads;
+
+/// A session on the CPU that uses `threads` threads.
+pub(super) fn cpu_session(graph: &Path, threads: CpuThreads) -> ort::Result<Session> {
+    let mut builder = Session::builder()?.with_intra_threads(threads.get().get())?;
     builder.commit_from_file(graph)
 }
 

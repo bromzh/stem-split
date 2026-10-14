@@ -2,66 +2,56 @@
 
 use std::{
     io, mem,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use eframe::egui;
-use stem_split_core::{
-    domain::OverwritePolicy,
-    job::{Progress, SeparationOutput, SeparationRequest},
-    model::ModelStore,
-};
+use stem_split_core::{batch::Batch, domain::OverwritePolicy, model::ModelStore};
 
 use crate::{
     dialogs,
     downloads::{Downloads, Polled},
     form::Form,
     settings::Settings,
-    timing::Timing,
+    tracker::{End, Results, Tracker},
     view::{
-        self, Clock, ConfirmingAction, DoneAction, EditingAction, FailedAction, RunningAction,
-        Stopping, text::Locale,
+        self, ConfirmingAction, DoneAction, EditingAction, FailedAction, RunningAction, Stopping,
+        text::Locale,
     },
-    worker::{Failure, Outcome, Worker},
+    worker::{Channel, Failure, Worker},
 };
 
-/// How long closing the window waits for a running job to clean up after
-/// itself. A job reacts within one model run, a few seconds at most on a
+/// How long closing the window waits for running jobs to clean up after
+/// themselves. A job reacts within one model run, a few seconds at most on a
 /// CPU; only a stalled download can take longer.
 const EXIT_PATIENCE: Duration = Duration::from_secs(10);
 
-/// How often the running screen is redrawn when the job has nothing new to
-/// report, so that the clock on it keeps ticking.
+/// How often the running screen is redrawn when the jobs have nothing new
+/// to report, so that the clocks on it keep ticking.
 const CLOCK_TICK: Duration = Duration::from_millis(200);
 
-/// A job in progress.
+/// A batch in progress.
 #[derive(Debug)]
 struct Run {
     form: Form,
-    /// Where the results will be, for the "open folder" button afterwards.
-    folder: PathBuf,
     worker: Worker,
-    progress: Option<Progress>,
-    timing: Timing,
+    tracker: Tracker,
     stopping: Stopping,
 }
 
-/// A job that produced its files.
+/// A batch that ended with something to show.
 #[derive(Debug)]
 struct Finished {
     form: Form,
-    folder: PathBuf,
-    output: SeparationOutput,
-    /// How long the job ran, from its start to the last file in place.
-    took: Duration,
-    /// Why the folder could not be opened, after the user asked for it.
+    results: Results,
+    /// Why a folder could not be opened, after the user asked for it.
     problem: Option<io::Error>,
 }
 
 /// What the window shows. Each screen owns exactly the data it needs, so a
 /// widget cannot outlive the state it belongs to: there is no progress bar
-/// without a running job, and no "Split" button while one runs.
+/// without a running batch, and no "Split" button while one runs.
 #[derive(Debug)]
 enum Screen {
     Editing(Form),
@@ -70,8 +60,10 @@ enum Screen {
         form: Form,
         existing: Vec<PathBuf>,
     },
-    Running(Run),
+    /// Boxed: the batch carries much more than any other screen.
+    Running(Box<Run>),
     Done(Finished),
+    /// The batch could not run at all.
     Failed {
         form: Form,
         failure: Failure,
@@ -84,11 +76,11 @@ impl Default for Screen {
     }
 }
 
-/// Whether a file dropped on the window is taken as the next one to split.
+/// Whether files dropped on the window are taken as the next ones to split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drop {
     Accepted,
-    /// A job is running; its input cannot change under it.
+    /// A batch is running; its files cannot change under it.
     Ignored,
 }
 
@@ -119,15 +111,15 @@ impl Screen {
         }
     }
 
-    /// The screen after a file was dropped on the window: the form with that
-    /// file, from wherever a new job can be started.
-    fn with_dropped(self, path: &Path) -> Self {
+    /// The screen after files were dropped on the window: the form with
+    /// those files, from wherever a new batch can be started.
+    fn with_dropped(self, paths: &[PathBuf]) -> Self {
         let mut form = match self {
             Self::Editing(form) | Self::Confirming { form, .. } | Self::Failed { form, .. } => form,
             Self::Done(finished) => finished.form,
             Self::Running(run) => return Self::Running(run),
         };
-        form.set_input(path);
+        form.set_inputs(paths);
         Self::Editing(form)
     }
 }
@@ -138,16 +130,16 @@ pub(crate) struct StemSplitApp {
     /// What the form shows about the model store: whether a model still has
     /// to be downloaded, and how much the downloaded ones take. Jobs open
     /// the store themselves. Absent when the system offers no cache
-    /// directory, in which case nothing is shown and the job reports the
+    /// directory, in which case nothing is shown and the batch reports the
     /// problem.
     downloads: Option<Downloads>,
     screen: Screen,
 }
 
 impl StemSplitApp {
-    /// `input` is a file to start with, as when the application is launched
-    /// by opening a file with it.
-    pub(crate) fn new(settings: &Settings, input: Option<&Path>) -> Self {
+    /// `inputs` are files to start with, as when the application is
+    /// launched by opening files with it.
+    pub(crate) fn new(settings: &Settings, inputs: &[PathBuf]) -> Self {
         let downloads = match ModelStore::in_user_cache() {
             Ok(store) => Some(Downloads::new(store)),
             Err(error) => {
@@ -157,9 +149,7 @@ impl StemSplitApp {
         };
         let mut form = Form::with(settings);
         form.refresh_download(downloads.as_ref().map(Downloads::store));
-        if let Some(path) = input {
-            form.set_input(path);
-        }
+        form.set_inputs(inputs);
         Self {
             locale: settings.locale,
             downloads,
@@ -171,7 +161,7 @@ impl StemSplitApp {
         self.downloads.as_ref().map(Downloads::store)
     }
 
-    /// Whether downloaded models are being deleted right now. No job may
+    /// Whether downloaded models are being deleted right now. No batch may
     /// start meanwhile: a model it found in place could vanish under it.
     fn clearing(&self) -> bool {
         self.downloads.as_ref().is_some_and(Downloads::is_clearing)
@@ -190,10 +180,7 @@ impl StemSplitApp {
             Screen::Confirming { form, existing } => {
                 match view::confirming(ui, locale, &existing) {
                     Some(ConfirmingAction::Replace) => {
-                        match form.request(OverwritePolicy::Replace) {
-                            Some(request) => launch(form, request, ui.ctx()),
-                            None => Screen::Editing(form),
-                        }
+                        prepare(form, OverwritePolicy::Replace, ui.ctx())
                     }
                     Some(ConfirmingAction::Back) => Screen::Editing(form),
                     None => Screen::Confirming { form, existing },
@@ -201,10 +188,13 @@ impl StemSplitApp {
             }
             Screen::Running(run) => self.follow(ui, run),
             Screen::Done(finished) => show_finished(ui, locale, finished),
-            Screen::Failed { form, failure } => match view::failed(ui, locale, &failure) {
-                Some(FailedAction::Back) => Screen::Editing(form),
-                None => Screen::Failed { form, failure },
-            },
+            Screen::Failed { form, failure } => {
+                let files = form.inputs().map_or(1, |inputs| inputs.count().get());
+                match view::failed(ui, locale, files, &failure) {
+                    Some(FailedAction::Back) => Screen::Editing(form),
+                    None => Screen::Failed { form, failure },
+                }
+            }
         }
     }
 
@@ -217,9 +207,9 @@ impl StemSplitApp {
         frame: &eframe::Frame,
     ) -> Screen {
         match action {
-            EditingAction::PickInput => {
-                if let Some(path) = dialogs::pick_audio_file(self.locale, frame) {
-                    form.set_input(&path);
+            EditingAction::PickInputs => {
+                if let Some(paths) = dialogs::pick_audio_files(self.locale, frame) {
+                    form.set_inputs(&paths);
                 }
             }
             EditingAction::PickOutputFolder => {
@@ -245,78 +235,86 @@ impl StemSplitApp {
                 if self.clearing() {
                     return Screen::Editing(form);
                 }
-                let Some(request) = form.request(OverwritePolicy::Refuse) else {
-                    return Screen::Editing(form);
-                };
-                let existing = request.existing_outputs();
-                return if existing.is_empty() {
-                    launch(form, request, context)
-                } else {
-                    Screen::Confirming { form, existing }
-                };
+                return prepare(form, OverwritePolicy::Refuse, context);
             }
         }
         Screen::Editing(form)
     }
 
-    /// Takes in what a running job has reported and either moves on to its
-    /// result or draws its progress.
-    fn follow(&mut self, ui: &mut egui::Ui, mut run: Run) -> Screen {
+    /// Takes in what the batch has reported and either moves on to its
+    /// results or draws its progress.
+    fn follow(&mut self, ui: &mut egui::Ui, mut run: Box<Run>) -> Screen {
         let now = Instant::now();
         let polled = run.worker.poll();
-        if let Some(report) = polled.progress {
-            run.timing.observe(report, now);
-            run.progress = Some(report);
+        for event in polled.events {
+            run.tracker.apply(event, now);
         }
-        let Some(outcome) = polled.outcome else {
-            ui.ctx().request_repaint_after(CLOCK_TICK);
-            let clock = Clock {
-                elapsed: run.timing.elapsed(now),
-                remaining: run.timing.remaining(now),
-            };
-            match view::running(ui, self.locale, run.progress, clock, run.stopping) {
-                Some(RunningAction::Cancel) => {
-                    run.worker.cancel();
-                    run.stopping = Stopping::Requested;
+        match polled.channel {
+            Channel::Open => {
+                ui.ctx().request_repaint_after(CLOCK_TICK);
+                let overview = run.tracker.overview(now);
+                match view::running(ui, self.locale, &overview, run.stopping) {
+                    Some(RunningAction::Cancel) => {
+                        run.worker.cancel();
+                        run.stopping = Stopping::Requested;
+                    }
+                    None => {}
                 }
-                None => {}
+                return Screen::Running(run);
             }
-            return Screen::Running(run);
-        };
+            Channel::Ended | Channel::Lost => {}
+        }
 
-        // Whatever the outcome, the job may have downloaded the model.
+        // Whatever the outcome, the batch may have downloaded the model.
         if let Some(downloads) = &mut self.downloads {
             downloads.refresh();
         }
         let mut form = run.form;
         form.refresh_download(self.store());
-        match outcome {
-            Outcome::Completed(output) => Screen::Done(Finished {
+        match run.tracker.finish(polled.channel, now) {
+            End::NotFetched(failure) => Screen::Failed { form, failure },
+            End::Cancelled => Screen::Editing(form),
+            End::Results(results) => Screen::Done(Finished {
                 form,
-                folder: run.folder,
-                output,
-                took: run.timing.elapsed(now),
+                results,
                 problem: None,
             }),
-            Outcome::Cancelled => Screen::Editing(form),
-            Outcome::Failed(failure) => Screen::Failed { form, failure },
         }
     }
 }
 
-/// Draws the result of a job and applies what the user does with it.
+/// Starts the batch the form describes, unless its files clash or results
+/// of an earlier run are in the way and `overwrite` does not allow
+/// replacing them, in which case the user is asked first.
+fn prepare(mut form: Form, overwrite: OverwritePolicy, context: &egui::Context) -> Screen {
+    match form.batch(overwrite) {
+        None => Screen::Editing(form),
+        Some(Err(clash)) => {
+            form.report_clash(clash);
+            Screen::Editing(form)
+        }
+        Some(Ok(batch)) => {
+            let existing = match overwrite {
+                OverwritePolicy::Refuse => batch.existing_outputs(),
+                OverwritePolicy::Replace => Vec::new(),
+            };
+            if existing.is_empty() {
+                launch(form, batch, context)
+            } else {
+                Screen::Confirming { form, existing }
+            }
+        }
+    }
+}
+
+/// Draws the results of a batch and applies what the user does with them.
 fn show_finished(ui: &mut egui::Ui, locale: Locale, mut finished: Finished) -> Screen {
-    let action = view::done(
-        ui,
-        locale,
-        &finished.folder,
-        &finished.output,
-        finished.took,
-        finished.problem.as_ref(),
-    );
+    let action = view::done(ui, locale, &finished.results, finished.problem.as_ref());
     match action {
-        Some(DoneAction::OpenFolder) => {
-            finished.problem = open::that_detached(&finished.folder).err();
+        Some(DoneAction::OpenFolder(index)) => {
+            if let Some(file) = finished.results.files.get(index) {
+                finished.problem = open::that_detached(&file.folder).err();
+            }
             Screen::Done(finished)
         }
         Some(DoneAction::Back) => Screen::Editing(finished.form),
@@ -324,18 +322,16 @@ fn show_finished(ui: &mut egui::Ui, locale: Locale, mut finished: Finished) -> S
     }
 }
 
-/// Starts the job and shows its progress, or the reason it could not start.
-fn launch(form: Form, request: SeparationRequest, context: &egui::Context) -> Screen {
-    let folder = request.output().path().to_path_buf();
-    match Worker::start(request, context.clone()) {
-        Ok(worker) => Screen::Running(Run {
+/// Starts the batch and shows its progress, or the reason it could not start.
+fn launch(form: Form, batch: Batch, context: &egui::Context) -> Screen {
+    let tracker = Tracker::new(&batch, Instant::now());
+    match Worker::start(batch, context.clone()) {
+        Ok(worker) => Screen::Running(Box::new(Run {
             form,
-            folder,
             worker,
-            progress: None,
-            timing: Timing::starting_at(Instant::now()),
+            tracker,
             stopping: Stopping::No,
-        }),
+        })),
         Err(error) => Screen::Failed {
             form,
             failure: Failure::NotStarted(error),
@@ -345,21 +341,20 @@ fn launch(form: Form, request: SeparationRequest, context: &egui::Context) -> Sc
 
 /// What the user is doing with files dragged from outside the window.
 struct Dragging {
-    /// A file let go of over the window in this frame.
-    dropped: Option<PathBuf>,
+    /// Files let go of over the window in this frame.
+    dropped: Vec<PathBuf>,
     /// Whether files are being held over the window.
     hovering: bool,
 }
 
 fn dragging(context: &egui::Context) -> Dragging {
     context.input(|input| Dragging {
-        // Several files dropped at once: the application splits one at a
-        // time, so the first is taken.
         dropped: input
             .raw
             .dropped_files
-            .first()
-            .map(|file| file.path().to_path_buf()),
+            .iter()
+            .map(|file| file.path().to_path_buf())
+            .collect(),
         hovering: !input.raw.hovered_files.is_empty(),
     })
 }
@@ -378,8 +373,8 @@ impl eframe::App for StemSplitApp {
         }
         let dragging = dragging(ui.ctx());
         let mut screen = mem::take(&mut self.screen);
-        if let Some(path) = &dragging.dropped {
-            screen = screen.with_dropped(path);
+        if !dragging.dropped.is_empty() {
+            screen = screen.with_dropped(&dragging.dropped);
         }
         self.screen = egui::CentralPanel::default()
             .show(ui, |ui| self.step(ui, frame, screen))
@@ -397,7 +392,7 @@ impl eframe::App for StemSplitApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         match mem::take(&mut self.screen) {
-            // Give the job the chance to remove its unfinished files.
+            // Give the jobs the chance to remove their unfinished files.
             Screen::Running(run) => run.worker.stop(EXIT_PATIENCE),
             Screen::Editing(_)
             | Screen::Confirming { .. }
@@ -409,7 +404,7 @@ impl eframe::App for StemSplitApp {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fs};
+    use std::{error::Error, fs, path::Path};
 
     use stem_split_core::domain::InputFile;
 
@@ -421,19 +416,24 @@ mod tests {
         Ok(path)
     }
 
-    fn input_of(screen: &Screen) -> Option<&Path> {
-        screen.form().input().map(InputFile::path)
+    fn inputs_of(screen: &Screen) -> Vec<&Path> {
+        screen
+            .form()
+            .inputs()
+            .map(|inputs| inputs.iter().map(InputFile::path).collect())
+            .unwrap_or_default()
     }
 
     #[test]
-    fn dropped_file_becomes_the_input_of_the_form() -> Result<(), Box<dyn Error>> {
+    fn dropped_files_become_the_inputs_of_the_form() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
-        let path = audio_file(directory.path(), "song.flac")?;
+        let first = audio_file(directory.path(), "song.flac")?;
+        let second = audio_file(directory.path(), "other.mp3")?;
 
-        let screen = Screen::default().with_dropped(&path);
+        let screen = Screen::default().with_dropped(&[first.clone(), second.clone()]);
 
         assert!(matches!(screen, Screen::Editing(_)));
-        assert_eq!(input_of(&screen), Some(path.as_path()));
+        assert_eq!(inputs_of(&screen), [first.as_path(), second.as_path()]);
         Ok(())
     }
 
@@ -443,10 +443,12 @@ mod tests {
         let good = audio_file(directory.path(), "song.flac")?;
         let bad = audio_file(directory.path(), "notes.txt")?;
 
-        let screen = Screen::default().with_dropped(&good).with_dropped(&bad);
+        let screen = Screen::default()
+            .with_dropped(std::slice::from_ref(&good))
+            .with_dropped(&[bad]);
 
-        // The file chosen before stays; the complaint is shown next to it.
-        assert_eq!(input_of(&screen), Some(good.as_path()));
+        // The files chosen before stay; the complaint is shown next to them.
+        assert_eq!(inputs_of(&screen), [good.as_path()]);
         assert!(screen.form().problem().is_some());
         Ok(())
     }
@@ -466,9 +468,9 @@ mod tests {
 
         for screen in [failed, confirming] {
             assert_eq!(screen.drop_policy(), Drop::Accepted);
-            let next = screen.with_dropped(&path);
+            let next = screen.with_dropped(std::slice::from_ref(&path));
             assert!(matches!(next, Screen::Editing(_)));
-            assert_eq!(input_of(&next), Some(path.as_path()));
+            assert_eq!(inputs_of(&next), [path.as_path()]);
         }
         Ok(())
     }
@@ -480,10 +482,22 @@ mod tests {
             ..Settings::initial()
         };
 
-        let app = StemSplitApp::new(&settings, None);
+        let app = StemSplitApp::new(&settings, &[]);
 
         assert_eq!(app.locale, Locale::Ru);
         assert_eq!(app.screen.form().settings(app.locale), settings);
-        assert!(input_of(&app.screen).is_none());
+        assert!(inputs_of(&app.screen).is_empty());
+    }
+
+    #[test]
+    fn files_from_the_command_line_are_on_the_form() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let first = audio_file(directory.path(), "a.mp3")?;
+        let second = audio_file(directory.path(), "b.mp3")?;
+
+        let app = StemSplitApp::new(&Settings::initial(), &[first.clone(), second.clone()]);
+
+        assert_eq!(inputs_of(&app.screen), [first.as_path(), second.as_path()]);
+        Ok(())
     }
 }

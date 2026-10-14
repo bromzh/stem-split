@@ -11,6 +11,7 @@ mod form;
 mod logging;
 mod settings;
 mod timing;
+mod tracker;
 mod view;
 mod worker;
 
@@ -34,9 +35,9 @@ const ICON: &[u8] = include_bytes!("../assets/icon-64.rgba");
 const ICON_SIZE: u32 = 64;
 
 fn run() -> eframe::Result {
-    // A file passed on the command line, as when a file is opened with the
-    // application, is what the form starts with.
-    let input = env::args_os().nth(1).map(PathBuf::from);
+    // Files passed on the command line, as when files are opened with the
+    // application, are what the form starts with.
+    let inputs: Vec<PathBuf> = env::args_os().skip(1).map(PathBuf::from).collect();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -59,7 +60,7 @@ fn run() -> eframe::Result {
             let settings = creation
                 .storage
                 .map_or_else(Settings::initial, Settings::load);
-            Ok(Box::new(StemSplitApp::new(&settings, input.as_deref())))
+            Ok(Box::new(StemSplitApp::new(&settings, &inputs)))
         }),
     )
 }

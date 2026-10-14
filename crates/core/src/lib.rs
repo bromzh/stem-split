@@ -4,6 +4,7 @@
 //! typed progress, results and errors, leaving presentation to the caller.
 
 pub mod audio;
+pub mod batch;
 pub mod domain;
 pub mod job;
 pub mod model;

@@ -14,11 +14,12 @@ mod output;
 mod stem;
 mod units;
 
+pub(crate) use self::input::comparable;
 pub use self::{
     audio_format::AudioFormat,
     digest::{DigestParseError, Sha256Digest},
     frames::{ChannelLengthMismatch, StereoFrames},
-    input::{InputFile, InputFileError},
+    input::{InputFile, InputFileError, InputFiles},
     model::ModelId,
     output::{OutputChoice, OutputDir, OutputDirError, OverwritePolicy},
     stem::{Stem, StemLayout},

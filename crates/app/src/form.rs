@@ -1,24 +1,27 @@
 //! What the user has chosen so far.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use stem_split_core::{
+    batch::{Batch, OutputClash},
     domain::{
-        ByteCount, InputFile, InputFileError, ModelId, OutputChoice, OutputDir, OutputDirError,
-        OverwritePolicy,
+        ByteCount, InputFile, InputFileError, InputFiles, ModelId, OutputChoice, OutputDir,
+        OutputDirError, OverwritePolicy,
     },
-    job::SeparationRequest,
     model::ModelStore,
     separate::DevicePreference,
 };
 
 use crate::{settings::Settings, view::text::Locale};
 
-/// Why the file or folder the user last picked was not accepted.
+/// Why what the user last picked, or asked for, was not accepted.
 #[derive(Debug)]
 pub(crate) enum Problem {
-    Input(InputFileError),
+    /// Files that cannot be split, one error each; never empty.
+    Inputs(Vec<InputFileError>),
     Output(OutputDirError),
+    /// Two of the files would write files with the same names.
+    Clash(OutputClash),
 }
 
 /// The choices on the main screen. Every field holds a value that has
@@ -26,7 +29,7 @@ pub(crate) enum Problem {
 /// was and is remembered in `problem` to be shown.
 #[derive(Debug, Default)]
 pub(crate) struct Form {
-    input: Option<InputFile>,
+    inputs: Option<InputFiles>,
     output: OutputChoice,
     model: ModelId,
     device: DevicePreference,
@@ -57,8 +60,8 @@ impl Form {
         }
     }
 
-    pub(crate) const fn input(&self) -> Option<&InputFile> {
-        self.input.as_ref()
+    pub(crate) const fn inputs(&self) -> Option<&InputFiles> {
+        self.inputs.as_ref()
     }
 
     pub(crate) const fn output(&self) -> &OutputChoice {
@@ -81,14 +84,25 @@ impl Form {
         self.download
     }
 
-    pub(crate) fn set_input(&mut self, path: &Path) {
-        match InputFile::new(path) {
-            Ok(input) => {
-                self.input = Some(input);
-                self.problem = None;
-            }
-            Err(error) => self.problem = Some(Problem::Input(error)),
+    /// Takes `paths` as the files to split, replacing the ones chosen
+    /// before. Those that cannot be split are left out and reported; if
+    /// none can, the earlier choice stays.
+    pub(crate) fn set_inputs(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
         }
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        for path in paths {
+            match InputFile::new(path) {
+                Ok(input) => accepted.push(input),
+                Err(error) => rejected.push(error),
+            }
+        }
+        if let Some(inputs) = InputFiles::new(accepted) {
+            self.inputs = Some(inputs);
+        }
+        self.problem = (!rejected.is_empty()).then_some(Problem::Inputs(rejected));
     }
 
     pub(crate) fn set_output_folder(&mut self, path: &Path) {
@@ -124,16 +138,22 @@ impl Form {
             .map(|_| self.model.spec().download_size());
     }
 
-    /// The job these choices describe, once an input file has been chosen.
-    pub(crate) fn request(&self, overwrite: OverwritePolicy) -> Option<SeparationRequest> {
-        let input = self.input.clone()?;
-        Some(SeparationRequest::new(
-            input,
+    /// The jobs these choices describe, once files have been chosen, or why
+    /// they cannot all be run together.
+    pub(crate) fn batch(&self, overwrite: OverwritePolicy) -> Option<Result<Batch, OutputClash>> {
+        let inputs = self.inputs.as_ref()?;
+        Some(Batch::new(
+            inputs,
             &self.output,
             self.model,
             self.device,
             overwrite,
         ))
+    }
+
+    /// Remembers why the chosen files cannot be split together, to show it.
+    pub(crate) fn report_clash(&mut self, clash: OutputClash) {
+        self.problem = Some(Problem::Clash(clash));
     }
 }
 
@@ -141,9 +161,28 @@ impl Form {
 mod tests {
     use std::{error::Error, fs};
 
-    use stem_split_core::domain::Stem;
+    use stem_split_core::{domain::Stem, job::SeparationRequest};
 
     use super::*;
+
+    fn audio(directory: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let path = directory.join(name);
+        fs::write(&path, b"")?;
+        Ok(path)
+    }
+
+    fn chosen(form: &Form) -> Vec<&Path> {
+        form.inputs()
+            .map(|inputs| inputs.iter().map(InputFile::path).collect())
+            .unwrap_or_default()
+    }
+
+    fn requests(form: &Form) -> Result<Vec<SeparationRequest>, Box<dyn Error>> {
+        let batch = form
+            .batch(OverwritePolicy::Refuse)
+            .ok_or("no batch for chosen files")??;
+        Ok(batch.requests().cloned().collect())
+    }
 
     #[test]
     fn form_starts_from_the_remembered_choices_and_reports_them_back() -> Result<(), Box<dyn Error>>
@@ -158,7 +197,7 @@ mod tests {
 
         let form = Form::with(&settings);
 
-        assert!(form.input().is_none());
+        assert!(form.inputs().is_none());
         assert!(form.problem().is_none());
         assert_eq!(form.model(), ModelId::HtdemucsFt);
         assert_eq!(form.device(), DevicePreference::Cpu);
@@ -170,55 +209,96 @@ mod tests {
     fn empty_form_describes_no_job() {
         let form = Form::default();
 
-        assert!(form.input().is_none());
+        assert!(form.inputs().is_none());
         assert_eq!(form.output(), &OutputChoice::BesideInput);
         assert_eq!(form.model(), ModelId::Htdemucs);
         assert_eq!(form.device(), DevicePreference::Auto);
-        assert!(form.request(OverwritePolicy::Refuse).is_none());
+        assert!(form.batch(OverwritePolicy::Refuse).is_none());
     }
 
     #[test]
-    fn chosen_file_makes_a_request_next_to_it() -> Result<(), Box<dyn Error>> {
+    fn chosen_files_make_one_job_each_next_to_them() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("song.mp3");
-        fs::write(&path, b"")?;
+        let first = audio(directory.path(), "song.mp3")?;
+        let second = audio(directory.path(), "other.flac")?;
         let mut form = Form::default();
 
-        form.set_input(&path);
+        form.set_inputs(&[first.clone(), second.clone()]);
 
         assert!(form.problem().is_none());
-        let request = form
-            .request(OverwritePolicy::Refuse)
-            .ok_or("no request for a chosen file")?;
-        assert_eq!(request.input().path(), path);
+        assert_eq!(chosen(&form), [first.as_path(), second.as_path()]);
+        let vocals: Vec<PathBuf> = requests(&form)?
+            .iter()
+            .map(|request| request.stem_path(Stem::Vocals))
+            .collect();
         assert_eq!(
-            request.stem_path(Stem::Vocals),
-            directory.path().join("song.vocals.wav")
+            vocals,
+            [
+                directory.path().join("song.vocals.wav"),
+                directory.path().join("other.vocals.wav")
+            ]
         );
         Ok(())
     }
 
     #[test]
-    fn rejected_file_keeps_the_previous_one_and_is_remembered() -> Result<(), Box<dyn Error>> {
+    fn new_choice_replaces_the_previous_one() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
-        let good = directory.path().join("song.flac");
-        let bad = directory.path().join("notes.txt");
-        fs::write(&good, b"")?;
-        fs::write(&bad, b"")?;
+        let first = audio(directory.path(), "a.mp3")?;
+        let second = audio(directory.path(), "b.mp3")?;
         let mut form = Form::default();
-        form.set_input(&good);
+        form.set_inputs(&[first]);
 
-        form.set_input(&bad);
+        form.set_inputs(std::slice::from_ref(&second));
 
-        assert_eq!(form.input().map(InputFile::path), Some(good.as_path()));
+        assert_eq!(chosen(&form), [second.as_path()]);
+        Ok(())
+    }
+
+    #[test]
+    fn files_that_cannot_be_split_are_left_out_and_reported() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let good = audio(directory.path(), "song.flac")?;
+        let bad = audio(directory.path(), "notes.txt")?;
+        let missing = directory.path().join("gone.mp3");
+        let mut form = Form::default();
+
+        form.set_inputs(&[bad.clone(), good.clone(), missing]);
+
+        assert_eq!(chosen(&form), [good.as_path()]);
         assert!(matches!(
             form.problem(),
-            Some(Problem::Input(InputFileError::UnsupportedFormat { .. }))
+            Some(Problem::Inputs(errors)) if errors.len() == 2
         ));
 
+        // A choice with nothing usable keeps the earlier one.
+        form.set_inputs(&[bad]);
+        assert_eq!(chosen(&form), [good.as_path()]);
+        assert!(matches!(form.problem(), Some(Problem::Inputs(errors)) if errors.len() == 1));
+
         // The next accepted pick clears the complaint.
-        form.set_input(&good);
+        form.set_inputs(&[good]);
         assert!(form.problem().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn files_that_would_overwrite_each_other_cannot_make_a_batch() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        form.set_inputs(&[
+            audio(directory.path(), "song.mp3")?,
+            audio(directory.path(), "song.flac")?,
+        ]);
+
+        let clash = form
+            .batch(OverwritePolicy::Refuse)
+            .ok_or("no batch")?
+            .err()
+            .ok_or("the files should clash")?;
+        form.report_clash(clash);
+
+        assert!(matches!(form.problem(), Some(Problem::Clash(_))));
         Ok(())
     }
 
@@ -226,24 +306,20 @@ mod tests {
     fn other_folder_receives_the_stems() -> Result<(), Box<dyn Error>> {
         let music = tempfile::tempdir()?;
         let stems = tempfile::tempdir()?;
-        let path = music.path().join("song.wav");
-        fs::write(&path, b"")?;
         let mut form = Form::default();
-        form.set_input(&path);
+        form.set_inputs(&[audio(music.path(), "song.wav")?]);
 
         form.set_output_folder(stems.path());
-        let custom = form
-            .request(OverwritePolicy::Refuse)
-            .ok_or("no request")?
-            .stem_path(Stem::Bass);
+        let custom = requests(&form)?
+            .first()
+            .map(|request| request.stem_path(Stem::Bass));
         form.set_output_beside_input();
-        let beside = form
-            .request(OverwritePolicy::Refuse)
-            .ok_or("no request")?
-            .stem_path(Stem::Bass);
+        let beside = requests(&form)?
+            .first()
+            .map(|request| request.stem_path(Stem::Bass));
 
-        assert_eq!(custom, stems.path().join("song.bass.wav"));
-        assert_eq!(beside, music.path().join("song.bass.wav"));
+        assert_eq!(custom, Some(stems.path().join("song.bass.wav")));
+        assert_eq!(beside, Some(music.path().join("song.bass.wav")));
         Ok(())
     }
 

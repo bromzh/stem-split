@@ -9,6 +9,7 @@ mod providers;
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    thread,
 };
 
 use ort::{session::Session, value::TensorRef};
@@ -122,6 +123,42 @@ enum Fallback {
     Unavailable,
 }
 
+/// How many threads a CPU session may use; at least one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuThreads(NonZeroUsize);
+
+impl CpuThreads {
+    #[must_use]
+    pub const fn new(threads: NonZeroUsize) -> Self {
+        Self(threads)
+    }
+
+    /// Every logical core. On the machine the settings were measured on,
+    /// that is about a tenth faster than ONNX Runtime's default of one
+    /// thread per physical core.
+    #[must_use]
+    pub fn all() -> Self {
+        Self(thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
+    }
+
+    /// An equal share of the cores for each of `sessions` running at once,
+    /// so that together they do not ask for more threads than there are
+    /// cores.
+    #[must_use]
+    pub fn share(sessions: NonZeroUsize) -> Self {
+        Self::all().divided_by(sessions)
+    }
+
+    fn divided_by(self, sessions: NonZeroUsize) -> Self {
+        Self(NonZeroUsize::new(self.0.get() / sessions.get()).unwrap_or(NonZeroUsize::MIN))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> NonZeroUsize {
+        self.0
+    }
+}
+
 /// One model graph loaded into ONNX Runtime.
 #[derive(Debug)]
 pub struct OrtSeparator {
@@ -129,6 +166,8 @@ pub struct OrtSeparator {
     device: ActiveDevice,
     fallback: Fallback,
     graph: PathBuf,
+    /// For a CPU session, including one that replaces a failed GPU.
+    threads: CpuThreads,
     stems: NonZeroUsize,
     stft: Stft,
     /// Model input `MIX`: left channel, then right.
@@ -141,6 +180,7 @@ pub struct OrtSeparator {
 
 impl OrtSeparator {
     /// Loads the graph at `graph`, which produces the stems of `layout`.
+    /// On the CPU it runs on `threads` threads.
     ///
     /// Under [`DevicePreference::Auto`] a GPU that cannot be initialized is
     /// replaced by the CPU right here, and one that fails or returns garbage
@@ -154,9 +194,10 @@ impl OrtSeparator {
         graph: &Path,
         layout: StemLayout,
         preference: DevicePreference,
+        threads: CpuThreads,
     ) -> Result<Self, InferenceError> {
         let on_cpu = || {
-            providers::cpu_session(graph).map_err(|source| InferenceError::Load {
+            providers::cpu_session(graph, threads).map_err(|source| InferenceError::Load {
                 path: graph.to_path_buf(),
                 source: Box::new(source),
             })
@@ -189,6 +230,7 @@ impl OrtSeparator {
             device,
             fallback,
             graph: graph.to_path_buf(),
+            threads,
             stems: layout.count(),
             stft: Stft::new(),
             mix: Vec::with_capacity(CHANNELS * SEGMENT_FRAMES),
@@ -304,9 +346,11 @@ impl Separator for OrtSeparator {
             (ActiveDevice::DirectMl, Fallback::ToCpu) => {
                 log::warn!("the GPU failed, continuing on the CPU: {error}");
                 self.session =
-                    providers::cpu_session(&self.graph).map_err(|source| InferenceError::Load {
-                        path: self.graph.clone(),
-                        source: Box::new(source),
+                    providers::cpu_session(&self.graph, self.threads).map_err(|source| {
+                        InferenceError::Load {
+                            path: self.graph.clone(),
+                            source: Box::new(source),
+                        }
                     })?;
                 self.device = ActiveDevice::Cpu;
                 self.fallback = Fallback::Unavailable;
@@ -473,7 +517,12 @@ mod tests {
     fn missing_graph_file_is_a_load_error() {
         let graph = PathBuf::from("no-such-directory-for-stem-split").join("graph.onnx");
 
-        let result = OrtSeparator::load(&graph, StemLayout::FOUR, DevicePreference::Cpu);
+        let result = OrtSeparator::load(
+            &graph,
+            StemLayout::FOUR,
+            DevicePreference::Cpu,
+            CpuThreads::all(),
+        );
 
         assert!(matches!(
             result,
@@ -521,7 +570,7 @@ mod tests {
 
     /// Runs the reference export, whose graph contains the transforms.
     fn run_reference(graph: &Path, segment: &Segment) -> Result<ChunkStems, Box<dyn Error>> {
-        let mut session = providers::cpu_session(graph)?;
+        let mut session = providers::cpu_session(graph, CpuThreads::all())?;
         let mix: Vec<f32> = segment
             .left()
             .iter()
@@ -556,6 +605,7 @@ mod tests {
                 &models.join(format!("hrsadeghi/{name}.onnx")),
                 layout,
                 DevicePreference::Cpu,
+                CpuThreads::all(),
             )?
             .separate(&segment)?;
             let reference = run_reference(&models.join(format!("smank/{name}.onnx")), &segment)?;
@@ -573,8 +623,18 @@ mod tests {
         let graph = stage_zero_models().join("hrsadeghi/htdemucs.onnx");
         let segment = test_segment();
 
-        let mut gpu = OrtSeparator::load(&graph, StemLayout::FOUR, DevicePreference::Gpu)?;
-        let mut cpu = OrtSeparator::load(&graph, StemLayout::FOUR, DevicePreference::Cpu)?;
+        let mut gpu = OrtSeparator::load(
+            &graph,
+            StemLayout::FOUR,
+            DevicePreference::Gpu,
+            CpuThreads::all(),
+        )?;
+        let mut cpu = OrtSeparator::load(
+            &graph,
+            StemLayout::FOUR,
+            DevicePreference::Cpu,
+            CpuThreads::all(),
+        )?;
         assert_eq!(gpu.device(), ActiveDevice::DirectMl);
         assert_eq!(cpu.device(), ActiveDevice::Cpu);
 

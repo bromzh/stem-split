@@ -7,7 +7,8 @@ Everything runs on this computer; no file is sent anywhere.
 How to use
 ----------
 1. Keep all the files of this folder together and run stem-split.exe.
-2. Choose an audio file (MP3, FLAC, WAV, OGG or M4A), or drag it onto the window.
+2. Choose one or more audio files (MP3, FLAC, WAV, OGG or M4A), or drag them
+   onto the window. Several files are split two at a time.
 3. Press "Split". The stems appear next to the file as
    <name>.drums.wav, <name>.bass.wav, <name>.other.wav and <name>.vocals.wav.
 
@@ -46,7 +47,8 @@ stem-split (по-русски)
 Как пользоваться
 ----------------
 1. Держите все файлы этой папки вместе и запустите stem-split.exe.
-2. Выберите аудиофайл (MP3, FLAC, WAV, OGG или M4A) или перетащите его в окно.
+2. Выберите один или несколько аудиофайлов (MP3, FLAC, WAV, OGG или M4A) или
+   перетащите их в окно. Несколько файлов делятся по два одновременно.
 3. Нажмите «Разделить». Стемы появятся рядом с файлом:
    <имя>.drums.wav, <имя>.bass.wav, <имя>.other.wav и <имя>.vocals.wav.
 

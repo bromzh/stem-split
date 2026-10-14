@@ -9,13 +9,13 @@ use stem_split_core::domain::AudioFormat;
 
 use crate::view::text::{self, Locale, Text};
 
-/// Asks for an audio file, offering only the supported formats.
-pub(crate) fn pick_audio_file(locale: Locale, parent: &eframe::Frame) -> Option<PathBuf> {
+/// Asks for one or more audio files, offering only the supported formats.
+pub(crate) fn pick_audio_files(locale: Locale, parent: &eframe::Frame) -> Option<Vec<PathBuf>> {
     let extensions: Vec<&str> = AudioFormat::all_extensions().collect();
     rfd::FileDialog::new()
         .add_filter(Text::AudioFiles.get(locale), &extensions)
         .set_parent(parent)
-        .pick_file()
+        .pick_files()
 }
 
 /// Tells the user, in a message box, that the application could not start.

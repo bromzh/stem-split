@@ -119,6 +119,24 @@ pub fn decode(input: &InputFile) -> Result<DecodedAudio, DecodeError> {
     collector.finish()
 }
 
+/// How long the audio in `input` is, as its container states it, found
+/// without decoding anything.
+///
+/// `None` when the container does not state it or the file cannot be
+/// opened. The length is meant for planning only; [`decode`] reports what
+/// is wrong with a file.
+#[must_use]
+pub fn stated_length(input: &InputFile) -> Option<Duration> {
+    let (format, _, track_id) = open(input.path()).ok()?;
+    let track = format.tracks().iter().find(|track| track.id == track_id)?;
+    let frames = track.num_frames?;
+    let rate = track.codec_params.as_ref()?.audio()?.sample_rate?;
+    let nanoseconds = u128::from(frames).saturating_mul(1_000_000_000) / u128::from(rate.max(1));
+    Some(Duration::from_nanos(
+        u64::try_from(nanoseconds).unwrap_or(u64::MAX),
+    ))
+}
+
 type Opened = (Box<dyn FormatReader>, Box<dyn AudioDecoder>, u32);
 
 /// Opens the container and creates a decoder for its default audio track.
@@ -293,6 +311,27 @@ mod tests {
 
         assert_eq!(audio.rate(), SampleRate::from_hertz(48_000).ok_or("rate")?);
         assert_eq!(audio.frames().as_slice(), frames);
+        Ok(())
+    }
+
+    #[test]
+    fn length_is_read_from_the_header_and_missing_for_unreadable_files()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("two seconds.wav");
+        let mut writer = hound::WavWriter::create(&path, spec(1, 8_000, 16, SampleFormat::Int))?;
+        for _ in 0..16_000 {
+            writer.write_sample(0_i16)?;
+        }
+        writer.finalize()?;
+        let broken = directory.path().join("broken.wav");
+        fs::write(&broken, b"not a wav file")?;
+
+        assert_eq!(
+            stated_length(&InputFile::new(&path)?),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(stated_length(&InputFile::new(&broken)?), None);
         Ok(())
     }
 

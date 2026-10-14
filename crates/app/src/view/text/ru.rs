@@ -41,6 +41,10 @@ pub(super) const fn text(text: Text) -> &'static str {
         Text::ExistingFilesHeading => "Эти файлы уже существуют и будут заменены:",
         Text::DoneHeading => "Готово",
         Text::FailedHeading => "Файл не разделён",
+        Text::NoFileSplit => "Ни один файл не разделён",
+        Text::Waiting => "В очереди",
+        Text::FileFailed => "Ошибка",
+        Text::FileCancelled => "Отменено",
         Text::DropHint => "Отпустите аудиофайл здесь",
     }
 }
@@ -101,7 +105,7 @@ const fn on_device(device: ActiveDevice) -> &'static str {
     }
 }
 
-pub(super) fn progress_status(progress: Progress) -> String {
+pub(super) fn row_status(progress: Progress) -> String {
     match progress {
         Progress::FetchingModel(download) => format!(
             "Загрузка модели: {} из {} МБ",
@@ -115,16 +119,61 @@ pub(super) fn progress_status(progress: Progress) -> String {
             done,
             total,
             device,
-        } => format!("Разделение: часть {done} из {total}, {}", on_device(device)),
+        } => format!("Часть {done} из {total} · {}", device_name(device)),
         Progress::Finalizing => "Запись файлов…".to_owned(),
     }
 }
 
-pub(super) fn time_status(elapsed: &str, remaining: Option<&str>) -> String {
-    match remaining {
-        Some(remaining) => format!("Прошло {elapsed} · осталось около {remaining}"),
-        None => format!("Прошло {elapsed}"),
+/// The device as a name: "видеокарта".
+const fn device_name(device: ActiveDevice) -> &'static str {
+    match device {
+        ActiveDevice::DirectMl => "видеокарта",
+        ActiveDevice::Cpu => "процессор",
     }
+}
+
+pub(super) fn completed_on(device: ActiveDevice) -> String {
+    format!("Готово · {}", device_name(device))
+}
+
+pub(super) fn row_time(elapsed: &str, remaining: Option<&str>) -> String {
+    match remaining {
+        Some(remaining) => format!("{elapsed} · ещё ~{remaining}"),
+        None => elapsed.to_owned(),
+    }
+}
+
+pub(super) fn batch_time_status(elapsed: &str, remaining: Option<&str>) -> String {
+    match remaining {
+        Some(remaining) => format!("Все файлы: прошло {elapsed} · осталось около {remaining}"),
+        None => format!("Все файлы: прошло {elapsed}"),
+    }
+}
+
+pub(super) fn files_chosen(count: usize) -> String {
+    format!("{count} {}", plural(count, "файл", "файла", "файлов"))
+}
+
+pub(super) fn partly_done(completed: usize, total: usize) -> String {
+    format!("Разделено файлов: {completed} из {total}")
+}
+
+pub(super) fn total_summary(took: &str) -> String {
+    format!("На все файлы ушло {took}.")
+}
+
+pub(super) fn clash_problem(first: &str, second: &str) -> Message {
+    Message::plain(format!(
+        "У «{first}» и «{second}» получились бы файлы с одинаковыми именами. \
+         Выберите только один из них или переименуйте один."
+    ))
+}
+
+pub(super) fn more_problems(count: usize) -> String {
+    format!(
+        "…и ещё {count} {}, которые нельзя разделить.",
+        plural(count, "файл", "файла", "файлов")
+    )
 }
 
 pub(super) fn finished_summary(took: &str, device: ActiveDevice) -> String {

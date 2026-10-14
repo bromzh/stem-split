@@ -40,6 +40,10 @@ pub(super) const fn text(text: Text) -> &'static str {
         Text::ExistingFilesHeading => "These files already exist and will be replaced:",
         Text::DoneHeading => "Done",
         Text::FailedHeading => "The file was not split",
+        Text::NoFileSplit => "No file was split",
+        Text::Waiting => "Waiting",
+        Text::FileFailed => "Failed",
+        Text::FileCancelled => "Cancelled",
         Text::DropHint => "Drop the audio file here",
     }
 }
@@ -84,7 +88,7 @@ const fn on_device(device: ActiveDevice) -> &'static str {
     }
 }
 
-pub(super) fn progress_status(progress: Progress) -> String {
+pub(super) fn row_status(progress: Progress) -> String {
     match progress {
         Progress::FetchingModel(download) => format!(
             "Downloading the model: {} of {} MB",
@@ -97,16 +101,59 @@ pub(super) fn progress_status(progress: Progress) -> String {
             done,
             total,
             device,
-        } => format!("Splitting: part {done} of {total}, {}", on_device(device)),
+        } => format!("Part {done} of {total} · {}", device_name(device)),
         Progress::Finalizing => "Writing the files…".to_owned(),
     }
 }
 
-pub(super) fn time_status(elapsed: &str, remaining: Option<&str>) -> String {
-    match remaining {
-        Some(remaining) => format!("Elapsed {elapsed} · about {remaining} left"),
-        None => format!("Elapsed {elapsed}"),
+/// The device as a name: "graphics card".
+const fn device_name(device: ActiveDevice) -> &'static str {
+    match device {
+        ActiveDevice::DirectMl => "graphics card",
+        ActiveDevice::Cpu => "processor",
     }
+}
+
+pub(super) fn completed_on(device: ActiveDevice) -> String {
+    format!("Done · {}", device_name(device))
+}
+
+pub(super) fn row_time(elapsed: &str, remaining: Option<&str>) -> String {
+    match remaining {
+        Some(remaining) => format!("{elapsed} · ~{remaining} left"),
+        None => elapsed.to_owned(),
+    }
+}
+
+pub(super) fn batch_time_status(elapsed: &str, remaining: Option<&str>) -> String {
+    match remaining {
+        Some(remaining) => format!("All files: elapsed {elapsed} · about {remaining} left"),
+        None => format!("All files: elapsed {elapsed}"),
+    }
+}
+
+pub(super) fn files_chosen(count: usize) -> String {
+    format!("{count} files")
+}
+
+pub(super) fn partly_done(completed: usize, total: usize) -> String {
+    format!("{completed} of {total} files split")
+}
+
+pub(super) fn total_summary(took: &str) -> String {
+    format!("All files took {took}.")
+}
+
+pub(super) fn clash_problem(first: &str, second: &str) -> Message {
+    Message::plain(format!(
+        "\"{first}\" and \"{second}\" would be split into files with the same names. \
+         Choose only one of them, or rename one."
+    ))
+}
+
+pub(super) fn more_problems(count: usize) -> String {
+    let files = if count == 1 { "file" } else { "files" };
+    format!("…and {count} more {files} that cannot be split.")
 }
 
 pub(super) fn finished_summary(took: &str, device: ActiveDevice) -> String {

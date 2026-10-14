@@ -1,6 +1,8 @@
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
-    fs, io,
+    fs, io, iter,
+    num::NonZeroUsize,
     path::{self, Path, PathBuf},
 };
 
@@ -91,6 +93,67 @@ impl InputFile {
     pub const fn format(&self) -> AudioFormat {
         self.format
     }
+}
+
+/// Audio files chosen together: at least one, each at most once, in the
+/// order they were chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputFiles {
+    first: InputFile,
+    rest: Vec<InputFile>,
+}
+
+impl InputFiles {
+    #[must_use]
+    pub const fn one(file: InputFile) -> Self {
+        Self {
+            first: file,
+            rest: Vec::new(),
+        }
+    }
+
+    /// The files of `files` in their order, a file given again being kept
+    /// only the first time. `None` if there are none.
+    pub fn new(files: impl IntoIterator<Item = InputFile>) -> Option<Self> {
+        let mut seen = HashSet::new();
+        let mut unique = files
+            .into_iter()
+            .filter(|file| seen.insert(comparable(file.path())));
+        let first = unique.next()?;
+        Some(Self {
+            first,
+            rest: unique.collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn first(&self) -> &InputFile {
+        &self.first
+    }
+
+    /// The files in the order they were chosen.
+    pub fn iter(&self) -> impl Iterator<Item = &InputFile> {
+        iter::once(&self.first).chain(&self.rest)
+    }
+
+    #[must_use]
+    pub const fn count(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+}
+
+/// `path` in the form the file system compares names in: regardless of
+/// letter case on Windows, exactly elsewhere.
+#[cfg(windows)]
+pub(crate) fn comparable(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+/// `path` in the form the file system compares names in: regardless of
+/// letter case on Windows, exactly elsewhere.
+#[cfg(not(windows))]
+pub(crate) fn comparable(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 #[cfg(test)]

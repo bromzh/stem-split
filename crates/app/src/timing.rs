@@ -1,9 +1,13 @@
-//! How long a job has been running, and how long its current stage will take.
+//! How long a job has been running, how long its current stage will take,
+//! and how long a whole batch of jobs still needs.
 //!
 //! Nothing here reads the clock: every method is given the current moment, so
 //! the arithmetic can be tested with made-up times.
 
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
 use stem_split_core::job::Progress;
 
@@ -32,6 +36,86 @@ struct Stage {
     first: Reading,
     latest: Reading,
     total: u64,
+}
+
+/// How long something has run and how long it should still take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Clock {
+    pub(crate) elapsed: Duration,
+    pub(crate) remaining: Option<Duration>,
+}
+
+/// How the separation of one file has gone so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pace {
+    /// From the start of the file to its first finished model run: reading
+    /// the file, loading the graph and warming up the device.
+    pub(crate) lead: Duration,
+    /// Model runs after the first one, and the time they took.
+    pub(crate) runs: u64,
+    pub(crate) spent: Duration,
+}
+
+/// What is left of one file, as the estimate for a whole batch sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Left {
+    /// Running, with this much time left by its own estimate.
+    Measured(Duration),
+    /// Expected to take `runs` model runs in all, of which `elapsed` has
+    /// passed; nothing for a file that waits.
+    Runs { runs: u64, elapsed: Duration },
+}
+
+/// Estimated time until every file of a batch is split, `lanes` files at a
+/// time.
+///
+/// A running file that estimates itself takes that long. Any other takes
+/// the average lead of the files measured so far, plus its runs after the
+/// first at their average pace, less the time it has already run. `files`
+/// come running ones first, then waiting ones in the order they will start;
+/// each is put on the lane that frees first, as the worker does, and the
+/// estimate is when the last lane frees. That keeps the fixed cost of every
+/// file apart from its runs, and a lone long file from being shared out
+/// over lanes it cannot use.
+///
+/// `None` until some file has finished a run after its first.
+pub(crate) fn batch_remaining(
+    files: &[Left],
+    paces: &[Pace],
+    lanes: NonZeroUsize,
+) -> Option<Duration> {
+    let measured = u32::try_from(paces.len()).ok().filter(|&count| count > 0)?;
+    let (lead, runs, spent) = paces.iter().fold(
+        (Duration::ZERO, 0_u64, Duration::ZERO),
+        |(lead, runs, spent), pace| {
+            (
+                lead.saturating_add(pace.lead),
+                runs.saturating_add(pace.runs),
+                spent.saturating_add(pace.spent),
+            )
+        },
+    );
+    if runs == 0 {
+        return None;
+    }
+    let lead = lead.checked_div(measured)?;
+    let at_pace = |count: u64| {
+        let nanoseconds = spent.as_nanos().saturating_mul(u128::from(count)) / u128::from(runs);
+        Duration::from_nanos(u64::try_from(nanoseconds).unwrap_or(u64::MAX))
+    };
+
+    let mut free = vec![Duration::ZERO; lanes.get()];
+    for file in files {
+        let time = match *file {
+            Left::Measured(remaining) => remaining,
+            Left::Runs { runs, elapsed } => lead
+                .saturating_add(at_pace(runs.saturating_sub(1)))
+                .saturating_sub(elapsed),
+        };
+        let lane = free.iter_mut().min()?;
+        *lane = lane.saturating_add(time);
+    }
+    free.into_iter().max()
 }
 
 /// The clock of a running job.
@@ -93,6 +177,19 @@ impl Timing {
         });
     }
 
+    /// How the separation has gone so far; `None` before its first run
+    /// and once it has moved on to writing the files.
+    pub(crate) fn pace(&self) -> Option<Pace> {
+        let stage = self
+            .stage
+            .filter(|stage| stage.measure == Measure::Separation)?;
+        Some(Pace {
+            lead: stage.first.at.saturating_duration_since(self.started),
+            runs: stage.latest.done.saturating_sub(stage.first.done),
+            spent: stage.latest.at.saturating_duration_since(stage.first.at),
+        })
+    }
+
     /// Time since the job started.
     pub(crate) fn elapsed(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.started)
@@ -120,8 +217,6 @@ impl Timing {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use stem_split_core::{
         domain::ByteCount, job::Progress, model::DownloadProgress, separate::ActiveDevice,
     };
@@ -136,6 +231,79 @@ mod tests {
             total: NonZeroUsize::new(total).unwrap_or(NonZeroUsize::MIN),
             device: ActiveDevice::Cpu,
         }
+    }
+
+    fn lanes(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// Two files measured: a lead of 3 s each, and 8 runs after the first
+    /// in 10 s, 1.25 s a run.
+    const PACES: [Pace; 2] = [
+        Pace {
+            lead: Duration::from_secs(3),
+            runs: 5,
+            spent: Duration::from_secs(5),
+        },
+        Pace {
+            lead: Duration::from_secs(3),
+            runs: 3,
+            spent: Duration::from_secs(5),
+        },
+    ];
+
+    #[test]
+    fn batch_estimate_needs_a_measured_pace() {
+        let waiting = [Left::Runs {
+            runs: 10,
+            elapsed: Duration::ZERO,
+        }];
+        assert_eq!(batch_remaining(&waiting, &[], lanes(2)), None);
+        let first_run_only = [Pace {
+            lead: 3 * SECOND,
+            runs: 0,
+            spent: Duration::ZERO,
+        }];
+        assert_eq!(batch_remaining(&waiting, &first_run_only, lanes(2)), None);
+    }
+
+    #[test]
+    fn waiting_file_takes_the_lane_that_frees_first() {
+        let files = [
+            Left::Measured(4 * SECOND),
+            Left::Measured(10 * SECOND),
+            // 3 s of lead and 9 runs at 1.25 s: 14.25 s, after the 4 s lane.
+            Left::Runs {
+                runs: 10,
+                elapsed: Duration::ZERO,
+            },
+        ];
+
+        assert_eq!(
+            batch_remaining(&files, &PACES, lanes(2)),
+            Some(Duration::from_millis(18_250))
+        );
+    }
+
+    #[test]
+    fn lone_file_is_not_shared_out_over_idle_lanes() {
+        let files = [Left::Measured(20 * SECOND)];
+
+        assert_eq!(batch_remaining(&files, &PACES, lanes(2)), Some(20 * SECOND));
+    }
+
+    #[test]
+    fn running_file_without_an_estimate_counts_what_has_passed() {
+        // 3 s + 1 run: 4.25 s, of which 2 s have passed.
+        let files = [Left::Runs {
+            runs: 2,
+            elapsed: 2 * SECOND,
+        }];
+
+        assert_eq!(
+            batch_remaining(&files, &PACES, lanes(2)),
+            Some(Duration::from_millis(2_250))
+        );
     }
 
     #[test]
