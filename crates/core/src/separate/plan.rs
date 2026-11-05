@@ -71,8 +71,12 @@ impl Normalization {
         (sample - self.mean) / self.deviation
     }
 
-    pub(crate) fn undo(self, sample: f32) -> f32 {
-        sample * self.deviation + self.mean
+    /// Undoes the normalization of a sum of `count` normalized parts. Each
+    /// part carried the offset, so the offset is applied once per part.
+    pub(crate) fn undo_sum(self, sample: f32, count: NonZeroUsize) -> f32 {
+        #[expect(clippy::cast_precision_loss, reason = "stem counts are single digits")]
+        let parts = count.get() as f32;
+        sample * self.deviation + self.mean * parts
     }
 }
 
@@ -298,9 +302,32 @@ mod tests {
         assert!((normalization.apply(4.0)).abs() < 1e-6);
         assert!((normalization.apply(4.0 + deviation) - 1.0).abs() < 1e-6);
         for sample in [-3.5_f32, 0.0, 0.25, 9.0] {
-            let restored = normalization.undo(normalization.apply(sample));
+            let restored = normalization.undo_sum(normalization.apply(sample), NonZeroUsize::MIN);
             assert!((restored - sample).abs() < 1e-5, "{sample} -> {restored}");
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the values are products of powers of two, so they are exact"
+    )]
+    fn undo_sum_applies_the_offset_once_per_part() {
+        let normalization = Normalization {
+            mean: 0.25,
+            deviation: 2.0,
+        };
+
+        // One part restores its scale and one copy of the offset.
+        for sample in [-1.5_f32, 0.0, 0.75] {
+            assert_eq!(
+                normalization.undo_sum(sample, NonZeroUsize::MIN),
+                sample * 2.0 + 0.25
+            );
+        }
+        // Three parts of 0.5 each: raw sum is 0.5 * 2 * 3 + 0.25 * 3.
+        let three = NonZeroUsize::MIN.saturating_add(2);
+        assert_eq!(normalization.undo_sum(1.5, three), 3.75);
     }
 
     #[test]

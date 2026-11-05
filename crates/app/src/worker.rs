@@ -293,6 +293,7 @@ mod tests {
 
     use stem_split_core::{
         domain::{InputFile, InputFiles, ModelId, OutputChoice, OverwritePolicy},
+        job::OutputKind,
         separate::DevicePreference,
     };
 
@@ -312,6 +313,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Cpu,
             OverwritePolicy::Refuse,
+            OutputKind::Stems,
         )?)
     }
 
