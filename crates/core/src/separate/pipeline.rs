@@ -1,4 +1,5 @@
 //! One pass of a separator over a whole track.
+use std::num::NonZeroUsize;
 
 use super::{
     ActiveDevice, InferenceError, Separator,
@@ -21,10 +22,13 @@ impl FrameSink for WavWriter {
     }
 }
 
-/// One stem a pass produces: where it is in the model's output and where its
-/// frames go.
+/// One output stream a pass produces: where its stems are in the model's
+/// output and where their summed frames go. A single stem is a sum of one.
 pub(crate) struct Target<'a> {
-    pub(crate) stem_index: usize,
+    /// Position of the first stem in the model's output.
+    pub(crate) stem: usize,
+    /// The other stems that go into the same stream, for a mixed output.
+    pub(crate) extra_stems: &'a [usize],
     pub(crate) sink: &'a mut dyn FrameSink,
 }
 
@@ -65,6 +69,13 @@ pub(crate) fn run_pass(
     cancel: &CancelToken,
 ) -> Result<PassEnd, PassError> {
     let mut blends: Vec<OverlapAdd> = targets.iter().map(|_| OverlapAdd::new()).collect();
+    // Scratch for targets that sum several stems. Blending is linear, so the
+    // stems of a chunk can be summed before the window is applied.
+    let mut sum = (Vec::new(), Vec::new());
+    if targets.iter().any(|target| !target.extra_stems.is_empty()) {
+        sum.0.resize(super::SEGMENT_FRAMES, 0.0);
+        sum.1.resize(super::SEGMENT_FRAMES, 0.0);
+    }
 
     for chunk in track.plan.chunks() {
         if cancel.is_cancelled() {
@@ -73,20 +84,38 @@ pub(crate) fn run_pass(
         let segment = chunk.segment(track.frames, track.normalization);
         let device = separator.device();
         let output = separator.separate(&segment)?;
+        let stem = |index: usize| {
+            output.stem(index).ok_or(InferenceError::MissingStem {
+                index,
+                available: output.stem_count().get(),
+            })
+        };
 
         for (target, blend) in targets.iter_mut().zip(&mut blends) {
-            let (left, right) =
-                output
-                    .stem(target.stem_index)
-                    .ok_or(InferenceError::MissingStem {
-                        index: target.stem_index,
-                        available: output.stem_count().get(),
-                    })?;
+            let (left, right) = stem(target.stem)?;
+            let (left, right) = if target.extra_stems.is_empty() {
+                (left, right)
+            } else {
+                let (sum_left, sum_right) = &mut sum;
+                sum_left.copy_from_slice(left);
+                sum_right.copy_from_slice(right);
+                for &extra in target.extra_stems {
+                    let (extra_left, extra_right) = stem(extra)?;
+                    for (total, &value) in sum_left.iter_mut().zip(extra_left) {
+                        *total += value;
+                    }
+                    for (total, &value) in sum_right.iter_mut().zip(extra_right) {
+                        *total += value;
+                    }
+                }
+                (sum_left.as_slice(), sum_right.as_slice())
+            };
             blend.add(chunk, track.plan.window(), left, right);
 
             let mut settled = blend.take_until(chunk.settled());
+            let parts = NonZeroUsize::MIN.saturating_add(target.extra_stems.len());
             for sample in settled.as_flattened_mut() {
-                *sample = track.normalization.undo(*sample);
+                *sample = track.normalization.undo_sum(*sample, parts);
             }
             target.sink.write(&settled)?;
         }
@@ -156,7 +185,8 @@ mod tests {
                 },
                 &mut separator,
                 &mut [Target {
-                    stem_index: 0,
+                    stem: 0,
+                    extra_stems: &[],
                     sink: &mut output,
                 }],
                 &mut |_| chunks += 1,
@@ -193,11 +223,13 @@ mod tests {
             &mut separator,
             &mut [
                 Target {
-                    stem_index: 2,
+                    stem: 2,
+                    extra_stems: &[],
                     sink: &mut third,
                 },
                 Target {
-                    stem_index: 0,
+                    stem: 0,
+                    extra_stems: &[],
                     sink: &mut first,
                 },
             ],
@@ -230,7 +262,8 @@ mod tests {
             },
             &mut separator,
             &mut [Target {
-                stem_index: 0,
+                stem: 0,
+                extra_stems: &[],
                 sink: &mut output,
             }],
             &mut |_| {
@@ -266,7 +299,8 @@ mod tests {
             },
             &mut separator,
             &mut [Target {
-                stem_index: 0,
+                stem: 0,
+                extra_stems: &[],
                 sink: &mut output,
             }],
             &mut |_| {},
@@ -294,7 +328,8 @@ mod tests {
             },
             &mut separator,
             &mut [Target {
-                stem_index: 4,
+                stem: 4,
+                extra_stems: &[],
                 sink: &mut output,
             }],
             &mut |_| {},
@@ -305,6 +340,83 @@ mod tests {
             result,
             Err(PassError::Inference(InferenceError::MissingStem {
                 index: 4,
+                available: 1
+            }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_target_can_sum_several_stems() -> Result<(), Box<dyn Error>> {
+        let track = 400_000;
+        let frames = signal(track);
+        let plan = ChunkPlan::new(NonZeroUsize::new(track).ok_or("empty")?);
+        // The scaling separator returns a mathematical gain, so an identity
+        // normalization keeps the expected sum straightforward.
+        let normalization = Normalization::of(&[]);
+        let mut separator = ScalingSeparator::new(ONE.saturating_add(3));
+        let mut mixed: Vec<[f32; 2]> = Vec::new();
+        let mut second: Vec<[f32; 2]> = Vec::new();
+
+        run_pass(
+            Track {
+                frames: &frames,
+                plan: &plan,
+                normalization,
+            },
+            &mut separator,
+            &mut [
+                Target {
+                    stem: 0,
+                    extra_stems: &[1, 3],
+                    sink: &mut mixed,
+                },
+                Target {
+                    stem: 1,
+                    extra_stems: &[],
+                    sink: &mut second,
+                },
+            ],
+            &mut |_| {},
+            &CancelToken::new(),
+        )?;
+
+        // Stem `k` of the test separator is the input times `k + 1`, so the
+        // mix of stems 0, 1 and 3 is the input times 1 + 2 + 4.
+        assert_eq!(mixed.len(), track);
+        assert_eq!(second.len(), track);
+        assert!(worst_error(&mixed, &frames, 7.0) < 1e-5);
+        assert!(worst_error(&second, &frames, 2.0) < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_extra_stem_is_an_error() -> Result<(), Box<dyn Error>> {
+        let frames = signal(1000);
+        let plan = ChunkPlan::new(NonZeroUsize::new(1000).ok_or("empty")?);
+        let mut separator = ScalingSeparator::new(ONE);
+        let mut output: Vec<[f32; 2]> = Vec::new();
+
+        let result = run_pass(
+            Track {
+                frames: &frames,
+                plan: &plan,
+                normalization: Normalization::of(&[]),
+            },
+            &mut separator,
+            &mut [Target {
+                stem: 0,
+                extra_stems: &[2],
+                sink: &mut output,
+            }],
+            &mut |_| {},
+            &CancelToken::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(PassError::Inference(InferenceError::MissingStem {
+                index: 2,
                 available: 1
             }))
         ));

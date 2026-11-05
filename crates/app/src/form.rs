@@ -8,6 +8,7 @@ use stem_split_core::{
         ByteCount, InputFile, InputFileError, InputFiles, ModelId, OutputChoice, OutputDir,
         OutputDirError, OverwritePolicy,
     },
+    job::OutputKind,
     model::ModelStore,
     separate::DevicePreference,
 };
@@ -148,6 +149,7 @@ impl Form {
             self.model,
             self.device,
             overwrite,
+            OutputKind::Stems,
         ))
     }
 

@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     domain::{self, InputFile, InputFiles, ModelId, OutputChoice, OverwritePolicy},
-    job::SeparationRequest,
+    job::{OutputKind, SeparationRequest},
     separate::{CpuThreads, DevicePreference},
 };
 
@@ -78,12 +78,14 @@ impl Batch {
         model: ModelId,
         device: DevicePreference,
         overwrite: OverwritePolicy,
+        output_kind: OutputKind,
     ) -> Result<Self, OutputClash> {
         let parallel = PARALLEL_JOBS.min(inputs.count());
         let threads = CpuThreads::share(parallel);
         let request = |input: &InputFile| {
             SeparationRequest::new(input.clone(), output, model, device, overwrite)
                 .with_cpu_threads(threads)
+                .with_output_kind(output_kind)
         };
 
         // Every stem file name is the output folder, the base name and a
@@ -158,6 +160,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Auto,
             OverwritePolicy::Refuse,
+            OutputKind::Stems,
         )
     }
 

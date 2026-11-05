@@ -12,6 +12,7 @@ mod macros;
 mod model;
 mod output;
 mod stem;
+mod stem_set;
 mod units;
 
 pub(crate) use self::input::comparable;
@@ -23,5 +24,6 @@ pub use self::{
     model::ModelId,
     output::{OutputChoice, OutputDir, OutputDirError, OverwritePolicy},
     stem::{Stem, StemLayout},
+    stem_set::StemSet,
     units::{ByteCount, FrameCount, SampleRate},
 };

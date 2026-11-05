@@ -5,6 +5,7 @@
 //! has, and only [`resample`] turns that into [`ModelAudio`].
 
 mod decode;
+mod mix;
 mod resample;
 mod wav;
 
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 pub use self::{
     decode::{DecodeError, decode, stated_length},
+    mix::{MixError, mix_files},
     resample::{ResampleError, resample},
     wav::{WavWriter, WriteError},
 };

@@ -393,6 +393,7 @@ mod tests {
     use stem_split_core::{
         audio::WriteError,
         job::JobError,
+        job::OutputKind,
         model::{CacheError, DownloadProgress, ModelStoreError},
         separate::InferenceError,
     };
@@ -711,6 +712,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Auto,
             stem_split_core::domain::OverwritePolicy::Refuse,
+            OutputKind::Stems,
         )
         .err()
         .ok_or("the files should clash")?;

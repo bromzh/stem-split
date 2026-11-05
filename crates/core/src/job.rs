@@ -1,12 +1,18 @@
 //! The whole job: from a request to stem files on disk.
 
-use std::{ffi::OsString, iter, num::NonZeroUsize, path::PathBuf};
+use std::{
+    ffi::OsString,
+    iter,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     audio::{self, DecodeError, ResampleError, WavWriter, WriteError},
     cancel::CancelToken,
     domain::{
         InputFile, ModelId, OutputChoice, OutputDir, OverwritePolicy, SampleRate, Stem, StemLayout,
+        StemSet,
     },
     model::{DownloadProgress, Ensured, LocalGraph, ModelStore, ModelStoreError, StemSelection},
     separate::{
@@ -16,6 +22,67 @@ use crate::{
     },
 };
 
+/// A non-empty subset of a model's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixStems(StemSet);
+
+/// Why a mix selection cannot be used for a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MixStemsError {
+    #[error("a mix needs at least one stem")]
+    Empty,
+    #[error("a mix stem is not in the model layout")]
+    OutsideLayout,
+}
+
+impl MixStems {
+    /// Validates a selection against the model layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selection is empty or includes a stem the
+    /// selected model cannot produce.
+    pub fn new(stems: StemSet, layout: StemLayout) -> Result<Self, MixStemsError> {
+        if stems.is_empty() {
+            return Err(MixStemsError::Empty);
+        }
+        if !stems.is_subset_of(layout) {
+            return Err(MixStemsError::OutsideLayout);
+        }
+        Ok(Self(stems))
+    }
+
+    /// Selected stems in layout order.
+    pub fn iter(self, layout: StemLayout) -> impl Iterator<Item = Stem> {
+        self.0.iter(layout)
+    }
+
+    #[must_use]
+    pub const fn contains(self, stem: Stem) -> bool {
+        self.0.contains(stem)
+    }
+
+    /// Positions of the selected stems in the model's output, in layout
+    /// order. The selection is a subset of the layout, so every stem has a
+    /// position.
+    #[must_use]
+    pub fn positions(self, layout: StemLayout) -> Vec<usize> {
+        self.iter(layout)
+            .filter_map(|stem| layout.position(stem))
+            .collect()
+    }
+}
+
+/// The files a separation job produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputKind {
+    /// One WAV per model stem.
+    #[default]
+    Stems,
+    /// A mix WAV made from selected stems, optionally accompanied by stems.
+    Mix { stems: MixStems, keep_stems: bool },
+}
+
 /// Everything a job needs to know, already checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeparationRequest {
@@ -24,6 +91,7 @@ pub struct SeparationRequest {
     model: ModelId,
     device: DevicePreference,
     overwrite: OverwritePolicy,
+    output_kind: OutputKind,
     cpu_threads: CpuThreads,
 }
 
@@ -44,6 +112,7 @@ impl SeparationRequest {
             model,
             device,
             overwrite,
+            output_kind: OutputKind::Stems,
             cpu_threads: CpuThreads::all(),
         }
     }
@@ -52,6 +121,13 @@ impl SeparationRequest {
     #[must_use]
     pub fn with_cpu_threads(mut self, threads: CpuThreads) -> Self {
         self.cpu_threads = threads;
+        self
+    }
+
+    /// Chooses the files this request will produce.
+    #[must_use]
+    pub fn with_output_kind(mut self, output_kind: OutputKind) -> Self {
+        self.output_kind = output_kind;
         self
     }
 
@@ -75,6 +151,11 @@ impl SeparationRequest {
         self.model
     }
 
+    #[must_use]
+    pub const fn output_kind(&self) -> OutputKind {
+        self.output_kind
+    }
+
     /// Where a stem is written: `<output>/<input name>.<stem>.wav`.
     #[must_use]
     pub fn stem_path(&self, stem: Stem) -> PathBuf {
@@ -85,16 +166,41 @@ impl SeparationRequest {
         self.output.path().join(name)
     }
 
+    /// Where the selected stems are written as a mix.
+    #[must_use]
+    pub fn mix_path(&self) -> PathBuf {
+        let mut name = OsString::from(self.input.base_name());
+        name.push(".mix.wav");
+        self.output.path().join(name)
+    }
+
     /// Output files that are already there. A caller can show them to the
-    /// user before asking to start with [`OverwritePolicy::Replace`].
+    /// user before asking to start with [`OverwritePolicy::Replace`]. Only
+    /// the files the job will produce are listed: a mix without kept stems
+    /// does not touch the stem files.
     #[must_use]
     pub fn existing_outputs(&self) -> Vec<PathBuf> {
-        self.model
-            .layout()
-            .iter()
-            .map(|stem| self.stem_path(stem))
-            .filter(|path| path.exists())
-            .collect()
+        let writes_stems = match self.output_kind {
+            OutputKind::Stems => true,
+            OutputKind::Mix { keep_stems, .. } => keep_stems,
+        };
+        let mut outputs = Vec::new();
+        if writes_stems {
+            outputs.extend(
+                self.model
+                    .layout()
+                    .iter()
+                    .map(|stem| self.stem_path(stem))
+                    .filter(|path| path.exists()),
+            );
+        }
+        if matches!(self.output_kind, OutputKind::Mix { .. }) {
+            let mix = self.mix_path();
+            if mix.exists() {
+                outputs.push(mix);
+            }
+        }
+        outputs
     }
 }
 
@@ -112,7 +218,26 @@ pub fn expected_runs(request: &SeparationRequest) -> Option<NonZeroUsize> {
         .saturating_mul(u128::from(SampleRate::MODEL.hertz().get()))
         / 1_000_000_000;
     let frames = NonZeroUsize::new(usize::try_from(frames).ok()?)?;
-    let passes = NonZeroUsize::new(request.model.spec().graphs().count())?;
+    // The passes the job runs: all of them when every stem is written, and
+    // only the graphs of the selected stems for a bare mix of a model with
+    // one graph per stem.
+    let passes = request
+        .model
+        .spec()
+        .graphs()
+        .filter(|graph| match (graph.emits(), request.output_kind) {
+            (_, OutputKind::Stems)
+            | (StemSelection::All, OutputKind::Mix { .. })
+            | (
+                StemSelection::Only(_),
+                OutputKind::Mix {
+                    keep_stems: true, ..
+                },
+            ) => true,
+            (StemSelection::Only(stem), OutputKind::Mix { stems, .. }) => stems.contains(stem),
+        })
+        .count();
+    let passes = NonZeroUsize::new(passes)?;
     Some(ChunkPlan::new(frames).count().saturating_mul(passes))
 }
 
@@ -150,6 +275,8 @@ impl<F: Fn(Progress)> ProgressSink for F {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeparationOutput {
     files: Vec<(Stem, PathBuf)>,
+    /// The mix of the selected stems, when the job made one.
+    mix: Option<PathBuf>,
     device: ActiveDevice,
 }
 
@@ -158,6 +285,12 @@ impl SeparationOutput {
     #[must_use]
     pub fn files(&self) -> &[(Stem, PathBuf)] {
         &self.files
+    }
+
+    /// The mix file, when the job made one.
+    #[must_use]
+    pub fn mix(&self) -> Option<&Path> {
+        self.mix.as_deref()
     }
 
     /// The device the last model run was computed on.
@@ -206,11 +339,67 @@ struct StemFile {
     writer: WavWriter,
 }
 
+/// The mix file being written, and which stems go into it.
+struct MixFile {
+    selection: MixStems,
+    path: PathBuf,
+    writer: WavWriter,
+}
+
+/// The files a job will produce, claimed before any work starts so that a
+/// clash is reported before anything is downloaded or computed.
+struct Outputs {
+    stems: Vec<StemFile>,
+    mix: Option<MixFile>,
+}
+
 /// One run of a graph over the track: which stems it yields and how to get
 /// the separator for it.
 struct Pass<L> {
     emits: StemSelection,
     load: L,
+}
+
+/// Sums the settled frames of consecutive passes into one track-long buffer.
+///
+/// The passes of a multi-graph model share the chunk schedule, so each of
+/// them reports the same positions and the buffer can simply add them up.
+/// It grows to the length of the track; the input itself is held in memory
+/// the same way.
+struct MixAccumulator {
+    frames: Vec<[f32; 2]>,
+    /// Where the current pass appends; reset as a pass starts.
+    cursor: usize,
+}
+
+impl MixAccumulator {
+    fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    /// Starts the next pass: it reports the same positions from zero.
+    fn next_pass(&mut self) {
+        self.cursor = 0;
+    }
+}
+
+impl pipeline::FrameSink for MixAccumulator {
+    fn write(&mut self, frames: &[[f32; 2]]) -> Result<(), WriteError> {
+        let end = self.cursor.saturating_add(frames.len());
+        if self.frames.len() < end {
+            self.frames.resize(end, [0.0; 2]);
+        }
+        for (held, &[left, right]) in self.frames.iter_mut().skip(self.cursor).zip(frames) {
+            let [held_left, held_right] = held;
+            *held_left += left;
+            *held_right += right;
+        }
+        self.cursor = end;
+        Ok(())
+    }
 }
 
 /// Separates the input of `request` into stem files.
@@ -234,7 +423,7 @@ pub fn run(
     cancel: &CancelToken,
 ) -> Result<JobEnd, JobError> {
     let layout = request.model.layout();
-    let files = create_files(request, layout)?;
+    let outputs = create_outputs(request, layout)?;
 
     let model = match store.ensure(
         request.model,
@@ -259,9 +448,10 @@ pub fn run(
     separate_into(
         frames,
         &ChunkPlan::new(frame_count),
+        layout,
         pass(model.first()),
         model.rest().iter().map(pass).collect(),
-        files,
+        outputs,
         progress,
         cancel,
     )
@@ -280,33 +470,62 @@ fn pass_for(
     }
 }
 
-/// Claims the output name of every stem. If one cannot be claimed, the
-/// writers created so far are dropped and release theirs.
-fn create_files(
-    request: &SeparationRequest,
-    layout: StemLayout,
-) -> Result<Vec<StemFile>, WriteError> {
-    layout
-        .iter()
-        .map(|stem| {
-            let path = request.stem_path(stem);
+/// Claims the output names of everything the job will write: every stem
+/// when they are kept, and the mix when one is requested. If a name cannot
+/// be claimed, the writers created so far are dropped and release theirs.
+fn create_outputs(request: &SeparationRequest, layout: StemLayout) -> Result<Outputs, WriteError> {
+    let keep_stems = match request.output_kind {
+        OutputKind::Stems => true,
+        OutputKind::Mix { keep_stems, .. } => keep_stems,
+    };
+    let stems = if keep_stems {
+        layout
+            .iter()
+            .map(|stem| {
+                let path = request.stem_path(stem);
+                let writer = WavWriter::create(&path, SampleRate::MODEL, request.overwrite)?;
+                Ok(StemFile { stem, path, writer })
+            })
+            .collect::<Result<_, WriteError>>()?
+    } else {
+        Vec::new()
+    };
+    let mix = match request.output_kind {
+        OutputKind::Stems => None,
+        OutputKind::Mix { stems, .. } => {
+            let path = request.mix_path();
             let writer = WavWriter::create(&path, SampleRate::MODEL, request.overwrite)?;
-            Ok(StemFile { stem, path, writer })
-        })
-        .collect()
+            Some(MixFile {
+                selection: stems,
+                path,
+                writer,
+            })
+        }
+    };
+    Ok(Outputs { stems, mix })
 }
 
-/// Runs every pass over the track and completes the files.
+/// Runs the contributing passes over the track and completes the files.
 ///
-/// There is always a first pass, as a model always has a first graph.
-/// `files` are in the model's stem order, so a file's position is also the
-/// position of its stem in the model output.
+/// `outputs.stems` are in the model's stem order, so a file's position is
+/// also the position of its stem in the model output. A pass that feeds
+/// neither a stem file nor the mix is skipped: for a model with one graph
+/// per stem, only the graphs of the selected stems run.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the typed inputs describe one job boundary and keeping them explicit prevents invalid combinations"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the pass scheduling, output routing, cancellation, and final publishing must remain adjacent to show their resource lifetimes"
+)]
 fn separate_into<L, S>(
     frames: &[[f32; 2]],
     plan: &ChunkPlan,
+    layout: StemLayout,
     first_pass: Pass<L>,
     other_passes: Vec<Pass<L>>,
-    mut files: Vec<StemFile>,
+    mut outputs: Outputs,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
 ) -> Result<JobEnd, JobError>
@@ -319,35 +538,100 @@ where
         plan,
         normalization: Normalization::of(frames),
     };
-    let pass_count = NonZeroUsize::MIN.saturating_add(other_passes.len());
-    let total = plan.count().saturating_mul(pass_count);
+    let mix = outputs.mix.as_ref().map(|mix| mix.selection);
+    // The closure below runs across the loop that mutably borrows the
+    // files, so it captures a copy instead.
+    let file_stems: Vec<Stem> = outputs.stems.iter().map(|file| file.stem).collect();
+
+    let contributes = |emits: StemSelection| match emits {
+        StemSelection::All => true,
+        StemSelection::Only(stem) => {
+            file_stems.contains(&stem) || mix.is_some_and(|mix| mix.contains(stem))
+        }
+    };
+    let pass_count = iter::once(&first_pass)
+        .chain(&other_passes)
+        .filter(|pass| contributes(pass.emits))
+        .count();
+    // A stems job runs every pass, and a mix is a non-empty selection of a
+    // layout the registry covers, so a job always has a contributing pass.
+    // The fallback is never reported: with no pass to run, the loop below
+    // never reports either.
+    let total = plan
+        .count()
+        .saturating_mul(NonZeroUsize::new(pass_count).unwrap_or(NonZeroUsize::MIN));
+
+    // With one pass the mix is streamed to its file as the frames settle.
+    // With several, each adds one stem, so they are summed in memory and
+    // written at the end.
+    let mut accumulator = (mix.is_some() && pass_count > 1).then_some(MixAccumulator::new());
+    // Positions of the mixed stems in the model output, for the pass that
+    // emits them all.
+    let mix_positions = mix.map(|mix| mix.positions(layout));
+    let mix_split = mix_positions
+        .as_deref()
+        .and_then(|positions| positions.split_first());
 
     let mut done = 0;
     let mut device = ActiveDevice::Cpu;
     for pass in iter::once(first_pass).chain(other_passes) {
+        if !contributes(pass.emits) {
+            continue;
+        }
         if cancel.is_cancelled() {
             return Ok(JobEnd::Cancelled);
-        }
-        if let StemSelection::Only(stem) = pass.emits
-            && !files.iter().any(|file| file.stem == stem)
-        {
-            return Err(InferenceError::StemNotInLayout { stem }.into());
         }
         progress.report(Progress::LoadingModel);
         let mut separator = (pass.load)()?;
 
-        let mut targets: Vec<Target<'_>> = files
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, file)| match pass.emits {
+        if let Some(accumulator) = &mut accumulator {
+            accumulator.next_pass();
+        }
+
+        let mut targets: Vec<Target<'_>> = Vec::new();
+        for (index, file) in outputs.stems.iter_mut().enumerate() {
+            let emitted = match pass.emits {
                 StemSelection::All => true,
-                StemSelection::Only(stem) => file.stem == stem,
-            })
-            .map(|(stem_index, file)| Target {
-                stem_index,
-                sink: &mut file.writer,
-            })
-            .collect();
+                StemSelection::Only(stem) => stem == file.stem,
+            };
+            if emitted {
+                targets.push(Target {
+                    stem: index,
+                    extra_stems: &[],
+                    sink: &mut file.writer,
+                });
+            }
+        }
+        // What the pass adds to the mix: every selected stem of a combined
+        // graph, or the one stem of a specialist graph it was run for.
+        let mixed: Option<(usize, &[usize])> = match pass.emits {
+            StemSelection::All => mix_split.map(|(&first, rest)| (first, rest)),
+            StemSelection::Only(stem) if mix.is_some_and(|mix| mix.contains(stem)) => {
+                let index = layout
+                    .position(stem)
+                    .ok_or(InferenceError::StemNotInLayout { stem })?;
+                Some((index, &[]))
+            }
+            StemSelection::Only(_) => None,
+        };
+        if let Some((first, rest)) = mixed {
+            let sink: Option<&mut dyn pipeline::FrameSink> = match accumulator.as_mut() {
+                Some(accumulator) => Some(accumulator),
+                // A mix always has its file; the fold to `None` exists
+                // because the compiler cannot see that.
+                None => outputs
+                    .mix
+                    .as_mut()
+                    .map(|mix| &mut mix.writer as &mut dyn pipeline::FrameSink),
+            };
+            if let Some(sink) = sink {
+                targets.push(Target {
+                    stem: first,
+                    extra_stems: rest,
+                    sink,
+                });
+            }
+        }
 
         let end = pipeline::run_pass(
             track,
@@ -370,14 +654,26 @@ where
         }
     }
 
+    if let (Some(accumulator), Some(mix)) = (&accumulator, &mut outputs.mix) {
+        mix.writer.write(&accumulator.frames)?;
+    }
+
     progress.report(Progress::Finalizing);
-    let mut published = Vec::with_capacity(files.len());
-    for file in files {
+    let mut published = Vec::with_capacity(outputs.stems.len().saturating_add(1));
+    for file in outputs.stems {
         file.writer.finish()?;
         published.push((file.stem, file.path));
     }
+    let mix = match outputs.mix {
+        Some(mix) => {
+            mix.writer.finish()?;
+            Some(mix.path)
+        }
+        None => None,
+    };
     Ok(JobEnd::Completed(SeparationOutput {
         files: published,
+        mix,
         device,
     }))
 }
@@ -456,6 +752,31 @@ mod tests {
         Ok(names)
     }
 
+    fn mix_request(
+        directory: &Path,
+        model: ModelId,
+        stems: StemSet,
+        keep_stems: bool,
+    ) -> Result<SeparationRequest, Box<dyn Error>> {
+        let request = request_in(directory, model, OverwritePolicy::Refuse)?;
+        let stems = MixStems::new(stems, model.layout())?;
+        Ok(request.with_output_kind(OutputKind::Mix { stems, keep_stems }))
+    }
+
+    #[test]
+    fn a_mix_needs_at_least_one_stem_of_the_layout() {
+        assert_eq!(
+            MixStems::new(StemSet::none(), StemLayout::FOUR),
+            Err(MixStemsError::Empty)
+        );
+        assert_eq!(
+            MixStems::new(StemSet::none().toggled(Stem::Piano), StemLayout::FOUR),
+            Err(MixStemsError::OutsideLayout)
+        );
+        let selected = StemSet::none().toggled(Stem::Drums).toggled(Stem::Vocals);
+        assert!(MixStems::new(selected, StemLayout::FOUR).is_ok());
+    }
+
     #[test]
     fn stem_paths_are_named_after_the_input_and_the_stem() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
@@ -469,6 +790,7 @@ mod tests {
             request.stem_path(Stem::Drums),
             directory.path().join("My Song.drums.wav")
         );
+        assert_eq!(request.mix_path(), directory.path().join("My Song.mix.wav"));
         Ok(())
     }
 
@@ -487,6 +809,25 @@ mod tests {
     }
 
     #[test]
+    fn existing_outputs_of_a_mix_depend_on_kept_stems() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let selected = StemSet::none().toggled(Stem::Vocals);
+        let bare = mix_request(directory.path(), ModelId::Htdemucs, selected, false)?;
+        fs::write(bare.stem_path(Stem::Bass), b"old")?;
+        fs::write(bare.mix_path(), b"old")?;
+
+        // A bare mix does not touch the stem files.
+        assert_eq!(bare.existing_outputs(), [bare.mix_path()]);
+
+        let kept = mix_request(directory.path(), ModelId::Htdemucs, selected, true)?;
+        assert_eq!(
+            kept.existing_outputs(),
+            [kept.stem_path(Stem::Bass), kept.mix_path()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn single_graph_job_writes_every_stem() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let request = request_in(directory.path(), ModelId::Htdemucs, OverwritePolicy::Refuse)?;
@@ -497,12 +838,13 @@ mod tests {
         let end = separate_into(
             &track,
             &plan_for(&track)?,
+            layout,
             Pass {
                 emits: StemSelection::All,
                 load: loader(layout),
             },
             Vec::new(),
-            create_files(&request, layout)?,
+            create_outputs(&request, layout)?,
             &|progress| reports.borrow_mut().push(progress),
             &CancelToken::new(),
         )?;
@@ -510,6 +852,7 @@ mod tests {
         let JobEnd::Completed(output) = end else {
             return Err("job was cancelled".into());
         };
+        assert_eq!(output.mix(), None);
         let stems: Vec<Stem> = output.files().iter().map(|&(stem, _)| stem).collect();
         assert_eq!(stems, layout.iter().collect::<Vec<_>>());
         assert_eq!(output.device(), ActiveDevice::Cpu);
@@ -576,9 +919,10 @@ mod tests {
         let end = separate_into(
             &track,
             &plan_for(&track)?,
+            layout,
             first,
             stems.map(pass).collect(),
-            create_files(&request, layout)?,
+            create_outputs(&request, layout)?,
             &|progress| reports.borrow_mut().push(progress),
             &CancelToken::new(),
         )?;
@@ -621,12 +965,13 @@ mod tests {
         let end = separate_into(
             &track,
             &plan_for(&track)?,
+            layout,
             Pass {
                 emits: StemSelection::All,
                 load: loader(layout),
             },
             Vec::new(),
-            create_files(&request, layout)?,
+            create_outputs(&request, layout)?,
             &|progress| {
                 if let Progress::Separating { done, .. } = progress {
                     *runs.borrow_mut() = done;
@@ -655,12 +1000,13 @@ mod tests {
         let result = separate_into(
             &track,
             &plan_for(&track)?,
+            layout,
             Pass {
                 emits: StemSelection::All,
                 load: failing,
             },
             Vec::new(),
-            create_files(&request, layout)?,
+            create_outputs(&request, layout)?,
             &|_| {},
             &CancelToken::new(),
         );
@@ -681,7 +1027,7 @@ mod tests {
         let clash = request.stem_path(Stem::Other);
         fs::write(&clash, b"previous result")?;
 
-        let result = create_files(&request, request.model().layout());
+        let result = create_outputs(&request, request.model().layout()).map(|_| ());
 
         assert!(matches!(
             result,
@@ -712,18 +1058,230 @@ mod tests {
         let end = separate_into(
             &track,
             &plan_for(&track)?,
+            layout,
             Pass {
                 emits: StemSelection::All,
                 load: loader(layout),
             },
             Vec::new(),
-            create_files(&request, layout)?,
+            create_outputs(&request, layout)?,
             &|_| {},
             &CancelToken::new(),
         )?;
 
         assert!(matches!(end, JobEnd::Completed(_)));
         assert_eq!(read(&previous)?.len().get(), track.len());
+        Ok(())
+    }
+
+    #[test]
+    fn mix_job_writes_the_mix_without_stem_files() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let selected = StemSet::none().toggled(Stem::Drums).toggled(Stem::Bass);
+        let request = mix_request(directory.path(), model, selected, false)?;
+        let layout = model.layout();
+        let track = frames(SEGMENT_FRAMES + 50_000);
+        let reports = RefCell::new(Vec::new());
+
+        let end = separate_into(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            &|progress| reports.borrow_mut().push(progress),
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        assert!(output.files().is_empty());
+        let mix = output.mix().ok_or("no mix file")?;
+        let written = read(mix)?;
+        assert_eq!(written.len().get(), track.len());
+        // Drums and bass of the test separator are the input times 1 and 2.
+        let error = worst_error(&written, &track, 3.0);
+        assert!(error < 1e-4, "mix error {error}");
+        assert_eq!(
+            names_in(directory.path())?,
+            ["My Song.flac", "My Song.mix.wav"]
+        );
+        // The single pass is reported as all the work there is.
+        let last_run = reports
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|report| match report {
+                Progress::Separating { done, total, .. } => Some((*done, total.get())),
+                Progress::FetchingModel(_)
+                | Progress::Decoding
+                | Progress::LoadingModel
+                | Progress::Finalizing => None,
+            });
+        assert_eq!(last_run, Some((2, 2)));
+        Ok(())
+    }
+
+    #[test]
+    fn mix_job_with_kept_stems_writes_both() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let selected = StemSet::none().toggled(Stem::Vocals);
+        let request = mix_request(directory.path(), model, selected, true)?;
+        let layout = model.layout();
+        let track = frames(300_000);
+
+        let end = separate_into(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            &|_| {},
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        assert_eq!(output.files().len(), 4);
+        // Vocals of the test separator is the input times 4.
+        let mix = read(output.mix().ok_or("no mix file")?)?;
+        assert!(worst_error(&mix, &track, 4.0) < 1e-4);
+        for ((_, path), gain) in output.files().iter().zip([1.0, 2.0, 3.0, 4.0]) {
+            assert!(worst_error(&read(path)?, &track, gain) < 1e-4);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn one_graph_per_stem_mix_skips_unselected_passes() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::HtdemucsFt;
+        let selected = StemSet::none().toggled(Stem::Bass).toggled(Stem::Vocals);
+        let request = mix_request(directory.path(), model, selected, false)?;
+        let layout = model.layout();
+        let track = frames(300_000);
+        let loads = RefCell::new(0);
+
+        let pass = |stem| Pass {
+            emits: StemSelection::Only(stem),
+            load: || {
+                *loads.borrow_mut() += 1;
+                Ok(ScalingSeparator::new(layout.count()))
+            },
+        };
+        let mut stems = layout.iter();
+        let first = pass(stems.next().ok_or("layout without stems")?);
+        let end = separate_into(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            first,
+            stems.map(pass).collect(),
+            create_outputs(&request, layout)?,
+            &|_| {},
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        // Only the passes of bass and vocals ran.
+        assert_eq!(*loads.borrow(), 2);
+        assert!(output.files().is_empty());
+        let mix = read(output.mix().ok_or("no mix file")?)?;
+        assert_eq!(mix.len().get(), track.len());
+        // Bass and vocals are the input times 2 and 4.
+        assert!(worst_error(&mix, &track, 6.0) < 1e-4);
+        assert_eq!(
+            names_in(directory.path())?,
+            ["My Song.flac", "My Song.mix.wav"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_graph_per_stem_mix_with_kept_stems_runs_every_pass() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::HtdemucsFt;
+        let selected = StemSet::none().toggled(Stem::Drums);
+        let request = mix_request(directory.path(), model, selected, true)?;
+        let layout = model.layout();
+        let track = frames(300_000);
+        let loads = RefCell::new(0);
+
+        let pass = |stem| Pass {
+            emits: StemSelection::Only(stem),
+            load: || {
+                *loads.borrow_mut() += 1;
+                Ok(ScalingSeparator::new(layout.count()))
+            },
+        };
+        let mut stems = layout.iter();
+        let first = pass(stems.next().ok_or("layout without stems")?);
+        let end = separate_into(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            first,
+            stems.map(pass).collect(),
+            create_outputs(&request, layout)?,
+            &|_| {},
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        assert_eq!(*loads.borrow(), 4);
+        assert_eq!(output.files().len(), 4);
+        // Drums alone are the input times 1.
+        let mix = read(output.mix().ok_or("no mix file")?)?;
+        assert!(worst_error(&mix, &track, 1.0) < 1e-4);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_mix_job_leaves_no_output_files() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let selected = StemSet::none().toggled(Stem::Drums).toggled(Stem::Bass);
+        let request = mix_request(directory.path(), model, selected, false)?;
+        let layout = model.layout();
+        let track = frames(1_500_000);
+        let cancel = CancelToken::new();
+
+        let end = separate_into(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            &|progress| {
+                if let Progress::Separating { done: 2, .. } = progress {
+                    cancel.cancel();
+                }
+            },
+            &cancel,
+        )?;
+
+        assert_eq!(end, JobEnd::Cancelled);
+        assert_eq!(names_in(directory.path())?, ["My Song.flac"]);
         Ok(())
     }
 }
