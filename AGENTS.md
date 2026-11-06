@@ -25,6 +25,11 @@ Before working on code, read:
 - The interface supports English and Russian. All UI strings go through `view::text`, with a separate module for each language (`text::en`, `text::ru`) and exhaustive matches. Add every new string to all languages at once so missing translations fail to compile.
 - Preserve the Russian UI localization and tests of its translations; the English-only documentation rule does not remove interface translations.
 
+## Working branch
+
+- Use `main` for ongoing work. Do not work on `dev` unless the owner explicitly requests it.
+- When pushing the current work, target `origin/main`.
+
 ## Versions
 
 - Automatically bump the version once for a local set of changes after the previous successful commit and push. Keep that version throughout subsequent local improvements, fixes, and new requests until the current set has both been committed and successfully pushed. A local commit without a push does not start a new bump cycle.
