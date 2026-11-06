@@ -20,7 +20,8 @@ use stem_split_core::{
 use self::text::{Locale, Message, Text};
 use crate::{
     downloads::Downloads,
-    form::{Form, Mode, Problem},
+    form::{Form, Mode, Problem, Source, StartBlock},
+    settings::SeparationPanel,
     tracker::{Outcome, Overview, Results, RowStatus},
     worker::Failure,
 };
@@ -29,6 +30,19 @@ const ROW_SPACING: f32 = 10.0;
 const COLUMN_SPACING: f32 = 12.0;
 const SECTION_SPACING: f32 = 12.0;
 const COMBO_WIDTH: f32 = 320.0;
+/// Equal cells keep the common settings still when changing input tabs.
+const OUTPUT_HEIGHT: f32 = 60.0;
+/// Reserved before metadata arrives, so a long playlist never resizes the window.
+const METADATA_HEIGHT: f32 = 24.0;
+const PLAYLIST_WIDTH: f32 = 300.0;
+const PLAYLIST_GAP: f32 = 12.0;
+const FORM_LABEL_WIDTH: f32 = 112.0;
+const FORM_CONTENT_WIDTH: f32 = 624.0;
+pub(crate) const INITIAL_WINDOW_SIZE: [f32; 2] = [640.0, 540.0];
+const CLEAR_INPUT: &str = "\u{00D7}";
+const DISCLOSURE_CLOSED: &str = "\u{25B6}";
+const DISCLOSURE_OPEN: &str = "\u{25BC}";
+const DOWNLOAD_WIDTH: f32 = 96.0;
 /// How dark the window gets while a file is dragged over it: 0 is not at
 /// all, 255 is black.
 const DROP_SHADE: u8 = 190;
@@ -57,8 +71,14 @@ const FOOTER_HEIGHT: f32 = 80.0;
 /// A list of files is never squeezed below this height.
 const MIN_LIST_HEIGHT: f32 = 60.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EditingAction {
+    SeparationPanel(SeparationPanel),
+    PlaylistPanel(crate::playlist::Panel),
+    PlaylistItem(usize),
+    PlaylistSelection(crate::playlist::Selection),
+    Source(Source),
+    Url(String),
     PickInputs,
     PickOutputFolder,
     OutputBesideInput,
@@ -76,6 +96,9 @@ pub(crate) enum EditingAction {
     OpenDownloads,
     ClearDownloads,
     Start(Mode),
+    Download,
+    SaveFormat(stem_split_media::SaveFormat),
+    OutputFormat(stem_split_core::domain::OutputFormat),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +172,7 @@ fn file_row(
 ) -> Option<EditingAction> {
     let mut action = None;
     ui.label(Text::File.get(locale));
-    ui.vertical(|ui| {
+    input_cell(ui, source_height(ui, form), |ui| {
         ui.horizontal(|ui| {
             if ui.button(Text::Browse.get(locale)).clicked() {
                 action = Some(EditingAction::PickInputs);
@@ -157,7 +180,7 @@ fn file_row(
             match form.inputs() {
                 None => ui.weak(Text::NoFileChosen.get(locale)),
                 Some(inputs) if inputs.count().get() == 1 => {
-                    ui.label(text::file_name(inputs.first().path()))
+                    ui.add(egui::Label::new(text::file_name(inputs.first().path())).truncate())
                 }
                 Some(inputs) => ui.label(text::files_chosen(locale, inputs.count())),
             };
@@ -197,6 +220,163 @@ fn file_row(
     action
 }
 
+fn input_cell<R>(
+    ui: &mut egui::Ui,
+    height: f32,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let width = FORM_CONTENT_WIDTH - FORM_LABEL_WIDTH - COLUMN_SPACING;
+    let size = egui::vec2(width, height);
+    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_width(width);
+        ui.set_min_height(height);
+        contents(ui)
+    })
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the visible file count is capped at a few rows"
+)]
+fn source_height(ui: &egui::Ui, form: &Form) -> f32 {
+    // Keep tabs aligned using the actual local selection, without reserving
+    // a full file list when the form is empty or contains just one file.
+    let lines =
+        if form.source() == Source::Url && form.separation_panel() == SeparationPanel::Collapsed {
+            0.0
+        } else {
+            form.local_inputs().map_or(0.0, |inputs| {
+                if inputs.count().get() == 1 {
+                    1.0
+                } else {
+                    (inputs.count().get() as f32).min(VISIBLE_INPUTS)
+                }
+            })
+        };
+    let spacing = ui.spacing().item_spacing.y;
+    let control = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(ui.text_style_height(&egui::TextStyle::Body) + 2.0 * ui.spacing().button_padding.y)
+        .ceil();
+    let hint = 2.0 * ui.text_style_height(&egui::TextStyle::Body);
+    (control + hint + 3.0 * spacing)
+        .max(control + METADATA_HEIGHT + spacing + 2.0)
+        .max(control * (1.0 + lines) + 2.0 * spacing)
+        .ceil()
+}
+
+fn source_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
+    match form.source() {
+        Source::Files => file_row(ui, locale, form, downloads),
+        Source::Url => {
+            let heading = ui.label(Text::Url.get(locale));
+            input_cell(ui, source_height(ui, form), |ui| {
+                let mut url = form.url().to_owned();
+                let mut action = None;
+                let blocked = start_block(form, downloads, Mode::Split);
+                ui.horizontal(|ui| {
+                    let button_size = ui.spacing().interact_size.y;
+                    let width = (ui.available_width()
+                        - button_size
+                        - DOWNLOAD_WIDTH
+                        - 2.0 * ui.spacing().item_spacing.x)
+                        .max(80.0);
+                    let response = ui
+                        .add_sized(
+                            [width, button_size],
+                            egui::TextEdit::singleline(&mut url)
+                                .hint_text(Text::UrlPlaceholder.get(locale)),
+                        )
+                        .labelled_by(heading.id);
+                    if response.changed() {
+                        action = Some(EditingAction::Url(url.clone()));
+                    }
+                    let clear = ui.add_enabled(
+                        !url.is_empty(),
+                        egui::Button::new(CLEAR_INPUT)
+                            .min_size(egui::vec2(button_size, button_size)),
+                    );
+                    if clear.clicked() {
+                        action = Some(EditingAction::Url(String::new()));
+                        response.request_focus();
+                    }
+                    name_picture(clear, Text::ClearUrl.get(locale))
+                        .on_hover_text(Text::ClearUrl.get(locale));
+                    let download = ui.add_enabled(
+                        blocked.is_none(),
+                        egui::Button::new(Text::Download.get(locale))
+                            .min_size(egui::vec2(DOWNLOAD_WIDTH, button_size)),
+                    );
+                    if download.clicked() {
+                        action = Some(EditingAction::Download);
+                    }
+                    if let Some(reason) = blocked {
+                        download.on_disabled_hover_text(text::start_block(locale, reason));
+                    }
+                });
+                action = url_preview(ui, locale, form).or(action);
+                action
+            })
+            .inner
+        }
+    }
+}
+
+/// Reserved title and playlist-toggle space that cannot grow the form.
+fn url_preview(ui: &mut egui::Ui, locale: Locale, form: &Form) -> Option<EditingAction> {
+    let mut action = None;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), METADATA_HEIGHT),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(METADATA_HEIGHT);
+            match form.preview() {
+                crate::preview::State::Empty | crate::preview::State::Pending { .. } => {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(Text::UrlHint.get(locale)).weak())
+                            .truncate(),
+                    );
+                }
+                crate::preview::State::Loading(_) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak(Text::LoadingMetadata.get(locale));
+                    });
+                }
+                crate::preview::State::Ready(info) => {
+                    action = media_title(
+                        ui,
+                        locale,
+                        info,
+                        form.playlist().map(|(_, choices)| choices.panel()),
+                    );
+                }
+                crate::preview::State::Failed(error) => {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(Text::MetadataFailed.get(locale))
+                                .color(ui.visuals().error_fg_color),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text({
+                        let message = text::failure(locale, error);
+                        message.detail.unwrap_or(message.summary)
+                    });
+                }
+            }
+        },
+    );
+    action
+}
+
 /// Where the stems go: next to the file, or a folder of the user's choice.
 fn output_row(
     ui: &mut egui::Ui,
@@ -206,7 +386,41 @@ fn output_row(
 ) -> Option<EditingAction> {
     let mut action = None;
     ui.label(Text::Output.get(locale));
-    ui.vertical(|ui| {
+    if form.source() == Source::Url {
+        input_cell(ui, OUTPUT_HEIGHT, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(Text::Browse.get(locale)).clicked() {
+                    action = Some(EditingAction::PickOutputFolder);
+                }
+                let mut format = form.save_format();
+                egui::ComboBox::from_id_salt("save encoding")
+                    .width(110.0)
+                    .selected_text(text::save_format(locale, format))
+                    .show_ui(ui, |ui| {
+                        for &choice in stem_split_media::SaveFormat::ALL {
+                            ui.selectable_value(
+                                &mut format,
+                                choice,
+                                text::save_format(locale, choice),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(Text::SaveFormat.get(locale));
+                if format != form.save_format() {
+                    action = Some(EditingAction::SaveFormat(format));
+                }
+            });
+            match form.url_folder() {
+                None => {
+                    ui.weak(Text::RequiredFolder.get(locale));
+                }
+                Some(folder) => show_folder(ui, folder.path()),
+            }
+        });
+        return action;
+    }
+    input_cell(ui, OUTPUT_HEIGHT, |ui| {
         let custom = match form.output() {
             OutputChoice::BesideInput => None,
             OutputChoice::Custom(directory) => Some(directory),
@@ -263,7 +477,8 @@ fn model_row(
                 // only its current value.
                 .labelled_by(heading.id);
             if let Some(downloads) = downloads {
-                action = downloads_buttons(ui, locale, downloads).or(action);
+                action =
+                    downloads_buttons(ui, locale, downloads, form.preview_busy()).or(action.take());
             }
         });
         if let Some(size) = form.download() {
@@ -283,6 +498,7 @@ fn downloads_buttons(
     ui: &mut egui::Ui,
     locale: Locale,
     downloads: &Downloads,
+    preview_busy: bool,
 ) -> Option<EditingAction> {
     let mut action = None;
     let usage = downloads.usage();
@@ -306,7 +522,7 @@ fn downloads_buttons(
     // Deleting asks first, in a small window that opens from the button and
     // closes at a click anywhere else.
     let clear = ui
-        .add_enabled_ui(stored.is_some(), |ui| {
+        .add_enabled_ui(stored.is_some() && !preview_busy, |ui| {
             let button = egui::Button::new(WASTEBASKET);
             let (response, _) =
                 egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
@@ -331,7 +547,11 @@ fn downloads_buttons(
     };
     name_picture(clear, Text::ClearDownloads.get(locale))
         .on_hover_text(Text::ClearDownloads.get(locale))
-        .on_disabled_hover_text(unavailable.get(locale));
+        .on_disabled_hover_text(if preview_busy {
+            Text::LoadingMetadata.get(locale)
+        } else {
+            unavailable.get(locale)
+        });
     action
 }
 
@@ -535,28 +755,247 @@ pub(crate) fn drop_hint(context: &egui::Context, locale: Locale) {
 
 /// The main form: what to split, where to put the result, and how.
 /// `downloads` is absent when there is no model store to show.
+#[derive(Debug)]
+pub(crate) struct EditingView {
+    pub(crate) action: Option<EditingAction>,
+    pub(crate) minimum: egui::Vec2,
+}
+
 pub(crate) fn editing(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    downloads: Option<&Downloads>,
+) -> EditingView {
+    let padding = (ui.ctx().content_rect().size() - ui.available_size()).max(egui::Vec2::ZERO);
+    let playlist = form.playlist().filter(|(_, choices)| {
+        form.source() == Source::Url && choices.panel() == crate::playlist::Panel::Open
+    });
+    let extra_width = if playlist.is_some() {
+        PLAYLIST_WIDTH + PLAYLIST_GAP
+    } else {
+        0.0
+    };
+    let available = ui.available_rect_before_wrap();
+    let mut main = available;
+    main.max.x = (main.max.x - extra_width).max(main.min.x + 1.0);
+    // Only the main form determines minimum height. The side list is clipped
+    // to the current viewport and scrolls independently, even for large lists.
+    let content = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(main), |ui| {
+            egui::ScrollArea::both()
+                .id_salt("small screen form")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(FORM_CONTENT_WIDTH);
+                    editing_contents(ui, locale, form, downloads)
+                })
+        })
+        .inner;
+    let mut action = content.inner;
+    if let Some((info, choices)) = playlist {
+        let panel = egui::Rect::from_min_max(
+            egui::pos2(main.max.x + PLAYLIST_GAP, available.min.y),
+            available.max,
+        );
+        let divider = main.max.x + PLAYLIST_GAP / 2.0;
+        ui.painter().line_segment(
+            [
+                egui::pos2(divider, available.min.y),
+                egui::pos2(divider, available.max.y),
+            ],
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+        let selected = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(panel));
+                playlist_panel(ui, locale, info, choices)
+            })
+            .inner;
+        action = selected.or(action);
+    }
+    EditingView {
+        action,
+        minimum: (content.content_size + padding + egui::vec2(extra_width, 4.0)).ceil(),
+    }
+}
+
+fn media_title(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    info: &stem_split_media::MediaInfo,
+    toggle: Option<crate::playlist::Panel>,
+) -> Option<EditingAction> {
+    let mut action = None;
+    let count = match info {
+        stem_split_media::MediaInfo::Single(_) => None,
+        stem_split_media::MediaInfo::Playlist { .. } => Some(format!(
+            "({})",
+            text::playlist_count(locale, info.items().count())
+        )),
+    };
+    ui.horizontal(|ui| {
+        let width = |value: &str| {
+            ui.painter()
+                .layout_no_wrap(
+                    value.to_owned(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    ui.visuals().text_color(),
+                )
+                .size()
+                .x
+        };
+        let spacing = ui.spacing().item_spacing.x;
+        let count_width = count.as_ref().map_or(0.0, |count| width(count) + spacing);
+        let toggle_width = if toggle.is_some() {
+            width(Text::Playlist.get(locale)) + 2.0 * ui.spacing().button_padding.x + spacing
+        } else {
+            0.0
+        };
+        let title_width =
+            width(info.title()).min((ui.available_width() - count_width - toggle_width).max(1.0));
+        ui.add_sized(
+            [title_width, ui.text_style_height(&egui::TextStyle::Body)],
+            egui::Label::new(info.title()).truncate(),
+        )
+        .on_hover_text(info.title());
+        if let Some(count) = count {
+            ui.weak(count);
+        }
+        if let Some(panel) = toggle {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(Text::Playlist.get(locale))
+                            .selected(panel == crate::playlist::Panel::Open),
+                    )
+                    .clicked()
+                {
+                    let next = match panel {
+                        crate::playlist::Panel::Open => crate::playlist::Panel::Closed,
+                        crate::playlist::Panel::Closed => crate::playlist::Panel::Open,
+                    };
+                    action = Some(EditingAction::PlaylistPanel(next));
+                }
+            });
+        }
+    });
+    action
+}
+
+fn playlist_panel(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    info: &stem_split_media::MediaInfo,
+    choices: &crate::playlist::Choices,
+) -> Option<EditingAction> {
+    let mut action = None;
+    ui.set_width(PLAYLIST_WIDTH);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    ui.strong(Text::Playlist.get(locale));
+    media_title(ui, locale, info, None);
+    let hint = if info
+        .items()
+        .enumerate()
+        .any(|(index, _)| choices.includes(index))
+    {
+        Text::PlaylistSelectionHint
+    } else {
+        Text::NoPlaylistItems
+    };
+    ui.add(egui::Label::new(egui::RichText::new(hint.get(locale)).weak()).wrap());
+    ui.horizontal(|ui| {
+        use crate::playlist::Selection;
+        let mut all = info
+            .items()
+            .enumerate()
+            .all(|(index, _)| choices.includes(index));
+        let mut none = info
+            .items()
+            .enumerate()
+            .all(|(index, _)| !choices.includes(index));
+        if ui
+            .checkbox(&mut all, Text::PlaylistAll.get(locale))
+            .clicked()
+        {
+            action = Some(EditingAction::PlaylistSelection(if all {
+                Selection::All
+            } else {
+                Selection::None
+            }));
+        }
+        if ui
+            .checkbox(&mut none, Text::PlaylistNone.get(locale))
+            .clicked()
+        {
+            action = Some(EditingAction::PlaylistSelection(if none {
+                Selection::None
+            } else {
+                Selection::All
+            }));
+        }
+    });
+    let selected = info
+        .items()
+        .enumerate()
+        .filter(|(index, _)| choices.includes(*index))
+        .count();
+    ui.weak(text::playlist_selected(
+        locale,
+        selected,
+        info.items().count(),
+    ));
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt("playlist choices")
+        .max_height(ui.available_height().max(1.0))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (index, item) in info.items().enumerate() {
+                let mut included = choices.includes(index);
+                // Truncation keeps long titles from widening the native window.
+                let response = ui.add(egui::Checkbox::new(&mut included, item.title()));
+                if response.clicked() {
+                    action = Some(EditingAction::PlaylistItem(index));
+                }
+                response.on_hover_text(item.title());
+            }
+        });
+    action
+}
+
+fn editing_contents(
     ui: &mut egui::Ui,
     locale: Locale,
     form: &Form,
     downloads: Option<&Downloads>,
 ) -> Option<EditingAction> {
     let mut action = None;
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(form.source() == Source::Files, Text::FileTab.get(locale))
+            .clicked()
+        {
+            action = Some(EditingAction::Source(Source::Files));
+        }
+        if ui
+            .selectable_label(form.source() == Source::Url, Text::UrlTab.get(locale))
+            .clicked()
+        {
+            action = Some(EditingAction::Source(Source::Url));
+        }
+    });
+    ui.separator();
+    ui.add_space(ROW_SPACING);
     egui::Grid::new("form")
         .num_columns(2)
+        .min_col_width(FORM_LABEL_WIDTH)
         .spacing([COLUMN_SPACING, ROW_SPACING])
         .show(ui, |ui| {
-            for row in [
-                file_row,
-                output_row,
-                model_row,
-                stems_row,
-                cleanup_row,
-                device_row,
-            ] {
+            for row in [source_row, output_row] {
                 // At most one widget is clicked in a frame, so a later row
                 // never overwrites an earlier one's action.
-                action = row(ui, locale, form, downloads).or(action);
+                action = row(ui, locale, form, downloads).or(action.take());
                 ui.end_row();
             }
         });
@@ -565,18 +1004,77 @@ pub(crate) fn editing(
         ui.add_space(SECTION_SPACING);
         show_problem(ui, locale, problem);
     }
-
     ui.add_space(SECTION_SPACING);
-    // A job must not start while the models it needs are being deleted.
-    let clearing = downloads.is_some_and(Downloads::is_clearing);
-    let ready = form.inputs().is_some() && !clearing;
     ui.horizontal(|ui| {
-        let split = egui::Button::new(Text::Split.get(locale));
-        if ui.add_enabled(ready, split).clicked() {
+        let marker = match form.separation_panel() {
+            SeparationPanel::Collapsed => DISCLOSURE_CLOSED,
+            SeparationPanel::Expanded => DISCLOSURE_OPEN,
+        };
+        let heading = format!("{marker} {}", Text::SeparationSettings.get(locale));
+        if ui
+            .add(egui::Button::new(egui::RichText::new(heading).strong()).frame(false))
+            .clicked()
+        {
+            action = Some(EditingAction::SeparationPanel(
+                form.separation_panel().toggled(),
+            ));
+        }
+        action = ui
+            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                language_menu(ui, locale)
+            })
+            .inner
+            .or(action.take());
+    });
+    match form.separation_panel() {
+        SeparationPanel::Collapsed => {}
+        SeparationPanel::Expanded => {
+            ui.add_space(ROW_SPACING);
+            action = separation_controls(ui, locale, form, downloads).or(action);
+        }
+    }
+    action
+}
+
+fn start_block(form: &Form, downloads: Option<&Downloads>, mode: Mode) -> Option<StartBlock> {
+    if downloads.is_some_and(Downloads::is_clearing) {
+        Some(StartBlock::ClearingCache)
+    } else {
+        form.start_block(mode)
+    }
+}
+
+fn separation_controls(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
+    let mut action = None;
+    egui::Grid::new("separation settings")
+        .num_columns(2)
+        .min_col_width(FORM_LABEL_WIDTH)
+        .spacing([COLUMN_SPACING, ROW_SPACING])
+        .show(ui, |ui| {
+            for row in [model_row, stems_row, cleanup_row, device_row] {
+                action = row(ui, locale, form, downloads).or(action.take());
+                ui.end_row();
+            }
+        });
+    ui.add_space(SECTION_SPACING);
+    let split_block = start_block(form, downloads, Mode::Split);
+    let mix_block = start_block(form, downloads, Mode::SplitAndMix);
+    ui.horizontal(|ui| {
+        let split = egui::Button::new(egui::RichText::new(Text::Split.get(locale)).strong())
+            .selected(true)
+            .min_size(egui::vec2(130.0, 34.0));
+        if ui.add_enabled(split_block.is_none(), split).clicked() {
             action = Some(EditingAction::Start(Mode::Split));
         }
-        let mix = egui::Button::new(Text::SplitAndMix.get(locale));
-        let mix = ui.add_enabled(ready && form.can_mix(), mix);
+        let mix = egui::Button::new(egui::RichText::new(Text::SplitAndMix.get(locale)).strong())
+            .selected(true)
+            .min_size(egui::vec2(160.0, 34.0));
+        let mix = ui.add_enabled(mix_block.is_none(), mix);
         let mix = if form.can_mix() {
             mix
         } else {
@@ -585,13 +1083,51 @@ pub(crate) fn editing(
         if mix.clicked() {
             action = Some(EditingAction::Start(Mode::SplitAndMix));
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut format = form.output_format();
+            egui::ComboBox::from_id_salt("result encoding")
+                .width(85.0)
+                .selected_text(text::output_format(locale, format))
+                .show_ui(ui, |ui| {
+                    for &choice in stem_split_core::domain::OutputFormat::ALL {
+                        ui.selectable_value(
+                            &mut format,
+                            choice,
+                            text::output_format(locale, choice),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text(Text::OutputFormat.get(locale));
+            if format != form.output_format() {
+                action = Some(EditingAction::OutputFormat(format));
+            }
+        });
     });
-    // Whatever height is left goes to a layout that fills from the bottom
-    // and aligns to the right: its only widget lands in that corner.
-    let corner = egui::Layout::bottom_up(egui::Align::Max);
-    ui.with_layout(corner, |ui| language_menu(ui, locale))
-        .inner
-        .or(action)
+    // Keep explanations visible without changing the window height when a
+    // playlist selection becomes empty or valid again.
+    let reasons = [
+        split_block,
+        mix_block.filter(|reason| Some(*reason) != split_block),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|reason| text::start_block(locale, reason))
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let height = ui.text_style_height(&egui::TextStyle::Body);
+    ui.allocate_ui_with_layout(
+        egui::vec2(FORM_CONTENT_WIDTH, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(height);
+            if !reasons.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(&reasons).weak()).truncate())
+                    .on_hover_text(reasons);
+            }
+        },
+    );
+    action
 }
 
 /// Why something on the form was not accepted. Of many files that cannot
@@ -700,6 +1236,12 @@ impl Bar {
             fill: None,
         };
         match status {
+            RowStatus::Downloading(progress) => Self {
+                fraction: media_fraction(progress),
+                text: text::media_status(locale, progress),
+                fill: None,
+            },
+            RowStatus::Downloaded => still(1.0, Text::DownloadComplete),
             RowStatus::Waiting => still(0.0, Text::Waiting),
             RowStatus::Working(None) => Self {
                 fraction: None,
@@ -780,6 +1322,13 @@ pub(crate) fn running(
                     Bar::of_row(ui, locale, row.status),
                     &time,
                 );
+                if let Some(failure) = row.failure {
+                    show_message(
+                        ui,
+                        &text::failure(locale, failure),
+                        ui.visuals().error_fg_color,
+                    );
+                }
             }
         });
     ui.add_space(SECTION_SPACING);
@@ -795,6 +1344,22 @@ pub(crate) fn running(
         action = Some(RunningAction::Cancel);
     }
     action
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "download progress is displayed with f32 precision"
+)]
+fn media_fraction(progress: stem_split_media::Progress) -> Option<f32> {
+    match progress {
+        stem_split_media::Progress::Downloading { downloaded, total } => {
+            total.map(|total| (downloaded as f32 / total.get() as f32).clamp(0.0, 1.0))
+        }
+        stem_split_media::Progress::InstallingDownloader
+        | stem_split_media::Progress::InstallingFfmpeg
+        | stem_split_media::Progress::Inspecting
+        | stem_split_media::Progress::Converting => None,
+    }
 }
 
 /// What became of every file of a batch. When the results went to more than
@@ -834,6 +1399,9 @@ pub(crate) fn done(
                     }
                 });
                 match &file.outcome {
+                    Outcome::Downloaded => {
+                        ui.label(Text::DownloadComplete.get(locale));
+                    }
                     Outcome::Completed { output, took } => {
                         ui.weak(text::finished_summary(locale, *took, output.device()));
                         let names: Vec<String> = output
@@ -889,7 +1457,13 @@ pub(crate) fn failed(
     failure: &Failure,
 ) -> Option<FailedAction> {
     let mut action = None;
-    ui.heading(text::results_heading(locale, 0, files));
+    let heading = match failure {
+        Failure::Media(_) => Text::DownloadFailed.get(locale).to_owned(),
+        Failure::Job(_) | Failure::NotStarted(_) | Failure::Crashed => {
+            text::results_heading(locale, 0, files)
+        }
+    };
+    ui.heading(heading);
     ui.add_space(ROW_SPACING);
     show_message(
         ui,
@@ -910,6 +1484,352 @@ mod tests {
     use stem_split_core::separate::ActiveDevice;
 
     use super::*;
+
+    #[test]
+    fn playlist_side_panel_adds_width_without_height() -> Result<(), io::Error> {
+        use crate::{playlist::Panel, preview::State};
+        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        let directory = tempfile::tempdir()?;
+        let url = MediaUrl::new("https://example.org/list").map_err(io::Error::other)?;
+        for &locale in Locale::ALL {
+            for separation in [SeparationPanel::Collapsed, SeparationPanel::Expanded] {
+                let mut form = Form::default();
+                form.set_source(Source::Url);
+                form.set_url(url.as_str().to_owned());
+                form.set_output_folder(directory.path());
+                form.set_separation_panel(separation);
+                form.show_preview(State::Ready(MediaInfo::Playlist {
+                    title: "Playlist".to_owned(),
+                    first: MediaItem::new("Track 0".to_owned(), url.clone()),
+                    rest: (1..100)
+                        .map(|index| {
+                            MediaItem::new(format!("Track {index} ").repeat(40), url.clone())
+                        })
+                        .collect(),
+                }));
+                let context = egui::Context::default();
+                let measure = |form: &Form| {
+                    let mut minimum = egui::Vec2::ZERO;
+                    for _ in 0..3 {
+                        let output = context.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(960.0, 540.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                minimum = editing(ui, locale, form, None).minimum;
+                            },
+                        );
+                        output.drop_without_applying_deltas();
+                    }
+                    minimum
+                };
+                let closed = measure(&form);
+                form.set_playlist_panel(Panel::Open);
+                let open = measure(&form);
+                assert!(
+                    (open.y - closed.y).abs() < 0.5,
+                    "{locale:?}: {closed:?} versus {open:?}"
+                );
+                assert!((open.x - closed.x - PLAYLIST_WIDTH - PLAYLIST_GAP).abs() < 0.5);
+                for index in 0..100 {
+                    form.toggle_playlist_item(index);
+                }
+                assert!((measure(&form).y - closed.y).abs() < 0.5);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_and_long_playlists_keep_the_form_height() -> Result<(), io::Error> {
+        use crate::preview::State;
+        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+
+        let url = MediaUrl::new("https://example.org/list").map_err(io::Error::other)?;
+        for &locale in Locale::ALL {
+            for panel in [SeparationPanel::Collapsed, SeparationPanel::Expanded] {
+                let mut form = Form::default();
+                form.set_source(Source::Url);
+                form.set_url(url.as_str().to_owned());
+                form.set_separation_panel(panel);
+                let context = egui::Context::default();
+                let measure = |form: &Form| {
+                    let mut size = egui::Vec2::ZERO;
+                    for _ in 0..3 {
+                        let output = context.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(640.0, 700.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                size = editing(ui, locale, form, None).minimum;
+                            },
+                        );
+                        output.drop_without_applying_deltas();
+                    }
+                    size
+                };
+                let empty = measure(&form);
+                form.show_preview(State::Loading(url.clone()));
+                assert!((empty - measure(&form)).length() < 0.5);
+                form.show_preview(State::Failed(Failure::Crashed));
+                assert!((empty - measure(&form)).length() < 0.5);
+                form.show_preview(State::Ready(MediaInfo::Single(MediaItem::new(
+                    "Long title ".repeat(100),
+                    url.clone(),
+                ))));
+                assert!((empty - measure(&form)).length() < 0.5);
+                for count in [2, 100] {
+                    form.show_preview(State::Ready(MediaInfo::Playlist {
+                        title: "Playlist title ".repeat(100),
+                        first: MediaItem::new("First track".to_owned(), url.clone()),
+                        rest: (1..count)
+                            .map(|number| MediaItem::new(format!("Track {number}"), url.clone()))
+                            .collect(),
+                    }));
+                    assert!(
+                        (empty - measure(&form)).length() < 0.5,
+                        "{locale:?}, {panel:?}, {count}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn model_position(form: &Form, locale: Locale, width: f32) -> Result<egui::Pos2, io::Error> {
+        let context = egui::Context::default();
+        let mut position = None;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 520.0),
+                )),
+                ..Default::default()
+            };
+            let output = context.run_ui(input, |ui| {
+                let _action = editing(ui, locale, form, None);
+            });
+            position = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.job.text == Text::Model.get(locale) =>
+                {
+                    Some(text.pos)
+                }
+                _ => None,
+            });
+            output.drop_without_applying_deltas();
+        }
+        position.ok_or_else(|| io::Error::other("the model heading was not rendered"))
+    }
+
+    #[test]
+    fn input_tabs_keep_common_settings_in_place() -> Result<(), io::Error> {
+        let directory = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        for number in 0..6 {
+            let path = directory.path().join(format!("track-{number}.wav"));
+            std::fs::write(&path, b"")?;
+            paths.push(path);
+        }
+        for selection in [None, Some(paths.as_slice())] {
+            let mut form = Form::default();
+            if let Some(paths) = selection {
+                form.set_inputs(paths);
+            }
+            form.set_output_folder(directory.path());
+            for &locale in Locale::ALL {
+                for width in [520.0, 640.0] {
+                    form.set_source(Source::Files);
+                    let files = model_position(&form, locale, width)?;
+                    form.set_source(Source::Url);
+                    form.set_url("invalid link".to_owned());
+                    let url = model_position(&form, locale, width)?;
+                    assert!(
+                        files.distance(url) < 0.5,
+                        "{locale:?}, {width}: {files:?} versus {url:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_form_fits(form: &Form, locale: Locale) -> Result<(), io::Error> {
+        let context = egui::Context::default();
+        let mut size = egui::vec2(640.0, 540.0);
+        for pass in 0..4 {
+            let previous = size;
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    size = egui::CentralPanel::default()
+                        .show(ui, |ui| editing(ui, locale, form, None))
+                        .inner
+                        .minimum;
+                },
+            );
+            if pass == 3 {
+                assert!(
+                    (size - previous).length() < 0.5,
+                    "window size must settle: {previous:?}, {size:?}"
+                );
+                let mut last_button = 0.0_f32;
+                for label in [Text::Split, Text::SplitAndMix, Text::Device, Text::Wav] {
+                    let (clip, rect) = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text)
+                                if text.galley.job.text == label.get(locale) =>
+                            {
+                                Some((
+                                    shape.clip_rect,
+                                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| io::Error::other("a required control was not rendered"))?;
+                    assert!(
+                        clip.expand(0.5).contains_rect(rect),
+                        "{label:?} must be fully visible: {clip:?}, {rect:?}"
+                    );
+                    last_button = last_button.max(rect.bottom());
+                }
+                assert!(
+                    size.y - last_button < 40.0,
+                    "the footer must remain compact"
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn measured_window_fits_controls_without_a_large_footer() -> Result<(), io::Error> {
+        let directory = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        for number in 0..7 {
+            let path = directory.path().join(format!("track-{number}.wav"));
+            std::fs::write(&path, b"")?;
+            paths.push(path);
+        }
+        let mut form = Form::default();
+        form.set_inputs(&paths);
+        form.set_output_folder(directory.path());
+        form.set_model(
+            ModelId::Htdemucs6s,
+            Some(&stem_split_core::model::ModelStore::new(
+                directory.path().join("models"),
+            )),
+        );
+        form.set_cleanup(true, None);
+        for &locale in Locale::ALL {
+            check_form_fits(&form, locale)?;
+        }
+        form.set_source(Source::Url);
+        form.set_url("https://example.org/audio".to_owned());
+        form.set_output_folder(directory.path());
+        for &locale in Locale::ALL {
+            check_form_fits(&form, locale)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collapsed_url_form_keeps_download_beside_clear_and_hides_separation() -> Result<(), io::Error>
+    {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        let mut files = Vec::new();
+        for number in 0..6 {
+            let path = directory.path().join(format!("track-{number}.wav"));
+            std::fs::write(&path, b"")?;
+            files.push(path);
+        }
+        form.set_inputs(&files);
+        form.set_source(Source::Url);
+        form.set_url("https://example.org/audio".to_owned());
+        form.set_output_folder(directory.path());
+        form.set_separation_panel(SeparationPanel::Collapsed);
+        for &locale in Locale::ALL {
+            let context = egui::Context::default();
+            for pass in 0..3 {
+                let mut minimum = egui::Vec2::ZERO;
+                let output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(640.0, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        minimum = editing(ui, locale, &form, None).minimum;
+                    },
+                );
+                if pass == 2 {
+                    let position = |label: &str| {
+                        output.shapes.iter().find_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                                Some(text.pos)
+                            }
+                            _ => None,
+                        })
+                    };
+                    let clear = position(CLEAR_INPUT)
+                        .ok_or_else(|| io::Error::other("clear control was not rendered"))?;
+                    let download = position(Text::Download.get(locale))
+                        .ok_or_else(|| io::Error::other("download control was not rendered"))?;
+                    assert!(
+                        (clear.y - download.y).abs() < 1.0
+                            && download.x > clear.x
+                            && download.x - clear.x < 80.0
+                    );
+                    assert!(position(Text::Url.get(locale)).is_some());
+                    assert!(position(Text::Output.get(locale)).is_some());
+                    let browse = position(Text::Browse.get(locale))
+                        .ok_or_else(|| io::Error::other("folder button missing"))?;
+                    let format = position(Text::OriginalFormat.get(locale))
+                        .ok_or_else(|| io::Error::other("source format missing"))?;
+                    assert!(format.x > browse.x && (format.y - browse.y).abs() < 2.0);
+
+                    for hidden in [
+                        Text::Model,
+                        Text::Stems,
+                        Text::Cleanup,
+                        Text::Device,
+                        Text::Split,
+                        Text::SplitAndMix,
+                    ] {
+                        assert!(
+                            position(hidden.get(locale)).is_none(),
+                            "{hidden:?} must be hidden"
+                        );
+                    }
+                    assert!(
+                        minimum.y < 280.0,
+                        "collapsed form must stay compact: {minimum:?}"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn stages_without_a_measure_have_no_fraction() {

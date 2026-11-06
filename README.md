@@ -1,122 +1,126 @@
 # stem-split
 
-Простое настольное приложение для разделения аудио на стемы: вокал, ударные, бас и остальное. Написано на Rust с интерфейсом на egui. Нейросеть работает локально, файлы никуда не отправляются.
+A simple desktop application for splitting audio into stems: vocals, drums, bass, and other instruments. Written in Rust with an egui interface. Neural-network inference runs locally; audio files are not uploaded.
 
-> **Статус:** все этапы плана выполнены. Приложение собирается в архив для Windows и DMG для macOS на Apple Silicon. Ход работ — в [docs/PLAN.md](docs/PLAN.md).
+> **Status:** the original plan is complete. The application packages as a Windows ZIP and an Apple Silicon macOS DMG. See [docs/PLAN.md](docs/PLAN.md) for progress and validation results.
 
-## Что умеет
+## Features
 
-- Выбрать один или несколько аудиофайлов: MP3, FLAC, WAV, OGG, M4A — в диалоге, перетаскиванием в окно или аргументами при запуске. Файлы делятся по два одновременно.
-- Выбрать, куда сохранить результат. По умолчанию — рядом с исходным файлом.
-- Выбрать модель:
+- Choose one or more MP3, FLAC, WAV, OGG, or M4A files using a dialog, drag and drop, or command-line arguments. Files are processed two at a time.
+- On the URL tab, enter the HTTP(S) address of a recording or playlist. After 500 ms without edits, a loading indicator appears, followed by the title. For a playlist, the right-aligned Playlist toggle beside its title opens a panel with a checkbox for every entry. All entries are selected initially; All/None checkboxes select or clear the whole list. Playlist titles show the total track count, and the panel also shows how many are selected. The list scrolls within the current window height. For playlists with more than five entries, starting Download or Split first opens the selection panel; press the action again after reviewing it. Playlists with five or fewer entries start directly. Choose a destination folder to download the best available audio for each selected entry, then run the usual separation, mixing, and cleanup. Live streams are not supported. Every entry has its own progress bar and error result. Unavailable entries are skipped while the others continue, using the normal cancellation button. Choose Original, WAV, or MP3 beside the destination Browse button. Original keeps the source codec/container; WAV uses 32-bit float and MP3 uses 320 kbit/s. Temporary decoding inputs preserve source quality independently of the saved format.
+- Download saves the source audio files without separation. After returning to the form, you can split or mix them without downloading again, provided the URL and folder have not changed and all downloaded files still exist.
+- Download sits next to the URL clear button. Collapse the Separation and mix section to show only the source and destination controls. The section state is remembered, and the window adjusts to its size.
+- Choose where results are saved; local files default to their source folder.
+- Choose a model:
 
-  | Модель | Стемы | Когда выбирать |
+  | Model | Stems | When to choose it |
   |---|---|---|
-  | `htdemucs` | ударные, бас, остальное, вокал | По умолчанию, самая быстрая |
-  | `htdemucs_ft` | те же | Качество немного выше, работает примерно в 4 раза дольше |
-  | `htdemucs_6s` | те же, гитара и пианино | Когда нужны гитара и пианино отдельно |
+  | `htdemucs` | drums, bass, other, vocals | Default and fastest |
+  | `htdemucs_ft` | the same four | Slightly better quality, about four times slower |
+  | `htdemucs_6s` | the same four, plus guitar and piano | Separate guitar and piano |
 
-- Свести в один файл только нужные стемы: отметить их чекбоксами (есть «Все» и «Ни одного») и нажать «Разделить и свести». Получится `song.mix.wav` — например, минус без вокала. Чекбокс «Сохранить стемы» добавляет к миксу и файлы всех стемов.
-- Убрать артефакты разделения второй нейросетью: чекбокс «Убрать артефакты», отдельно отметить, что чистить — стемы, микс или то и другое, и выбрать сеть:
+- Mix selected stems into one file: use the stem checkboxes, All or None, then press Split and mix. The output is `song.mix.wav`, for example an instrumental mix. Save stems also writes every stem to its own file.
+- Clean up separation artifacts with a second neural network. Enable Clean up artifacts, select Stems, The mix, or both, and choose a network:
 
-  | Сеть | Что убирает |
+  | Network | Removes |
   |---|---|
-  | Reverb HQ | Реверберацию и размытые хвосты |
-  | Просачивание (`UVR-MDX-NET-Voc_FT`) | Голос, просочившийся в инструментальные стемы, и инструменты, просочившиеся в вокал |
+  | Reverb HQ | Reverb and smeared tails |
+  | Vocal bleed (`UVR-MDX-NET-Voc_FT`) | Vocals leaking into instrumental stems, and instruments leaking into vocals |
 
-  Сеть, отличающая голос от инструментов, не чистит микс, в котором есть и то и другое: для такого микса отметка «Микс» недоступна, а стемы чистятся по отдельности.
-- Показать прогресс каждого файла с его временем и общее время всех файлов, отменить обработку; по окончании — итог и время каждого файла.
-- Получить файлы вида `song.vocals.wav`, `song.drums.wav`, `song.mix.wav` (WAV, 32-битный float, 44.1 кГц).
-- Интерфейс на английском и русском; язык, модель, устройство, папка, отмеченные стемы и настройки очистки запоминаются.
-- Открыть папку со скачанными моделями или удалить их, чтобы освободить место: маленькие кнопки справа от списка моделей.
+  The vocal network cannot clean a mix containing both vocals and instruments. The mix checkbox is unavailable for that combination; individual stems can still be cleaned.
+- View progress and elapsed time for each file and the whole batch, cancel processing, and see each file's outcome and duration.
+- Choose WAV or MP3 to the right of Split/Split and mix. Stems and mixes use the selected extension: 32-bit float WAV or 320 kbit/s MP3 at 44.1 kHz. Download and output format choices are remembered independently.
+- Use English or Russian. Language, model, device, active tab, each tab's destination folder, selected stems, and cleanup settings are remembered. Selected files and URL text are not saved between launches.
+- Open or clear the shared cache using the small buttons beside the model selector. yt-dlp and FFmpeg download on first URL use into the model directory and are cleared together with the models.
 
-Ограничения: моно и стерео, длительность до 3 часов. У файлов M4A (AAC) результат может начинаться на 20–50 мс позже, чем исходник в других программах: используемый декодер не убирает задержку кодировщика.
+Limits: mono or stereo audio, up to three hours. With M4A/AAC, results can start 20–50 ms later than the source in other applications because the decoder does not remove encoder delay.
 
-Модель скачивается при первом использовании и сохраняется в кэше: `htdemucs` — 169 МБ, `htdemucs_6s` — 110 МБ, `htdemucs_ft` — 675 МБ. Сети очистки — по 67 МБ каждая. Каждый файл проверяется по SHA-256. На Windows кэш лежит в `%LOCALAPPDATA%\stem-split\cache\models`, на macOS — в `~/Library/Caches/stem-split/models`.
+Models download on first use and remain cached: `htdemucs` is 169 MB, `htdemucs_6s` is 110 MB, and `htdemucs_ft` is 675 MB. Cleanup networks are about 67 MB each. Every model file is verified with SHA-256. The cache is `%LOCALAPPDATA%\stem-split\cache\models` on Windows and `~/Library/Caches/stem-split/models` on macOS.
 
-Очистка добавляет время: на видеокарте около 0.5 с (Reverb HQ) или 0.25 с (просачивание) на каждые 6–12 секунд звука каждого очищаемого стема или микса, на процессоре — в 15–20 раз больше. Файлы с очисткой обрабатываются по одному, а не по два. Замеры сделаны на Windows; на macOS очистка не проверялась.
+Cleanup adds processing time: about 0.5 s for Reverb HQ or 0.25 s for vocal bleed on the GPU per 6–12 seconds of audio in each cleaned stem or mix; CPU processing takes 15–20 times longer. Batches, including cleanup, run two files at a time. These measurements are from Windows; cleanup has not been validated on macOS.
 
-## Как это устроено
+## How it works
 
-Инференс идёт через [ONNX Runtime](https://onnxruntime.ai/) на моделях [HTDemucs](https://github.com/facebookresearch/demucs) в виде [ONNX-экспорта](https://huggingface.co/HRSadeghi/demucs-onnx). Сети очистки — модели MDX-Net из набора [UVR](https://github.com/Anjok07/ultimatevocalremovergui), взятые из [этого репозитория](https://huggingface.co/Politrees/UVR_resources). На Windows используется видеокарта через DirectML, на macOS — CoreML с доступом к GPU и Neural Engine. При отказе ускорения обработка переходит на процессор. CoreML может выполнять часть графа на CPU; ускорение зависит от модели. Python и ffmpeg не нужны.
+Inference uses [ONNX Runtime](https://onnxruntime.ai/) with [HTDemucs](https://github.com/facebookresearch/demucs) models from an [ONNX export](https://huggingface.co/HRSadeghi/demucs-onnx). Cleanup uses MDX-Net models from [UVR](https://github.com/Anjok07/ultimatevocalremovergui), distributed in [this model repository](https://huggingface.co/Politrees/UVR_resources). Windows uses DirectML; macOS uses CoreML with access to the GPU and Neural Engine. Failed acceleration falls back to the CPU. CoreML may execute some graph operators on the CPU, and performance depends on the model. Local-file processing needs neither Python nor FFmpeg. For URLs, the application installs yt-dlp and FFmpeg through the [yt-dlp crate](https://docs.rs/yt-dlp/latest/yt_dlp/).
 
-На тестовой машине (Ryzen 5 2600, GTX 1660 SUPER) трек длиной 106 секунд моделью `htdemucs` делится за 13 с на видеокарте и за 55 с на процессоре; `htdemucs_ft` на видеокарте — за 39 с.
+On the test machine, a Ryzen 5 2600 with a GTX 1660 SUPER, `htdemucs` separates a 106-second track in 13 s on the GPU or 55 s on the CPU. `htdemucs_ft` takes 39 s on the GPU.
 
-То же разделение доступно без окна, примером из ядра:
+The core example provides the same separation without a window:
 
 ```sh
 cargo run --release -p stem-split-core --example separate -- song.flac --model htdemucs
-# микс ударных и баса, стемы и микс очищены от реверберации
+# Mix drums and bass; clean both the stems and mix with the reverb network.
 cargo run --release -p stem-split-core --example separate -- song.flac \
     --mix drums,bass --cleanup reverb_hq --cleanup-target both
 ```
 
-Подробности — в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 
-## Требования
+## Requirements
 
-- Windows 10 или 11, 64 бита, либо macOS 12 или новее на Apple Silicon (M1 и новее). Готовая macOS-сборка не поддерживает Intel; Linux пока не проверяется.
-- Для ускорения на Windows — видеокарта с поддержкой DirectX 12; на macOS — CoreML. Без ускорения обработка идёт на процессоре и занимает больше времени.
-- Для сборки — Rust 1.96 или новее.
+- 64-bit Windows 10 or 11, or macOS 12 or later on Apple Silicon (M1 or newer). The macOS package does not support Intel. Linux is not currently validated.
+- DirectX 12 graphics hardware for Windows acceleration; CoreML on macOS. Without acceleration, processing uses the CPU and takes longer.
+- Rust 1.96 or later for building; the repository pins its validated toolchain in `rust-toolchain.toml`.
 
-## Установка готовой версии
+## Install a release
 
-Скачайте пакет своей платформы из [GitHub Releases](https://github.com/bromzh/stem-split/releases).
+Download your platform's package from [GitHub Releases](https://github.com/bromzh/stem-split/releases).
 
-На Windows распакуйте ZIP и оставьте все файлы рядом с `stem-split.exe`.
+On Windows, extract the ZIP and keep all files beside `stem-split.exe`.
 
-На macOS откройте DMG, перетащите `stem-split.app` на ярлык Applications, извлеките образ и запустите приложение из «Программы». В DMG есть `README.txt` с инструкцией на английском и русском. Сборка подписана ad-hoc, но не сертификатом Apple Developer ID и не нотариализована, поэтому Gatekeeper может её заблокировать:
+On macOS, open the DMG, drag `stem-split.app` to the Applications shortcut, eject the image, and open the app from Applications. The image contains English installation instructions in `README.txt`. The build is ad-hoc signed, without an Apple Developer ID signature or notarization, so Gatekeeper may block it:
 
-1. Попробуйте открыть установленное приложение.
-2. В macOS 13 и новее откройте «Системные настройки → Конфиденциальность и безопасность», в macOS 12 — «Защита и безопасность → Основные».
-3. У сообщения о stem-split нажмите «Всё равно открыть» (`Open Anyway`) и подтвердите запуск.
+1. Try opening the installed application.
+2. On macOS 13 or later, open System Settings > Privacy & Security. On macOS 12, open System Preferences > Security & Privacy > General.
+3. Find the message about stem-split, click Open Anyway, and confirm Open.
 
-Если проверенная загрузка всё ещё блокируется как «повреждённая», в `README.txt` описано снятие quarantine только с этого приложения. Не отключайте Gatekeeper глобально.
+If a trusted download is still reported as damaged, `README.txt` explains how to remove quarantine from this application only. Do not disable Gatekeeper globally.
 
-## Сборка и запуск
+## Build and run
 
 ```sh
 cargo run --release
 ```
 
-Файл можно передать сразу: `cargo run --release -- song.flac`.
+Pass a file directly with `cargo run --release -- song.flac`.
 
-## Сборка релиза
+## Package a release
+
 ### Windows
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\package.ps1
 ```
 
-Скрипт собирает приложение и складывает в `dist\stem-split-<версия>-windows-x64.zip` всё, что нужно на машине без Rust и Visual Studio: `stem-split.exe`, `DirectML.dll`, четыре библиотеки среды выполнения Visual C++ и `README.txt`. Файлы архива должны лежать вместе.
+The script creates `dist\stem-split-<version>-windows-x64.zip` with everything needed on a machine without Rust or Visual Studio: `stem-split.exe`, `DirectML.dll`, four Visual C++ runtime libraries, and `README.txt`. Keep the archive's files together.
 
-Для упаковки нужна Visual Studio или Build Tools: оттуда берутся библиотеки Visual C++.
+Packaging requires Visual Studio or Build Tools, which supply the redistributable Visual C++ libraries.
 
-### macOS (Apple Silicon)
+### macOS / Apple Silicon
 
 ```sh
 bash tools/package-macos.sh
 ```
 
-Нужны Rust и Xcode Command Line Tools (`xcode-select --install`). Скрипт запускается на Apple Silicon без Rosetta, собирает с `--locked` для `aarch64-apple-darwin` и создаёт `dist/stem-split-<версия>-macos-arm64.dmg` и файл `.dmg.sha256`. Внутри DMG — `stem-split.app`, ярлык Applications, лицензия и двуязычная инструкция по установке и Gatekeeper.
+Requires Rust and Xcode Command Line Tools (`xcode-select --install`). Run on Apple Silicon without Rosetta. The script builds with `--locked` for `aarch64-apple-darwin` and creates `dist/stem-split-<version>-macos-arm64.dmg` plus its `.dmg.sha256` file. The DMG contains `stem-split.app`, an Applications shortcut, the license, and English installation and Gatekeeper instructions.
 
-В `.app` один исполняемый файл: ONNX Runtime встроен статически, отдельные сторонние dylib не нужны. Скрипт проверяет зависимости и ad-hoc подпись; нотариализация Apple не выполняется. Модели в пакет не входят и скачиваются при первом использовании.
+The app has one executable with ONNX Runtime linked statically; no separate third-party dylibs are needed. The script checks dependencies and the ad-hoc signature. Apple notarization is not performed. Models are not bundled and download on first use.
 
-Где приложение хранит своё:
+Application directories:
 
-| Что | Windows | macOS |
+| Data | Windows | macOS |
 |---|---|---|
-| Модели | `%LOCALAPPDATA%\stem-split\cache\models` | `~/Library/Caches/stem-split/models` |
-| Настройки и положение окна | `%APPDATA%\stem-split\data\app.ron` | `~/Library/Application Support/stem-split/app.ron` |
-| Журнал последнего запуска | `%LOCALAPPDATA%\stem-split\data\stem-split.log` | `~/Library/Application Support/stem-split/stem-split.log` |
+| Models and download tools | `%LOCALAPPDATA%\stem-split\cache\models` | `~/Library/Caches/stem-split/models` |
+| Settings and window position | `%APPDATA%\stem-split\data\app.ron` | `~/Library/Application Support/stem-split/app.ron` |
+| Latest launch log | `%LOCALAPPDATA%\stem-split\data\stem-split.log` | `~/Library/Application Support/stem-split/stem-split.log` |
 
-Релизные сборки обеих платформ также выполняются в GitHub Actions при отправке тега `v<версия>`: после проверок ZIP, DMG и контрольная сумма DMG прикрепляются к релизу. Версия тега должна совпадать с корневым `Cargo.toml`.
+Pushing a `v<version>` tag also runs both platform builds in GitHub Actions. After validation, the ZIP, DMG, and DMG checksum are attached to the release. The tag version must match the root `Cargo.toml`.
 
-## Разработка
+## Development
 
-Начиная с 1.0.0, при добавлении функциональности повышается вторая цифра версии и сбрасывается третья, при исправлениях — третья. Версия задаётся для всего workspace в корневом `Cargo.toml` и синхронизируется с `Cargo.lock`; изменения только документации её не повышают.
+Bump the version once per local set of changes, then keep it until that set has been committed and successfully pushed. Further local tasks and commits without a push do not cause another bump. After pushing the previous set, features increment the minor version and reset the patch version; fixes increment the patch version. The workspace version lives in the root `Cargo.toml` and is synchronized with `Cargo.lock`. Documentation-only changes do not bump it. The current local version is 1.2.0.
 
-Перед коммитом должны проходить без предупреждений:
+Before committing, all checks must pass without warnings:
 
 ```sh
 cargo fmt --all --check
@@ -124,33 +128,36 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Репозиторий — workspace из двух крейтов: `crates/core` (конвейер разделения, без GUI) и `crates/app` (окно на egui). В `spikes/` лежат отдельные пакеты-эксперименты, в сборку приложения они не входят.
+The workspace has three crates: `crates/core`, the separation pipeline without a GUI; `crates/media`, URL audio downloads and tool installation; and `crates/app`, the egui window. Standalone experiments in `spikes/` are excluded from the application workspace.
 
-Правила кода описаны в [docs/GUIDELINES.md](docs/GUIDELINES.md). Коротко:
+See [docs/GUIDELINES.md](docs/GUIDELINES.md). The essential rules are:
 
-- никаких `unwrap`, `expect`, `panic!` и индексации, способной упасть;
-- инварианты выражаются типами, чтобы ошибки ловил компилятор;
-- `unsafe` запрещён.
+- No `unwrap`, `expect`, `panic!`, or indexing that can panic.
+- Express invariants through types so the compiler catches invalid states.
+- No `unsafe`.
 
-Эти правила закреплены линтами в [Cargo.toml](Cargo.toml).
+These rules are enforced by lints in [Cargo.toml](Cargo.toml).
 
-## План
+## Plan
 
-Подробный план с критериями готовности — в [docs/PLAN.md](docs/PLAN.md).
+The detailed plan and acceptance criteria are in [docs/PLAN.md](docs/PLAN.md).
 
-0. Проверка гипотез: ONNX-экспорт HTDemucs через `ort` с DirectML на целевой машине. **Готово.**
-1. Каркас: workspace из двух крейтов, доменные типы. **Готово.**
-2. Аудио: декодирование, ресемплинг, запись WAV. **Готово.**
-3. Модели: реестр, загрузка, кэш. **Готово.**
-4. Разделение: конвейер целиком с прогрессом и отменой. **Готово.**
-5. Интерфейс. **Готово.**
-6. Доводка и сборка релиза. **Готово.**
-7. Микс из выбранных стемов. **Готово.**
-8. Очистка от артефактов сетью Reverb HQ. **Готово.**
-9. Вторая сеть очистки и выбор целей чекбоксами. **Готово.**
+0. Validate HTDemucs ONNX inference through `ort` and DirectML on the target machine. **Complete.**
+1. Workspace skeleton, two initial crates, and domain types. **Complete.**
+2. Audio decoding, resampling, and WAV output. **Complete.**
+3. Model registry, downloads, and cache. **Complete.**
+4. Complete separation pipeline with progress and cancellation. **Complete.**
+5. Interface. **Complete.**
+6. Polish and release packaging. **Complete.**
+7. Mix selected stems. **Complete.**
+8. Reverb HQ artifact cleanup. **Complete.**
+9. Second cleanup network and target checkboxes. **Complete.**
+10. Preview URL metadata and download recordings or playlists through yt-dlp. **Implemented locally in 1.2.0.**
 
-## Лицензии
+## Licenses
 
-Код проекта распространяется под лицензией [MIT](LICENSE): её можно использовать, изменять и распространять почти без ограничений.
+The project's own code is distributed under [MIT](LICENSE), which permits use, modification, and redistribution with few restrictions.
 
-Веса нейросетей в репозиторий не входят: приложение скачивает их при первом запуске из [отдельного ONNX-экспорта](https://huggingface.co/HRSadeghi/demucs-onnx) и [набора моделей UVR](https://huggingface.co/Politrees/UVR_resources) и к лицензии проекта они отношения не имеют. Модели MDX-Net распространяются в составе UVR, код которого открыт под MIT; отдельного заявления о лицензии весов нет. Код Demucs распространяется под MIT, но отдельного заявления о лицензии весов в его репозитории нет, и часть сторонних экспортов трактует их как CC BY-NC 4.0 (некоммерческое использование). Поэтому приложение задумано как некоммерческое и рассчитано на личное использование; лицензия MIT этого не ограничивает, ограничение идёт от весов.
+The local 1.2.0 URL integration uses `yt-dlp` 2.10 under GPL-3.0-only. The MIT license of the project's own sources does not replace this dependency's license. Downloaded yt-dlp and FFmpeg binaries also have their own licensing terms.
+
+Neural-network weights are not included in the repository. The application downloads them from the [ONNX export](https://huggingface.co/HRSadeghi/demucs-onnx) and [UVR model collection](https://huggingface.co/Politrees/UVR_resources), independently of the project's license. MDX-Net models are distributed with UVR, whose code is MIT, but no separate weight-license statement is available. Demucs code is MIT; its repository likewise has no separate statement for weights, and some third-party exports treat them as CC BY-NC 4.0 for non-commercial use. The application is therefore intended for personal, non-commercial use. The model weights, rather than the project's MIT license, impose that limitation.

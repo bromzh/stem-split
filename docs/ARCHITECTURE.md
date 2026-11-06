@@ -1,206 +1,201 @@
-# Архитектура
+# Architecture
 
-Документ описывает устройство приложения. Версии крейтов и состояние сторонних проектов проверены на 2026-10-12. Выбор моделей и настройки DirectML подтверждены замерами этапа 0, цифры — в [PLAN.md](PLAN.md).
+This document describes the application. Dependency versions and the state of third-party projects were checked on 2026-10-12. Model selection and DirectML configuration were confirmed by stage 0 measurements; see [PLAN.md](PLAN.md).
 
-## 1. Назначение и границы
+## 1. Purpose and scope
 
-`stem-split` — настольное приложение, которое делит аудиофайл на стемы (вокал, ударные, бас и так далее) с помощью открытой нейросети.
+`stem-split` is a desktop application that separates an audio file into stems such as vocals, drums, and bass using an open neural network.
 
-В первую версию входит:
+The first version includes choosing an input file, choosing an output directory (the source folder by default), selecting an HTDemucs model, progress and cancellation, understandable errors, and automatic first-use model downloads.
 
-- выбор одного входного файла;
-- выбор выходной директории, по умолчанию — рядом с файлом;
-- выбор модели из семейства HTDemucs;
-- индикатор прогресса, отмена, понятное сообщение об ошибке;
-- автоматическая загрузка модели при первом запуске.
+Multiple files can be processed in one batch (section 13), but this is not a queue: new files cannot be added to a running batch.
 
-Несколько файлов делятся за один запуск (см. раздел 13), но это не очередь: новые файлы не добавляются к идущей работе.
+Later additions include mixing selected stems into one file (section 9) and a second MDX-Net neural network for artifact cleanup after separation (section 16).
 
-Сверх первой версии добавлены:
+Out of scope: playback, a mixer with individual volume controls, model training, and separated-stem output formats other than WAV/MP3. Downloaded source audio retains its native format.
 
-- микс: сумма выбранных стемов в один файл (раздел 9);
-- очистка от артефактов второй нейросетью семейства MDX-Net после разделения (раздел 16).
+## 2. Key decisions
 
-Не входит: проигрыватель, микшер с громкостями, обучение моделей, выходные форматы кроме WAV.
-
-## 2. Ключевые решения
-
-| Решение | Почему |
+| Decision | Reason |
 |---|---|
-| Инференс через ONNX Runtime (крейт `ort`), конвейер вокруг него — свой | Один exe плюс DLL рантайма, без Python и ffmpeg. Прогресс, отмена и ошибки — на собственных типах |
-| Модели HTDemucs: `htdemucs`, `htdemucs_ft`, `htdemucs_6s` | Стандарт для деления на 4–6 стемов, есть готовые ONNX-экспорты |
-| ONNX-экспорт, в котором STFT и iSTFT вынесены из графа; оба преобразования считает приложение | Единственный из проверенных вариантов, который работает на DirectML. Экспорт со встроенным STFT на GPU не запускается |
-| GPU через DirectML с откатом на CPU | Работает на любой видеокарте с DirectX 12, не требует установки CUDA. На целевой машине в 10 раз быстрее CPU |
-| Слияние графа в DirectML отключено | Со слиянием DirectML без ошибок возвращает неверный результат (см. раздел 11) |
-| Два крейта: ядро без GUI и приложение | Граница слоёв проверяется компилятором: ядро не может зависеть от egui |
-| Рендерер eframe — glow (OpenGL), а не wgpu по умолчанию | Для интерфейса из одной формы wgpu избыточен: в release-сборке на целевой машине exe 13.6 МБ против 6.8 МБ, выделенная память 490 МБ против 120–180 МБ, окно появляется за 1.1 с против 0.6–0.8 с |
-| Рабочий поток и канал сообщений, без async-рантайма | Задача одна и последовательная; `tokio` здесь не нужен |
-| Микс суммируется в памяти и пишется в конце | Работает одинаково для моделей с одним графом и с графом на стем; памяти нужно столько же, сколько занимает вход |
-| Очистка — отдельная стадия после разделения, на сетях MDX-Net из набора UVR | Готовые ONNX-файлы той же связки `ort` + DirectML; STFT считает приложение, как и для HTDemucs |
-| Стемы до очистки лежат в сырых файлах рядом с результатом и удаляются в `Drop` | Шесть стемов пятиминутного трека в памяти — около 640 МБ; файл же исчезает при ошибке и отмене сам |
-| Windows и macOS на Apple Silicon, платформенный код изолирован | DirectML и CoreML выбираются в одном модуле; Linux пока работает только на CPU и не проверялся |
+| ONNX Runtime through `ort`, with a custom pipeline | One executable plus runtime DLLs, with no Python or FFmpeg needed for local-file inference. Progress, cancellation, and errors use project types |
+| HTDemucs models: `htdemucs`, `htdemucs_ft`, `htdemucs_6s` | A standard approach to 4–6 stem separation, with available ONNX exports |
+| An ONNX export with STFT and iSTFT outside the graph | The only tested export that works with DirectML; exports embedding STFT failed on the GPU |
+| DirectML acceleration with CPU fallback | Works with any DirectX 12 GPU, needs no CUDA installation, and is ten times faster than the CPU on the target machine |
+| Disable DirectML graph fusion | With fusion enabled, DirectML silently returns incorrect values; see section 11 |
+| Three crates: core, media downloads, and application | The core depends on neither egui nor download tools; `media` uses core domain types, and `app` connects both workflows |
+| eframe's glow/OpenGL renderer instead of default wgpu | For this form-based interface, the measured release executable is 6.8 MB instead of 13.6 MB, allocated memory is 120–180 MB instead of 490 MB, and startup is 0.6–0.8 s instead of 1.1 s |
+| Worker threads and channels; a separate Tokio runtime only for URL downloads | Inference stays synchronous. The asynchronous `yt-dlp` API, tool installation, and subprocess control stay in `media`, off the UI thread |
+| Accumulate the mix in memory and write it last | Works for both single-graph and per-stem-graph models, using memory comparable to the input |
+| Cleanup is a separate post-separation stage using UVR MDX-Net networks | Uses the same `ort` and DirectML stack, with STFT performed by the application |
+| Raw stems awaiting cleanup spill to files beside the results and are removed by `Drop` | Six stems of a five-minute track would occupy about 640 MB in memory; files are cleaned up automatically on failure or cancellation |
+| Windows and Apple Silicon macOS, with isolated platform modules | DirectML and CoreML selection is centralized. Linux currently uses only the CPU and has not been validated |
 
-## 3. Рассмотренные варианты бэкенда
+## 3. Backend alternatives considered
 
-| Вариант | Итог | Причина |
+| Option | Outcome | Reason |
 |---|---|---|
-| Свой конвейер на `ort` + ONNX-экспорт HTDemucs | **Выбран** | Контроль над типами, прогрессом и отменой; выбор из трёх моделей |
-| Крейт [`stem-splitter-core`](https://github.com/gentij/stem-splitter-core) | Образец для сверки | Глобальные колбэки, нет отмены, одна модель, настройка через переменные окружения |
-| Крейт [`charon-audio`](https://crates.io/crates/charon-audio) | Образец для сверки | Версия 0.1.2 от сентября 2026, слишком молод для зависимости |
-| [`demucs-rs`](https://github.com/nikhilunni/demucs-rs) на Burn | Отложен | Нет на crates.io, скорость через wgpu на целевой видеокарте неизвестна |
-| Python CLI [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) | Возможный второй бэкенд | Лучшие модели (RoFormer), но нужны Python, PyTorch на 2–3 ГБ и ffmpeg |
-| RoFormer нативно ([ONNX-экспорт](https://huggingface.co/silverdaw/bs-roformer-rhythm-onnx), [`uvr-rs`](https://github.com/IronHpc/UVR-rs)) | Отложен | Нужен собственный STFT/iSTFT; `uvr-rs` работает только на CPU |
+| Custom `ort` pipeline with HTDemucs ONNX exports | **Selected** | Control over types, progress, cancellation, and three models |
+| [`stem-splitter-core`](https://github.com/gentij/stem-splitter-core) | Reference implementation | Global callbacks, no cancellation, one model, environment-variable settings |
+| [`charon-audio`](https://crates.io/crates/charon-audio) | Reference implementation | Version 0.1.2 from September 2026 was too young to adopt as a dependency |
+| [`demucs-rs`](https://github.com/nikhilunni/demucs-rs) on Burn | Deferred | Not on crates.io; wgpu performance on the target GPU is unknown |
+| Python CLI [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) | Possible second backend | Better models such as RoFormer, but requires Python, 2–3 GB of PyTorch, and FFmpeg |
+| Native RoFormer ([ONNX export](https://huggingface.co/silverdaw/bs-roformer-rhythm-onnx), [`uvr-rs`](https://github.com/IronHpc/UVR-rs)) | Deferred | Needs custom STFT/iSTFT; `uvr-rs` supports only the CPU |
 
-Трейт `Separator` (раздел 7) оставляет место для второго бэкенда без переделки остального кода.
+The `Separator` trait in section 7 allows a second backend without redesigning the pipeline.
 
-## 4. Модели
+## 4. Models
 
-| Идентификатор | Стемы | Особенности |
+| Identifier | Stems | Notes |
 |---|---|---|
-| `htdemucs` | drums, bass, other, vocals | Модель по умолчанию, самая быстрая |
-| `htdemucs_ft` | drums, bass, other, vocals | Дообученная, качество немного выше, работает примерно в 4 раза дольше |
-| `htdemucs_6s` | те же и guitar, piano | Пианино, по словам авторов, отделяется посредственно |
+| `htdemucs` | drums, bass, other, vocals | Default and fastest |
+| `htdemucs_ft` | drums, bass, other, vocals | Fine-tuned, slightly better quality, about four times slower |
+| `htdemucs_6s` | the same, plus guitar and piano | The authors describe piano separation as mediocre |
 
-Общие параметры: 44.1 кГц, стерео, сегмент 7.8 с (343 980 кадров).
+Shared parameters: 44.1 kHz, stereo, 7.8-second segments (343,980 frames).
 
-### Источник файлов
+### Model files
 
-Используется [`HRSadeghi/demucs-onnx`](https://huggingface.co/HRSadeghi/demucs-onnx), проверенная ревизия `9128f6ee0f1b8e333b5b8d12613aefb3bebc249a`. Ссылки в реестре моделей указывают на эту ревизию, а не на `main`.
+Use [`HRSadeghi/demucs-onnx`](https://huggingface.co/HRSadeghi/demucs-onnx), pinned to verified revision `9128f6ee0f1b8e333b5b8d12613aefb3bebc249a`. Registry URLs point to that revision rather than `main`.
 
-| Модель | Файлы | Размер загрузки |
+| Model | Files | Download size |
 |---|---|---|
-| `htdemucs` | `htdemucs.onnx` | 169 МБ |
-| `htdemucs_6s` | `htdemucs_6s.onnx` | 110 МБ |
-| `htdemucs_ft` | `htdemucs_ft_0.onnx` … `htdemucs_ft_3.onnx`, по одному на стем | 4 × 169 МБ |
+| `htdemucs` | `htdemucs.onnx` | 169 MB |
+| `htdemucs_6s` | `htdemucs_6s.onnx` | 110 MB |
+| `htdemucs_ft` | `htdemucs_ft_0.onnx` through `htdemucs_ft_3.onnx`, one per stem | 4 × 169 MB |
 
-Контракт графа одинаков для всех файлов:
+All graphs share this contract:
 
-| Тензор | Форма | Содержимое |
+| Tensor | Shape | Content |
 |---|---|---|
-| вход `mix` | `[batch, 2, 343980]` | Нормализованная волна |
-| вход `mag` | `[batch, 4, 2048, 336]` | Спектрограмма: плоскости «левый re, левый im, правый re, правый im» |
-| выход `wav` | `[batch, S, 2, 343980]` | Временная ветвь |
-| выход `spec` | `[batch, S, 4, 2048, 336]` | Спектральная ветвь в той же раскладке плоскостей |
+| Input `mix` | `[batch, 2, 343980]` | Normalized waveform |
+| Input `mag` | `[batch, 4, 2048, 336]` | Spectrogram planes: left real, left imaginary, right real, right imaginary |
+| Output `wav` | `[batch, S, 2, 343980]` | Time-domain branch |
+| Output `spec` | `[batch, S, 4, 2048, 336]` | Spectral branch, with the same plane layout |
 
-Итоговый стем — это `wav` плюс обратное STFT от `spec`. `htdemucs_ft` — набор из четырёх графов той же архитектуры: каждый выдаёт все четыре стема, но в результат идёт только тот, на котором граф специализирован (порядок: drums, bass, other, vocals).
+Each final stem is `wav` plus inverse STFT of `spec`. `htdemucs_ft` contains four graphs of the same architecture. Each emits all four stems, but only the stem it specializes in is retained, in order: drums, bass, other, vocals.
 
-Отвергнутые источники:
+Rejected sources:
 
-| Репозиторий | Почему не подошёл |
+| Repository | Why it was rejected |
 |---|---|
-| [`smank/htdemucs-onnx`](https://huggingface.co/smank/htdemucs-onnx) | STFT встроен в граф через свёртки. На CPU работает, на DirectML узел `ConvTranspose` обратного преобразования падает с ошибкой выделения памяти. Оставлен как эталон для сверки собственного STFT |
-| [`gentij/htdemucs-ort`](https://huggingface.co/gentij/htdemucs-ort) | Формат `.ort`, сессия на DirectML не создаётся. Только одна модель |
+| [`smank/htdemucs-onnx`](https://huggingface.co/smank/htdemucs-onnx) | STFT is embedded as convolutions. CPU execution works, but inverse-transform `ConvTranspose` fails with a memory-allocation error on DirectML. Retained as a reference for the custom STFT |
+| [`gentij/htdemucs-ort`](https://huggingface.co/gentij/htdemucs-ort) | DirectML cannot create a session for the `.ort` file; only one model is available |
 
-Используются только веса fp32. Варианты fp16 исключены: на видеокартах серии GTX 16xx половинная точность известна ошибками вычислений. Вариант int8 на CPU оказался быстрее всего на 5% при заметно большем расхождении с fp32, поэтому не используется.
+Only fp32 weights are used. fp16 is excluded because GTX 16xx GPUs are known to produce numerical errors with half precision. The tested int8 CPU version was only 5% faster and differed more from fp32, so it is not used.
 
-Лицензии: код Demucs распространяется под MIT, отдельного заявления о лицензии весов в репозитории нет, часть сторонних экспортов трактует их как CC BY-NC 4.0. До выяснения проект рассчитан на личное некоммерческое использование.
+Demucs code is MIT. Its repository has no separate weight-license statement, and some third-party exports treat weights as CC BY-NC 4.0. Until clarified, the project is intended for personal, non-commercial use.
 
-## 5. Структура проекта
+## 5. Project structure
 
-```
-Cargo.toml                    # [workspace], общие линты и версии зависимостей
+```text
+Cargo.toml                    # Workspace, shared lints and dependency versions
 crates/
-  core/                       # пакет stem-split-core (lib), без GUI
+  core/                       # stem-split-core library; no GUI dependencies
     src/
       lib.rs
-      domain/                 # типы с инвариантами: Stem, ModelId, SampleRate, InputFile, OutputDir…
-      audio/                  # decode (symphonia), resample (rubato), wav (hound)
-      model/                  # registry — описания моделей и сетей очистки, store — загрузка и кэш
-      separate/               # plan — нарезка, stft — прямое и обратное STFT, overlap — сборка,
-                              # backend — Separator и ort
-      enhance/                # очистка MDX-Net: нарезка окон, stft, backend — Enhancer и ort
-      providers.rs            # сессии ONNX Runtime на CPU и GPU, откат на CPU — общие для всех сетей
-      job.rs                  # сценарий целиком: от запроса до файлов на диске
-      batch.rs                # пакет файлов: проверка выходов, сколько задач идут разом
-      partial.rs              # PartialFile: файл появляется под своим именем только готовым
-    examples/                 # утилиты ручной проверки на реальных файлах
-  app/                        # пакет stem-split (bin)
+      domain/                 # Invariant-bearing types: Stem, ModelId, InputFile, etc.
+      audio/                  # Decode, resample, and WAV output
+      model/                  # Registry, downloads, and cache
+      separate/               # Chunk planning, STFT, overlap-add, and ort backend
+      enhance/                # MDX-Net cleanup: windows, STFT, Enhancer, and ort
+      providers.rs            # Shared CPU/GPU sessions and fallback
+      job.rs                  # Complete request-to-files workflow
+      batch.rs                # Output conflicts and file concurrency
+      partial.rs              # Publish a file only after it is complete
+    examples/                 # Manual validation on real files
+  app/                        # stem-split executable
     src/
       main.rs
-      app.rs                  # eframe::App и автомат состояний
-      worker.rs               # пакет задач в рабочих потоках, канал событий
-      tracker.rs              # что стало с каждым файлом пакета, часы и оценки
-      downloads.rs            # скачанные модели: объём, папка, удаление в отдельном потоке
-      view/                   # отрисовка экранов; text — все строки интерфейса и локали
-spikes/                       # отдельные пакеты-эксперименты, в workspace не входят
+      app.rs                  # eframe::App and screen state machine
+      worker.rs               # Batch threads and event channel
+      preview.rs              # Debounced metadata requests and cancellation
+      playlist.rs             # Transient entry selection and panel state
+      tracker.rs              # File states, clocks, and estimates
+      downloads.rs            # Cache size, location, and background deletion
+      view/                   # Screens; text contains strings and locales
+  media/                      # stem-split-media: URL validation and yt-dlp/FFmpeg
+                              # installation, playlist downloads, and cancellation
+    src/metadata.rs           # Metadata-only inspection and validated media items
+spikes/                       # Standalone experiments outside the workspace
 docs/
 ```
 
-Правило зависимостей: `app` зависит от `core`, обратной зависимости нет. Внутри `core` модуль `domain` не зависит ни от чего, а `job` — единственное место, где встречаются `audio`, `model`, `separate` и `enhance`.
+Dependency direction: `app` depends on `core` and `media`; `media` depends on core domain and cancellation types. There are no reverse dependencies. Within `core`, `domain` is independent, and `job` is the only module combining `audio`, `model`, `separate`, and `enhance`.
 
-Ядро готово целиком: `domain`, `audio` (в том числе `mix` — сумма готовых файлов и `spill` — сырые стемы до очистки), `model`, `separate`, `enhance`, `providers`, `job`, `batch`, `cancel`, `partial`. В приложении: `main.rs`, `app.rs` (автомат экранов), `form.rs` (выбор пользователя), `settings.rs` (что запоминается между запусками), `worker.rs` (рабочие потоки пакета), `tracker.rs` (состояние файлов пакета), `downloads.rs` (скачанные модели), `timing.rs` (время работы), `dialogs.rs` (нативные диалоги), `logging.rs` и `view` с модулем `text`. Значок лежит в `crates/app/assets` вместе со скриптом, который его рисует; скрипт упаковки релиза — в `tools/`.
+The core is complete: `domain`, `audio` (including `mix` for summing files and `spill` for raw stems), `model`, `separate`, `enhance`, `providers`, `job`, `batch`, `cancel`, and `partial`. The application includes `main.rs`, `app.rs`, `form.rs`, `settings.rs`, `worker.rs`, `tracker.rs`, `downloads.rs`, `preview.rs`, `playlist.rs`, `timing.rs`, `dialogs.rs`, `logging.rs`, and `view::text`. The icon and its generator are in `crates/app/assets`; release packaging scripts are in `tools/`.
 
-У ядра есть сборочный скрипт `build.rs`. Он кладёт `DirectML.dll` рядом с тестовыми бинарниками и примерами (см. раздел 15).
+The core's `build.rs` copies `DirectML.dll` beside test and example executables; see section 15.
 
-## 6. Поток данных
+## 6. Data flow
 
+```text
+ UI thread (app)                        Worker thread (core::job)
+ ----------------                      -------------------------
+ Form ---> SeparationRequest --------> ModelStore::ensure ---> cached model
+                                        audio::decode     ---> DecodedAudio
+                                        audio::resample   ---> ModelAudio (44.1 kHz)
+                                        separate::plan    ---> 7.8-second chunks
+                                        Separator         ---> chunk stems
+ Progress <--- event channel ---------  separate::overlap  ---> completed frames
+                                        stems for cleanup ---> *.wav.raw (Spill)
+                                        mix               ---> in-memory sum
+                                        enhance::clean    ---> cleaned stems and mix
+ CancelToken ------------------------>  audio::wav        ---> *.wav.part ---> *.wav
+ JobEnd / JobError <-------------------  completion
 ```
- UI-поток (app)                         Рабочий поток (core::job)
- ───────────────                        ─────────────────────────
- Form ──► SeparationRequest ──────────► ModelStore::ensure ──► файл модели в кэше
-                                        audio::decode      ──► DecodedAudio
-                                        audio::resample    ──► ModelAudio (44.1 кГц)
-                                        separate::plan     ──► чанки по 7.8 с
-                                        Separator          ──► стемы чанка
- Progress ◄──── канал событий ────────  separate::overlap  ──► готовые кадры
-                                        стемы на очистку   ──► *.wav.raw (Spill)
-                                        микс               ──► сумма в памяти
-                                        enhance::clean     ──► очищенные стемы и микс
- CancelToken ─────────────────────────► audio::wav         ──► *.wav.part ──► *.wav
- JobEnd / JobError ◄──────────────────  завершение
-```
 
-Несколько файлов — это пакет (`core::batch::Batch`): по задаче на файл с общими моделью, устройством и выходом. Ведущий поток пакета один раз скачивает модель, затем запускает задачи по две одновременно, каждую в своём потоке, и следующую — как только освободится место. Все события идут в один канал с номером файла.
+A multi-file run is a `core::batch::Batch`: one job per file sharing the model, device, and output settings. Its leading thread downloads the model once, then starts two file jobs at a time, each on its own thread. The next starts as soon as a slot becomes free. Events share one channel and include the file's index.
 
-## 7. Типы и инварианты
+## 7. Types and invariants
 
-Смысл раздела — перечислить, какие ошибки ловит компилятор. Сигнатуры иллюстративны. Типы до `Sha256Digest` включительно, кроме помеченных этапом, уже реализованы в `core::domain`.
+This section identifies errors caught by the compiler. Signatures are illustrative. Domain types through `Sha256Digest`, except those explicitly introduced in later stages, are implemented in `core::domain`.
 
-Перечисления, по которым нужен перебор (`Stem`, `ModelId`, `AudioFormat`, `DevicePreference`, а в приложении `Locale` и `Text`), объявлены макросом `closed_enum!`. Макрос экспортируется из ядра. Он порождает из одного списка и сам `enum`, и константу `ALL`, поэтому список вариантов не может отстать от перечисления.
+Iterable enums (`Stem`, `ModelId`, `AudioFormat`, `DevicePreference`, and application `Locale` and `Text`) use the core's exported `closed_enum!` macro. It generates both the enum and `ALL`, so iteration cannot fall behind the variants.
 
-| Тип | Инвариант | Чем обеспечен |
+| Type | Invariant | Enforcement |
 |---|---|---|
-| `ModelId` | Модель существует | `enum`; описание модели выдаёт исчерпывающий `match`, а не поиск по строке |
-| `Stem` | Имя стема корректно | `enum`; имя файла получается из варианта |
-| `StemLayout` | Список стемов модели не пуст, порядок фиксирован | Поля `first: Stem` и `rest: &'static [Stem]`; публичного конструктора нет, значения — константы `FOUR` и `SIX` |
-| `AudioFormat` | Расширение входного файла поддерживается | `enum`; он же даёт список расширений для диалога выбора файла |
-| `ModelSpec` | У модели есть хотя бы один граф | Поле `first: GraphSpec` и `rest: &'static [GraphSpec]` |
-| `GraphSpec` | Известны размер и SHA-256 файла и то, какие стемы графа идут в результат | Значения — константы реестра; дайджест задан макросом `hex!`, который проверяет длину и цифры при компиляции. `emits: StemSelection` — `All` или `Only(Stem)` |
-| `LocalModel` | Все файлы модели лежат на диске и проверены | Создаётся только `ModelStore::ensure`; не пуст так же, как `ModelSpec` |
-| `Ensured` | Отмена загрузки — не ошибка | `enum { Ready(LocalModel), Cancelled }` |
-| `CancelToken` | Отменённая работа не возобновляется | Флаг только взводится; клоны делят один флаг |
-| `SampleRate` | Частота больше нуля | `NonZeroU32` |
-| `FrameCount`, `ByteCount` | Число кадров не спутать с числом байт или отсчётов | Отдельные типы-обёртки |
-| `StereoFrames` | Ровно два канала одинаковой длины | `Vec<[f32; 2]>` |
-| `DecodedAudio` | Стерео с известной ненулевой частотой | Состоит из `SampleRate` и `StereoFrames`; собственного скрытого инварианта нет, поэтому конструктор открыт |
-| `ModelAudio` | Стерео, строго 44.1 кГц | Частота не хранится: значение создаёт только `resample`, конструктор виден лишь внутри ядра |
-| `ChunkPlan` | У трека есть хотя бы один чанк | Строится из `NonZeroUsize`; поля `first: Chunk` и `rest: Vec<Chunk>` |
-| `Chunk` | Смещение, длина и положение внутри окна модели согласованы с длиной трека | Создаётся только планировщиком |
-| `Segment` | Ровно 343 980 отсчётов в каждом канале | Создаётся тихим нужной длины, дальше в него только пишут |
-| `ChunkStems` | Число отсчётов равно «стемы × 2 × сегмент» | Проверяющий конструктор, один раз при разборе выхода модели |
-| `InputFile` | Абсолютный путь к существующему файлу с поддерживаемым расширением; известны его директория и имя без расширения | Проверяющий конструктор; производные части вычисляются в нём один раз, поэтому геттеры не возвращают `Option` |
-| `OutputDir` | Абсолютный путь к существующей директории | Проверяющий конструктор; `OutputDir::beside(&InputFile)` проверки не требует |
-| `OutputChoice` | Либо «рядом с файлом», либо явная директория | `enum { BesideInput, Custom(OutputDir) }`; выбор «рядом» не превращается в путь заранее и следует за сменой входного файла |
-| `OverwritePolicy` | Перезапись возможна только по явному решению | `enum { Refuse, Replace }`, по умолчанию `Refuse` |
-| `SeparationRequest` | Все поля заданы и проверены | Собирается только из проверенных типов; выходная директория вычисляется в конструкторе |
-| `InputFiles` | Выбран хотя бы один файл, каждый не больше одного раза | Поля `first` и `rest`; конструктор из списка возвращает `Option` и отбрасывает повторы (на Windows — без учёта регистра) |
-| `Batch` | Задач хотя бы одна, у всех одна модель и устройство, никакие две не пишут в один файл | Строится только из `InputFiles` и общих настроек; совпадение «папка результата + имя без расширения» — ошибка `OutputClash` до запуска |
-| `CpuThreads` | Потоков сессии на CPU хотя бы один | `NonZeroUsize`; `share(n)` делит ядра между `n` одновременными сессиями |
-| Список проходов задачи | Хотя бы один проход | Первый проход — отдельный аргумент, остальные — `Vec` |
-| `Sha256Digest` | 32 байта | `[u8; 32]`, значения в реестре — константы |
-| `PartialFile` | Недописанный файл не остаётся на диске, существующий не затирается раньше времени | Данные пишутся в `<имя>.part`; `Drop` удаляет всё созданное, если не вызван `publish()` |
-| `WavWriter` | Файл стема либо записан целиком, либо отсутствует | Владеет `PartialFile`; `finish(self)` — единственный путь к публикации |
-| `StemSet` | Набор стемов, в том числе пустой (состояние формы) | Битовая маска по вариантам `Stem`; `within(layout)` оставляет стемы модели |
-| `MixStems` | Стемы микса не пусты и все есть у модели | Проверяющий конструктор из `StemSet` и `StemLayout` |
-| `CleanupTargets` | Очистка что-то чистит | `enum { Stems, Mix, Both }`; «ничего» выражается отсутствием очистки, `from_ticks` из двух галочек возвращает `Option` |
-| `MixOutput` | Сеть очистки умеет чистить этот микс | Поля приватные; конструктор отвергает очистку микса, где вокальная сеть встретила бы и голос, и инструменты, и запоминает полярность для микса |
-| `OutputKind` | Цели очистки есть только у микса | `Stems { cleanup: Option<EnhancerId> }` чистит стемы, `Mix(MixOutput)` — то, что выбрано |
-| `EnhancerId` | Сеть очистки существует | `enum`; описание выдаёт исчерпывающий `match` |
-| `MdxParams` | Окно сети непусто, бины помещаются в FFT | Проверяется `chunking()` и конструктором STFT; тест проверяет каждую сеть реестра |
-| `NetworkOutput` | Полярность выводится из того, что сеть выдаёт | `for_stem` — всегда ответ; `for_mix` — `None` для смеси голоса и инструментов |
-| `Spill` | Сырой стем не остаётся на диске | Файл удаляется в `Drop` |
+| `ModelId` | The model exists | Enum; exhaustive descriptor match |
+| `Stem` | A valid stem name | Enum; the variant determines its filename |
+| `StemLayout` | Nonempty, fixed-order model stems | `first: Stem`, `rest: &'static [Stem]`; no public constructor; constants `FOUR` and `SIX` |
+| `AudioFormat` | Supported input extension | Enum, also supplies dialog filters |
+| `ModelSpec` | At least one graph | `first: GraphSpec` and `rest: &'static [GraphSpec]` |
+| `GraphSpec` | Known file size, SHA-256, and emitted stems | Registry constants; `hex!` validates digest syntax and length at compile time; `emits` is `All` or `Only(Stem)` |
+| `LocalModel` | All graph files exist and are verified | Created only by `ModelStore::ensure`; nonempty like `ModelSpec` |
+| `Ensured` | Download cancellation is not an error | `Ready(LocalModel)` or `Cancelled` |
+| `CancelToken` | Cancelled work cannot resume | A shared flag can only be set; clones share it |
+| `SampleRate` | Positive sample rate | `NonZeroU32` |
+| `FrameCount`, `ByteCount` | Frames cannot be confused with bytes or samples | Separate wrappers |
+| `StereoFrames` | Exactly two equally long channels | `Vec<[f32; 2]>` |
+| `DecodedAudio` | Stereo at a known nonzero sample rate | `SampleRate` and `StereoFrames`; no hidden invariant, so construction is public |
+| `ModelAudio` | Stereo at exactly 44.1 kHz | No stored rate; only `resample` constructs it, with a core-private constructor |
+| `ChunkPlan` | At least one chunk | Built from `NonZeroUsize`; `first: Chunk`, `rest: Vec<Chunk>` |
+| `Chunk` | Offset, length, and position in the model window agree with track length | Constructed only by the planner |
+| `Segment` | Exactly 343,980 samples per channel | Initially silent with the required length; later operations only write into it |
+| `ChunkStems` | Sample count is stems × 2 × segment length | Validating constructor at model-output parsing |
+| `InputFile` | Absolute existing regular file with supported extension and known directory/base name | Constructor validates and computes derived components once; getters do not return `Option` |
+| `OutputDir` | Absolute existing directory | Validating constructor; `OutputDir::beside(&InputFile)` needs no revalidation |
+| `OutputChoice` | Source folder or an explicit directory | `BesideInput` or `Custom(OutputDir)`; the former follows changes to the input |
+| `OverwritePolicy` | Replacement is explicit | `Refuse` by default, or `Replace` |
+| `SeparationRequest` | All fields are present and validated | Composed from checked types; constructor resolves the output directory |
+| `InputFiles` | At least one file, each at most once | `first` and `rest`; list constructor returns `Option` and removes duplicates, case-insensitively on Windows |
+| `Batch` | Nonempty jobs sharing model/device, with no duplicate output path | Built from `InputFiles` and shared settings; duplicate directory/base-name pairs cause `OutputClash` before work starts |
+| `CpuThreads` | At least one CPU session thread | `NonZeroUsize`; `share(n)` divides cores among concurrent sessions |
+| Job passes | At least one pass | Separate first-pass argument and a vector of remaining passes |
+| `Sha256Digest` | Exactly 32 bytes | `[u8; 32]`; registry values are constants |
+| `PartialFile` | No abandoned partial file or premature replacement | Writes `<name>.part`; `Drop` removes created resources unless `publish()` succeeds |
+| `WavWriter` | A stem file is complete or absent | Owns `PartialFile`; only `finish(self)` publishes |
+| `StemSet` | A stem set, including an empty UI selection | Bitmask over `Stem`; `within(layout)` retains model stems |
+| `MixStems` | Nonempty stems all belonging to the model | Validating constructor from `StemSet` and `StemLayout` |
+| `CleanupTargets` | Cleanup has a target | `Stems`, `Mix`, or `Both`; no cleanup is represented by absence, and `from_ticks` returns `Option` |
+| `MixOutput` | The cleanup network supports the selected mix | Private fields; constructor rejects a vocal-network mix containing both vocals and instruments and retains mix polarity |
+| `OutputKind` | Explicit cleanup targets belong only to mixes | `Stems { cleanup: Option<EnhancerId> }` or `Mix(MixOutput)` |
+| `EnhancerId` | The cleanup network exists | Enum with exhaustive descriptor match |
+| `MdxParams` | Nonempty network window, with bins fitting inside FFT | Checked by `chunking()` and STFT construction; every registered network is tested |
+| `NetworkOutput` | Output meaning determines polarity | `for_stem` always succeeds; `for_mix` is absent for mixed vocals/instruments |
+| `Spill` | No abandoned raw stem | Removes its file in `Drop` |
 
-Граница с инференсом:
+Inference boundary:
 
 ```rust
 pub trait Separator {
@@ -209,9 +204,9 @@ pub trait Separator {
 }
 ```
 
-Реализаций две: `OrtSeparator` и тестовая тождественная. Остальной конвейер знает только трейт. Один `Separator` соответствует одному графу; STFT и iSTFT находятся внутри `OrtSeparator`, потому что это деталь контракта конкретного экспорта.
+Implementations are `OrtSeparator` and an identity fake for tests. The rest of the pipeline depends only on the trait. One `Separator` corresponds to one graph. STFT and iSTFT stay within `OrtSeparator` because they are specific to the export contract.
 
-Граница с интерфейсом:
+UI boundary:
 
 ```rust
 pub enum Progress {
@@ -240,385 +235,418 @@ pub fn run(
 ) -> Result<JobEnd, JobError>;
 ```
 
-`ProgressSink` реализован для любого замыкания `Fn(Progress)`. Хранилище моделей передаётся явно, глобального состояния нет. Порядок работы `run`: занять имена выходных файлов, получить модель, декодировать вход, выполнить проходы, опубликовать файлы. Коллизия имён поэтому обнаруживается до загрузки и вычислений.
+Any `Fn(Progress)` closure implements `ProgressSink`. The model store is passed explicitly, without global state. `run` reserves output names, ensures the model, decodes input, executes passes, and publishes files. Name collisions therefore surface before downloading or inference.
 
-## 8. Алгоритм разделения
+## 8. Separation algorithm
 
-Повторяет `apply_model` из Demucs.
+The pipeline follows Demucs `apply_model`.
 
-1. Декодировать файл целиком. Моно дублируется в оба канала, более двух каналов — ошибка `UnsupportedChannels`. Запись длиннее 3 часов отклоняется: вход хранится в памяти, и примерно столько же вмещает WAV.
-2. Привести к 44.1 кГц, если частота другая. Длительность сохраняется с точностью до кадра, собственная задержка ресемплера убирается.
-3. Нормализовать: по моно-сумме каналов вычислить среднее и стандартное отклонение, вычесть первое и разделить на второе. Для тишины (отклонение около нуля) деление пропускается.
-4. Разбить на чанки по 343 980 кадров с шагом 257 985 (перекрытие 25%). Короткий последний чанк, как в Demucs, ставится в середину окна модели: слева его дополняет настоящий звук трека, справа — тишина.
-5. Для каждого графа модели выполнить проход по всем чанкам. У `htdemucs` и `htdemucs_6s` граф один, у `htdemucs_ft` их четыре, и каждый проход даёт один стем. Сессия в памяти всегда одна.
-6. Для каждого чанка: проверить отмену, вызвать `Separator` (см. ниже), проверить результат на правдоподобие, умножить на треугольное окно с максимумом 1 в середине, прибавить к накопителю стемов и к накопителю весов.
-7. Кадры левее начала следующего чанка окончательны: разделить их на сумму весов, вернуть масштаб (умножить на отклонение, прибавить среднее) и записать в файлы.
-8. После последнего чанка дописать остаток и переименовать `*.wav.part` в `*.wav`.
+1. Decode the whole input. Duplicate mono into both channels; reject more than two channels with `UnsupportedChannels`. Reject recordings longer than three hours because input stays in memory and WAV has a similar practical size limit.
+2. Resample to 44.1 kHz if needed. Preserve duration within one frame and remove the resampler's own delay.
+3. Normalize using the mean and standard deviation of the mono channel average: subtract the mean and divide by the deviation. Skip division for silence with near-zero deviation.
+4. Plan 343,980-frame chunks with a 257,985-frame step, giving 25% overlap. As in Demucs, center a short final chunk inside the model window: actual preceding audio fills the left side, silence the right.
+5. Make one complete-track pass per model graph. `htdemucs` and `htdemucs_6s` have one graph; `htdemucs_ft` has four, each contributing one stem. Only one session is held in memory at a time.
+6. For each chunk, check cancellation, call `Separator`, check plausibility, apply a triangular window peaking at one in the center, and add samples and weights to the accumulators.
+7. Frames before the next chunk's start are final: divide by accumulated weights, restore scale by multiplying by the deviation and adding the mean, then write them.
+8. After the final chunk, write the remainder and rename `*.wav.part` to `*.wav`.
 
-Что делает `OrtSeparator` с одним чанком:
+For each chunk, `OrtSeparator` performs:
 
-1. Прямое STFT каждого канала по правилам Demucs (`_spec`): окно Ханна 4096, шаг 1024, нормировка `1/√4096`; отражающее дополнение на 1536 отсчётов слева и до кратности шагу справа, затем центрирование; из 340 окон спектрограммы остаются 336 средних, частота Найквиста отбрасывается.
-2. Запуск графа с входами `mix` и `mag`.
-3. Обратное STFT выхода `spec` для каждого стема и канала (`_ispec`): четыре отброшенных окна восстанавливаются нулями, огибающая считается по всем 340 окнам.
-4. Сложение с выходом `wav`.
+1. Forward STFT per channel following Demucs `_spec`: Hann window 4096, hop 1024, normalization `1/sqrt(4096)`, reflection padding by 1536 samples on the left and to a hop multiple on the right, then centering. Retain the middle 336 of 340 spectrogram frames and discard the Nyquist bin.
+2. Run the graph with `mix` and `mag`.
+3. Inverse STFT per output stem and channel following `_ispec`: restore four discarded frames as zeros and compute the envelope across all 340 frames.
+4. Add the `wav` time-domain output.
 
-Первые и последние 1536 отсчётов чанка спектральная ветвь восстанавливает с ослаблением. Это свойство самой модели, а не ошибка: при сборке края чанков получают почти нулевой вес треугольного окна.
+The spectral branch attenuates the first and last 1536 samples. This is a model property, not an implementation error: overlap-add gives chunk edges almost zero triangular weight.
 
-Проверка правдоподобия: все значения конечны, а уровень выхода не превышает уровень входа более чем на порядок. Проверка нужна из-за случая, когда DirectML вернул мусор без ошибки (раздел 11). При нарушении на GPU чанк пересчитывается на CPU, и работа продолжается на CPU.
+Plausibility requires all values to be finite and output level to be no more than one order of magnitude above input level. This guards against DirectML silently returning invalid values (section 11). A failing GPU chunk is recomputed on the CPU, which is then used for the rest of the job.
 
-Отличие от эталона одно: случайный сдвиг (`shifts`) не применяется, результат детерминирован.
+The single difference from the reference algorithm is that random shifts are not applied; results are deterministic.
 
-Сверка с Python-версией Demucs не проводилась и исключена из плана решением владельца проекта. Корректность опирается на три проверки: запуск графа с собственным STFT совпадает с эталонным экспортом, где STFT встроен в граф; GPU совпадает с CPU; нарезка и сборка проверены тестами на подставном разделителе.
+Comparison against Python Demucs was not performed and was explicitly excluded by the owner. Correctness rests on matching an export with embedded STFT, comparing GPU with CPU, and fake-separator tests of chunking and reconstruction.
 
-Память: вход хранится целиком (около 106 МБ на 5 минут), выход пишется по мере готовности, поэтому число стемов на потребление памяти почти не влияет.
+Input stays in memory, about 106 MB per five minutes; output is streamed, so stem count has little effect on memory use.
 
-Время полной обработки на целевой машине, трек длиной 106 с (19 чанков), модели уже в кэше:
+Complete 106-second track processing on the target machine, 19 chunks, models cached:
 
-| Модель | GPU (DirectML) | CPU |
+| Model | GPU / DirectML | CPU |
 |---|---|---|
-| `htdemucs` | 12.6 с | 55.4 с |
-| `htdemucs_6s` | 10.7 с | не измерялось |
-| `htdemucs_ft` | 38.9 с | не измерялось |
+| `htdemucs` | 12.6 s | 55.4 s |
+| `htdemucs_6s` | 10.7 s | Not measured |
+| `htdemucs_ft` | 38.9 s | Not measured |
 
-В это время входят декодирование, загрузка графа (около 2 с на граф) и запись файлов.
+Times include decoding, graph loading (about two seconds per graph), and file output.
 
-## 9. Выходные файлы
+## 9. Output files
 
-- Формат: WAV, 32-битный float, 44.1 кГц, стерео. Float выбран потому, что сумма стемов может выходить за диапазон `[-1, 1]`, а клиппинг недопустим.
-- Имена: `<имя входного файла>.<стем>.wav`, например `song.vocals.wav`, прямо в выбранной директории. Микс — `<имя>.mix.wav`.
-- Микс — сумма выбранных стемов. Он копится в памяти по мере готовности кадров и пишется после последнего прохода. Без «Сохранить стемы» файлы стемов не создаются и в подтверждении перезаписи не упоминаются; у `htdemucs_ft` идут только проходы выбранных стемов.
-- Стемы, которые будут очищены, разделение пишет в сырые файлы `<имя>.<стем>.wav.raw` рядом с результатом. Очистка читает их по одному и удаляет, так что на диске одновременно не больше набора сырых стемов. Файл, оставшийся от убитого процесса, следующая задача перезаписывает.
-- Данные пишутся во временный файл `<имя>.wav.part` и переименовываются в `<имя>.wav` только после успешного завершения.
-- Существующие файлы молча не перезаписываются. При `OverwritePolicy::Refuse` имя сразу занимается пустым файлом, созданным в режиме `create_new`. Если файл уже есть, возвращается ошибка `AlreadyExists`, и интерфейс запрашивает подтверждение. Создание атомарно, поэтому из двух одновременных записей в одно имя пройдёт одна.
-- При `OverwritePolicy::Replace` прежний файл остаётся на месте до переименования: неудачная или отменённая обработка его не портит.
-- При ошибке и отмене временный файл и занятое имя удаляются.
-- Размер файла ограничен 4 ГиБ форматом WAV. `WavWriter` проверяет предел сам, потому что `hound` этого не делает.
+- `OutputFormat::{Wav, Mp3}` selects 32-bit float WAV or 320 kbit/s MP3, both at 44.1 kHz stereo. WAV float preserves sums outside `[-1, 1]`. Request paths, overwrite checks, stems and mixes all use the selected extension.
+- Names are `<input-base-name>.<stem>.wav`, such as `song.vocals.wav`, directly in the chosen directory. A mix is `<name>.mix.wav`.
+- The mix sums selected stems in memory as frames become final and is written after the last pass. Without Save stems, no stem files are created or listed in overwrite confirmation. `htdemucs_ft` runs only the selected stem passes in that mode.
+- Stems awaiting cleanup are raw `<name>.<stem>.wav.raw` files beside the results. Each job reads and deletes its own raw stems one by one; up to two jobs can own distinct sets. A subsequent job replaces raw files left by a killed process.
+- Streaming calculations and cleanup use float-WAV staging files. WAV publishes directly; MP3 calls the application-supplied `AudioEncoder` before publication. `WavWriter::finish_as` owns both staging files and publishes the chosen extension only after successful encoding, preserving prior files on failure/cancellation.
+- Existing files are never silently overwritten. `OverwritePolicy::Refuse` reserves a name with an empty `create_new` file. If it exists, `AlreadyExists` triggers confirmation. Reservation is atomic, so concurrent writers cannot both claim the same name.
+- With `OverwritePolicy::Replace`, the old file stays intact until the final rename; failed or cancelled work does not damage it.
+- Failure or cancellation removes partial files and reserved names.
+- WAV limits each file to 4 GiB. `WavWriter` enforces this because `hound` does not.
 
-## 10. Хранилище моделей
+`AudioEncoder`, `EncodeError` and the normal `Encoded::{Ready, Cancelled}` outcome are core boundary types. `job::run_with_encoder` accepts the encoder; the WAV-only `job::run` remains usable without media dependencies. `media::FfmpegEncoder` installs in the shared model cache and implements MP3 encoding with cancellable owned subprocesses. The batch worker prepares it once and shares it across the two concurrent file jobs. `tempfile` is now a normal core dependency for encoded staging, in addition to its existing test use.
 
-- Реестр (`model::registry`) — статические данные в коде: репозиторий и путь файла, размер, SHA-256, а для графа разделения — какие стемы он даёт, для сети очистки — `MdxParams` и `NetworkOutput`. Репозиториев два (`Repository::DemucsOnnx`, `Repository::UvrResources`), адрес каждого указывает на фиксированную ревизию.
-- `ModelStore::ensure_files` качает модель и сеть очистки одной загрузкой с общим прогрессом. `missing_size` отвечает форме, сколько придётся скачать. Контракт входов и выходов графа одинаков для всех файлов и описывается в бэкенде, который его использует.
-- Кэш (`model::store`) — в пользовательской директории кэша, путь даёт крейт `directories`. На Windows это `%LOCALAPPDATA%\stem-split\cache\models`.
-- Имя файла в кэше содержит начало дайджеста, например `htdemucs-abaac48bc8fd55fa.onnx`. Если будущая версия реестра укажет под тем же именем графа другое содержимое, старый файл за новый принят не будет.
-- Загрузка идёт в `*.part` блоками по 64 КиБ. После каждого блока сообщается прогресс и проверяется отмена. Файл переименовывается только после совпадения размера и SHA-256; иначе он удаляется, а ошибка называет ожидаемое и полученное значение.
-- Файл попадает в кэш только проверенным, поэтому позже достаточно совпадения имени и размера. Повторный подсчёт дайджеста при каждом запуске не выполняется.
-- Прогресс считается по всем файлам модели, которые пришлось скачать: у `htdemucs_ft` их четыре. Если всё уже в кэше, сеть не используется и прогресс не сообщается.
-- При отмене уже скачанные файлы остаются в кэше, незавершённый удаляется.
-- `ModelStore::usage` сообщает, сколько места занимает каталог: `Usage::NoDirectory`, если ничего ещё не скачивалось, иначе `Usage::Files(ByteCount)`. `ModelStore::clear` удаляет файлы и возвращает освобождённый объём. Учитываются и удаляются все обычные файлы каталога: модели, файлы моделей, которые новая версия больше не использует, и `*.part`, оставшиеся после аварийного завершения. Подкаталоги и сам каталог не трогаются.
-- Очистка не должна идти одновременно с задачей: модель, найденная на месте, исчезла бы до загрузки. Приложение не даёт запустить задачу, пока идёт удаление.
-- Соединение только по HTTPS, сертификаты проверяет хранилище операционной системы. Так учитываются сертификаты, установленные администратором или антивирусом.
-- Прокси берётся из переменных окружения `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`. Системные настройки прокси Windows не читаются.
+## 10. Model store
 
-## 11. Устройство выполнения
+- `model::registry` contains static repository/path, size, SHA-256, emitted-stem, and cleanup `MdxParams`/`NetworkOutput` descriptions. `Repository::DemucsOnnx` and `Repository::UvrResources` each point to a pinned revision.
+- `ModelStore::ensure_files` downloads the separation model and cleanup network together with combined progress. `missing_size` reports the required download to the form. The backend describes the shared graph input/output contract.
+- `directories` supplies the per-user cache location: `%LOCALAPPDATA%\stem-split\cache\models` on Windows.
+- Cache filenames include a digest prefix, such as `htdemucs-abaac48bc8fd55fa.onnx`. A later registry revision cannot mistake an older file with the same graph name for new content.
+- Download to `*.part` in 64 KiB blocks, report progress, and check cancellation after each block. Rename only after size and SHA-256 match. Otherwise remove the file and report expected and actual values.
+- Since files enter the cache only after verification, subsequent use checks name and size without rehashing every launch.
+- Progress covers all missing files, including all four `htdemucs_ft` graphs. A complete cache needs no network access or download progress.
+- Cancellation keeps completed downloads and removes the current partial file.
+- `usage` returns `Usage::NoDirectory` before the cache exists, or `Usage::Files(ByteCount)`. `clear` deletes regular files and returns bytes freed, including models, retired model files, and crash-leftover `*.part` files. It does not remove subdirectories or the cache directory itself.
+- Cache deletion cannot overlap a job, since a model could disappear before loading. The application disables starts during deletion.
+- Connections use HTTPS and OS certificate validation, honoring certificates installed by administrators or antivirus software.
+- Proxies come from `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`. Windows system proxy settings are not read.
 
-- `DevicePreference { Auto, Gpu, Cpu }` — выбор пользователя, по умолчанию `Auto`.
-- `ActiveDevice { DirectMl, Cpu }` — то, что реально используется; показывается в интерфейсе.
-- В режиме `Auto` сессия создаётся с DirectML на Windows или CoreML на macOS, при неудаче — на CPU. Причина отката пишется в журнал.
-- Список провайдеров формирует единственный модуль `providers.rs`: DirectML под `#[cfg(windows)]`, CoreML под `#[cfg(target_os = "macos")]`. Для остальных систем доступен только CPU.
+## 11. Execution device
 
-На macOS сессия CoreML использует `ComputeUnits::All` (CPU, GPU и Neural Engine) и формат `MLProgram` (Core ML 5, macOS 12+). Провайдер регистрируется с `error_on_failure`: при ошибке создания сессии приложение явно переходит на CPU. Часть операторов CoreML может выполнять на CPU; надпись GPU в интерфейсе означает выбранный провайдер, а не выполнение всего графа исключительно на видеокарте. Замеров скорости и сверки CoreML с CPU в этом документе пока нет.
+- `DevicePreference { Auto, Gpu, Cpu }` is the user's choice, initially `Auto`.
+- `ActiveDevice` reports the actual device to the UI; the original Windows set is `DirectMl` and `Cpu`.
+- Auto tries DirectML on Windows or CoreML on macOS, then falls back to CPU on failure and logs the reason.
+- Only `providers.rs` builds the provider list: DirectML under `#[cfg(windows)]`, CoreML under `#[cfg(target_os = "macos")]`, and CPU elsewhere.
 
-Настройки сессии DirectML, подтверждённые на этапе 0:
+CoreML uses `ComputeUnits::All` (CPU, GPU, and Neural Engine) and `MLProgram` (Core ML 5, macOS 12+). Registration uses `error_on_failure`, so session-creation failures explicitly select the CPU. Some operators may still run on the CPU. A GPU label identifies the provider, not an exclusively GPU graph. This document has no CoreML speed measurements or CPU comparisons yet.
 
-| Настройка | Значение | Зачем |
+Stage 0 verified these DirectML settings:
+
+| Setting | Value | Reason |
 |---|---|---|
-| `ep.dml.disable_graph_fusion` | `1` | Обязательна. Если размерности статические, DirectML сливает граф в один узел и выдаёт значения в 100 000 раз больше верных, не сообщая об ошибке. Без слияния результат совпадает с CPU, потеря скорости — около 10% |
-| Провайдер | `error_on_failure` | Иначе при отказе DirectML сессия молча создаётся на CPU, и интерфейс покажет не то устройство |
-| Выбор адаптера | `PerformancePreference::HighPerformance` | В системе могут быть виртуальные и встроенные адаптеры |
-| Memory pattern, параллельное выполнение | выключены | Требование документации ONNX Runtime для DirectML |
+| `ep.dml.disable_graph_fusion` | `1` | Required: with static dimensions, fusion can silently return values 100,000 times too large. Disabling it matches CPU results at about a 10% speed cost |
+| Provider registration | `error_on_failure` | Otherwise failed DirectML silently becomes a CPU session while the UI reports the wrong device |
+| Adapter selection | `PerformancePreference::HighPerformance` | Systems may contain virtual and integrated adapters |
+| Memory pattern and parallel execution | Disabled | Required by ONNX Runtime's DirectML documentation |
 
-Размерность `batch` у графа динамическая, и фиксировать её не нужно: отключение слияния задаётся явно и не зависит от формы входа.
+The graph's dynamic `batch` dimension need not be fixed; graph fusion is disabled explicitly regardless of input shape.
 
-На CPU одна задача получает все логические ядра: на целевой машине это на 10% быстрее значения по умолчанию. Когда задачи идут по две, ядра делятся пополам (`CpuThreads::share`): по скорости это то же самое (79–81 с на два трека против 97 с подряд), а машина не перегружена.
+A single CPU job receives all logical cores, about 10% faster than default on the target machine. For two concurrent jobs, `CpuThreads::share` splits them in half. Throughput remains similar, 79–81 seconds for two tracks versus 97 seconds sequentially, without oversubscribing the machine.
 
-Сколько задач идёт одновременно, задаёт `batch::PARALLEL_JOBS` = 2. Замеры на целевой машине, `htdemucs_6s`, трек 106 с:
+`batch::PARALLEL_JOBS` is 2. Target-machine measurements for a 106-second `htdemucs_6s` track:
 
-| Одновременно | Видеокарта | Процессор |
+| Concurrent files | GPU | CPU |
 |---|---|---|
-| 1 файл | 10.6 с | 48.6 с |
-| 2 файла | 14.5 с (7.2 с на файл) | 78–81 с (≈40 с на файл) |
-| 3 файла | 20.1 с (6.7 с на файл) | — |
-| 4 файла | 39.7 с: не помещается в 6 ГБ видеопамяти | — |
+| 1 | 10.6 s | 48.6 s |
+| 2 | 14.5 s, or 7.2 s per file | 78–81 s, about 40 s per file |
+| 3 | 20.1 s, or 6.7 s per file | Not measured |
+| 4 | 39.7 s; exceeds 6 GB VRAM | Not measured |
 
-Выигрыш на видеокарте — от того, что пока одна задача ждёт видеокарту, другая читает файл, грузит граф или считает STFT на процессоре. Три задачи почти не быстрее двух, а памяти для больших моделей оставляют меньше.
+The GPU benefits because one job can read files, load graphs, or compute STFT on the CPU while another waits for the GPU. Three files barely improve on two and leave less VRAM for larger models.
 
-Пакет с очисткой идёт по одной задаче (`batch::PARALLEL_JOBS_WITH_CLEANUP`): сессия очистки занимает 2.3–3.6 ГБ. Две копии трека 5:50 с очисткой стемов и микса: с Reverb HQ одновременно — 620 с против 154 с подряд, видеопамять заполнена до 5.9 ГБ; с вокальной сетью — 120 с против 142 с.
+Cleanup batches now use two jobs through `batch::PARALLEL_JOBS_WITH_CLEANUP = PARALLEL_JOBS`, as explicitly requested by the owner. The earlier serial policy was based on historical measurements: cleanup sessions occupy 2.3–3.6 GB. For two 5:50 tracks with both stem and mix cleanup, Reverb HQ took 620 s concurrently versus 154 s sequentially and used 5.9 GB VRAM. The vocal network took 120 s concurrently versus 142 s sequentially.
 
-## 12. Потоки, прогресс и отмена
+## 12. Threads, progress, and cancellation
 
-- Потоки создаются через `std::thread::Builder`, который возвращает `Result`. Ведущий поток пакета запускает задачи как `spawn_scoped` внутри `thread::scope` и ждёт, пока задача не скажет по своему каналу, что место свободно.
-- Модель скачивается ведущим потоком один раз до запуска задач: две задачи, качающие один файл, писали бы в один и тот же `*.part`.
-- Перед этим ведущий поток читает из заголовков длину каждого файла (`audio::stated_length`, без декодирования) и сообщает, сколько прогонов модели ожидается (`job::expected_runs`). Это нужно только для оценки времени.
-- События идут через `std::sync::mpsc`, у каждого — номер файла. Реализация `ProgressSink` в `app` отправляет событие и вызывает `Context::request_repaint`. Последнее сообщение канала — «конец»; канал, закрытый без него, означает панику ведущего потока.
-- Интерфейс читает канал через `try_recv` в начале кадра и никогда не ждёт.
-- Отмена: `CancelToken` на `Arc<AtomicBool>`. Ядро проверяет его между чанками и между блоками загрузки.
-- Если получатель канала уничтожен, рабочий поток считает это отменой.
-- При закрытии окна выставляется отмена, и приложение до 10 секунд ждёт, пока задача уберёт за собой недописанные файлы. Задача реагирует в пределах одного запуска модели; дольше может продержаться только зависшая загрузка, и тогда поток бросается.
-- Паника в потоке задачи (из сторонней библиотеки) перехватывается `catch_unwind` и завершает только этот файл с `Failure::Crashed`; остальные файлы пакета продолжают работу.
-- Отмена останавливает идущие задачи и не запускает ожидающие. Готовые файлы остаются.
-- Хранилище моделей рабочий поток открывает сам. В потоке интерфейса есть своё (`app::downloads`): узнать, скачана ли модель и сколько места занимают скачанные. Это мгновенные проверки метаданных при запуске, после задачи и после удаления, а не на каждом кадре.
-- Удаление скачанных моделей идёт в своём потоке и сообщает итог через канал. Поток, завершившийся без итога, означает панику и показывается как ошибка, как у задачи.
-- Предупреждения ядра и сообщение о панике (из сторонней библиотеки) пишутся в stderr и в файл `%LOCALAPPDATA%\stem-split\data\stem-split.log`, который начинается заново при каждом запуске. У release-сборки консоли нет, и файл — единственное место, где их видно.
-- Если окно не удалось создать, причина показывается системным окном сообщения.
+- Use `std::thread::Builder`, which returns `Result`. A batch leader starts `spawn_scoped` file jobs within `thread::scope` and receives completion messages when a slot becomes free.
+- The leader downloads models once; concurrent downloads of the same graph would overwrite the same `*.part`.
+- First read stated track lengths from headers through `audio::stated_length`, without decoding, and report `job::expected_runs` for time estimates.
+- Events use `std::sync::mpsc` with file indices. The application's `ProgressSink` sends an event and calls `Context::request_repaint`. An explicit final message closes the workflow; channel loss without it means the leader panicked.
+- The UI drains `try_recv` at frame start and never waits.
+- `CancelToken` uses `Arc<AtomicBool>` and is checked between chunks and download blocks.
+- A dropped receiver is treated as cancellation.
+- Closing the window requests cancellation and waits up to ten seconds for partial-file cleanup. Jobs react within one model run. A stalled download may take longer, in which case the worker is left behind.
+- `catch_unwind` converts a dependency panic in a file job to `Failure::Crashed`; the rest of the batch continues.
+- Cancellation stops running jobs and prevents waiting ones from starting; completed files remain.
+- Workers open their own model store. `app::downloads` has a UI-side store for immediate metadata checks at startup, after jobs, and after deletion, rather than every frame.
+- Cache deletion runs on its own thread and reports through a channel. Missing completion is treated as a crash and shown as an error.
+- Core warnings and dependency panic reports go to stderr and `%LOCALAPPDATA%\stem-split\data\stem-split.log`, recreated each launch. Release builds have no console, so the file is their only log output.
+- Failure to create a window is reported through a native message box.
 
-## 13. Интерфейс
+## 13. Interface
 
-Одно окно, состояние — автомат:
+One window uses a screen state machine:
 
 ```rust
 enum Screen {
     Editing(Form),
     Confirming { form: Form, existing: Vec<PathBuf> },
-    Running(Box<Run>), // форма, рабочие потоки, состояние каждого файла, признак отмены
-    Done(Finished),    // форма, итог каждого файла, общее время
-    Failed { form: Form, failure: Failure }, // пакет не смог начаться: модель не скачалась
+    Running(Box<Run>), // Form, workers, file tracking, and cancellation state.
+    Done(Finished),   // Form, per-file results, and total time.
+    Failed { form: Form, failure: Failure },
 }
 ```
 
-Каждый экран владеет ровно теми данными, которые ему нужны: индикатора прогресса не бывает без работающей задачи, а кнопки `Split` — во время работы. Форма переходит из экрана в экран, поэтому после результата, ошибки или отмены выбор пользователя сохраняется.
+Each screen owns only its valid data: no progress bar without work, no Split button during a batch. The form moves between screens, preserving choices after success, failure, or cancellation.
 
-- У каждого экрана свой тип действий (`EditingAction`, `ConfirmingAction` и так далее). Функция отрисовки возвращает действие, а `app.rs` превращает пару «экран и действие» в следующий экран. Невозможных сочетаний вроде «отмена на экране результата» в типах нет.
-- Функции в `view` состояния не хранят и не меняют: получают данные, рисуют, возвращают действие.
-- Кнопка `Split` активна, только когда выбран хотя бы один файл. Если результаты прошлого запуска уже лежат на месте, сначала показывается экран `Confirming` со списком файлов всех задач.
-- Файлы можно передать аргументами командной строки, как при открытии файлов приложением.
-- Выпадающим спискам заданы имена для экранных дикторов; подписи связаны со списками.
+- Each screen has a dedicated action type, such as `EditingAction` or `ConfirmingAction`. `app.rs` maps a screen and action to the next screen, making invalid combinations unrepresentable.
+- View functions receive data, render, and return an action; they do not own application state.
+- Split requires selected local files or a valid URL and destination. Existing results trigger a combined overwrite-confirmation screen.
+- Files may be supplied as command-line arguments.
+- Combo boxes have accessible names associated with their labels.
 
-### Несколько файлов
+### URL audio / local 1.2.0
 
-- В диалоге можно выбрать несколько файлов, в окно — перетащить несколько. Новый выбор заменяет прежний. Повторы отбрасываются; неподходящие файлы пропускаются, и о них говорит сообщение на форме (первые три по имени, остальные числом). Если не подошёл ни один, прежний выбор остаётся.
-- На форме один файл показан с папкой, несколько — числом и списком имён, который прокручивается после четырёх строк.
-- Если два файла дали бы результаты с одинаковыми именами (`song.mp3` и `song.flac` в одной папке или одноимённые файлы из разных папок при общей папке результата), задача не запускается, а форма называет оба файла.
-- На экране работы у каждого файла своя строка: имя, полоса с тем, что происходит (`Waiting`, `Part 7 of 19 · graphics card`, `Done · graphics card`, `Failed`), и время файла рядом с полосой. Пока качается модель, над файлами есть строка загрузки. Под строками — общее время пакета, если файлов больше одного.
-- На экране итога у каждого файла — время и устройство, список готовых стемов или сообщение об ошибке. Заголовок говорит, сколько файлов разделено. Кнопка `Open folder` одна, если все результаты в одной папке, иначе у каждого файла своя.
-- Если отменить пакет до того, как хоть один файл закончился, возвращается форма; иначе показываются итоги, где прерванные и не начатые файлы помечены `Cancelled`.
+Files and URL are separate tabs. Local selections are retained independently of downloaded URL files. URLs must be absolute HTTP(S) addresses without embedded credentials. Downloading requires an existing destination folder, used for both source audio and results; metadata preview does not require a folder. Model, device, mix, and cleanup settings are shared.
 
-### Время на экране работы
+A clear button beside the URL empties it and restores text focus; its tooltip and accessible name are localized. Source and destination cells share dimensions across tabs, with a common minimum label-column width, so common settings do not jump. `form::StartBlock` is the source of actionable disabled-state explanations: missing files, empty or invalid URL, missing folder, no mix stems, or cache deletion. Shared explanations are not duplicated.
 
-У каждого файла рядом с полосой — прошедшее время и оценка оставшегося, например `0:08 · ~0:12 left`; под всеми файлами — время пакета: `All files: elapsed 0:13 · about 0:07 left`.
+`media::download` runs in a worker with its own single-thread Tokio runtime. `yt_dlp::client::deps::LibraryInstaller` installs platform yt-dlp and FFmpeg executables if absent. Completed executables are published directly in `ModelStore::directory()`. Temporary installation files have RAII owners in that cache. Existing `usage` and `clear` count and remove the tools as ordinary files alongside models, without recursively deleting unrelated directories.
 
-- Время файла считается от его запуска, время пакета — от нажатия `Split`, вместе с загрузкой модели.
-- Оставшееся относится к текущей стадии, как и сам индикатор: к загрузке модели или к разделению. На стадиях без измеримого прогресса (чтение файла, загрузка графа, запись) его нет.
-- Оценка — это остаток стадии при средней скорости с её первого отчёта. Время до первого отчёта в скорость не входит: там соединение с сервером или загрузка графа и прогрев устройства, которые исказили бы оценку. Поэтому она появляется со второго отчёта.
-- Между отчётами оценка убывает вместе с часами и не уходит ниже нуля. Показывается с округлением вверх и не меньше секунды.
-- У `htdemucs_ft` между проходами загружается следующий граф; оценка при этом не сбрасывается, а время загрузки входит в среднюю скорость.
-- На экране результата у каждого файла показано его время с округлением до секунды: `Finished in 0:13 on the graphics card.`, а у пакета — общее: `All files took 0:21.`
-- Оценка пакета — расписание по двум «дорожкам». Идущий файл занимает свою дорожку на столько, сколько ему осталось по его собственной оценке. Ожидающий файл стоит «разгон» плюс его прогоны после первого: разгон — среднее время от запуска файла до его первого прогона (чтение, загрузка графа, прогрев), прогон — среднее время прогона по уже измеренным файлам. Число прогонов ожидающего файла известно из длины в заголовке; если её нет — берётся среднее. Файлы ставятся по порядку на ту дорожку, что освободится первой, как это делает рабочий поток; оценка — когда освободится последняя.
-- Так фиксированная цена каждого файла не размазывается по прогонам, а один длинный файл не делится на две дорожки, которыми он не может воспользоваться. Проверено на четырёх файлах (два по 106 с и два коротких): оценка на 7, 10 и 14-й секунде — 14, 11 и 7 с при фактических 13, 10 и 6.
-- Вся арифметика — в `app::timing`. Текущее время туда передаётся параметром, поэтому она проверяется тестами без ожидания. Окно перерисовывается каждые 200 мс, пока задача работает, чтобы часы шли и без новостей от неё.
+`media::process` owns cancellable/reaped child processes and reads streaming progress. User yt-dlp configuration is ignored and its separate disk cache disabled. Metadata uses `--skip-download --flat-playlist --yes-playlist --dump-single-json`. `MediaInfo` is a single item or an ordered nonempty playlist with validated HTTP(S) URLs. Selection creates an exact nonempty snapshot; the download worker never re-expands the parent playlist.
 
+The best source audio is downloaded with `bestaudio/best`. `SaveFormat::{Original, Wav, Mp3}` either preserves codec/container bytes or encodes a float WAV / 320 kbit/s MP3 in private staging before publication with a safe title, unique suffix and chosen extension. A live or unavailable entry fails independently; `DownloadEvent::{Progress, Finished}` includes the selected item's index. The loop reports failures and continues with later items. Shared setup failures are attached to each affected item rather than replacing the entire playlist with one error screen.
+
+`DownloadedAudio` owns the native source path and a core `InputFile`. MP3/FLAC/WAV/M4A inputs are used directly when supported. Other containers/codecs, including WebM/Opus, get private float-WAV decoding copies for inference, without altering the native download. FFmpeg is installed when source transcoding, private decoding or MP3 stem/mix output is needed. Saving MP3 never feeds the re-encoded lossy file back into inference: its private WAV comes from the original stream. These copies share one RAII directory in the model cache; references survive the ordinary split/mix batch and input reuse. The final owner schedules directory cleanup off the UI thread. The existing `log` dependency records cleanup failures. Incomplete native downloads remain inside destination-local RAII directories and disappear on error/cancellation.
+
+`SourceProgress(index, progress)` and `SourceFinished(index, result)` update independent tracker rows, including queued entries. A row shows its own stage, bytes/percentage, elapsed time and error detail. `SourceReady` transfers successfully prepared audio owners into the form, even when some items failed. Download-only results contain all per-file outcomes; split/mix runs only successful inputs and appends download failures to its final results. Original native paths label separation rows while core jobs decode the prepared input paths. Source files remain in the selected destination. Cancellation prevents later downloads and subsequent separation from starting.
+
+Added dependencies: `yt-dlp` 2.10 for binary installation; `tokio` for its async API and subprocess I/O/cancellation; `url` for HTTP(S) validation; `serde` and `serde_json` for minimal metadata; `tempfile` for RAII intermediates; and `thiserror` for typed errors. `yt-dlp` disables defaults and enables `rustls` and `cache-memory`; published 2.10.0 otherwise fails to compile because a `utils` import is conditional. No persistent library cache is created. The dependency is GPL-3.0-only, distinct from the project's own MIT sources.
+
+`app::preview` owns the metadata state machine: Empty, Pending, Loading, Ready, Failed. Edits restart a 500 ms monotonic debounce and cancel the previous request. A worker installs only yt-dlp if necessary and calls `media::inspect`; no media or FFmpeg is downloaded. At most one preview worker runs at a time; cancelled workers are reaped before another starts. Results are accepted only while the matching URL is loading, so stale responses cannot replace new input. Work is paused off the URL tab and during cache deletion. Shutdown cancels the worker and waits with the normal bounded patience.
+
+Metadata has a 24-point reserved area below the URL, measured before requests begin. A title is truncated with a full tooltip; successfully inspected playlists show their total count and a right-aligned Playlist toggle in the same row. Loading/error/title/button states retain the same height, including long titles and large playlists. Shared source-cell sizing preserves expanded-tab alignment. Cache deletion is disabled while metadata work owns a tool; cache usage is measured by that worker and passed back without UI-thread I/O. Download/start cancels preview work; independent staging makes concurrent tool publication safe. The folder cell remains 60 points high. A source-format combo is directly beside its URL destination Browse button. The result-format combo is on the right of the lower action buttons; both labels/tooltips are localized. Missing or unknown stored format keys fall back to Original/WAV.
+
+### Playlist selection panel / local 1.2.0
+
+`playlist::Choices` keeps excluded entry positions in a set and an explicit Open/Closed panel state. Choices exist only for successfully inspected playlists, default to all entries included, and are transient. A URL change clears the panel, selections, and downloaded-input reuse. Changing a checkbox also invalidates the reused downloaded set. Switching to Files hides the panel without losing the current URL choices.
+
+The right-hand panel is 300 points wide, with a 12-point gap and independent vertical scrolling clipped to the current viewport. Only the main form contributes to the native minimum height; opening/closing the panel changes required width while retaining current window height. The source region shows title, total count and the only panel toggle on one line. The sidebar has no duplicate close button. Long checkbox labels truncate with full tooltips. All/None checkboxes above the list select or clear the entire playlist and reflect individual choices; changing either invalidates the predownloaded selection. Both the URL preview and sidebar show the original playlist track count beside its title, with localized number agreement. A separate selected/total counter updates with every checkbox change. The count stays visible while long titles truncate.
+
+Starts wait for successful metadata, a destination, and at least one included entry. A fixed single-line explanation area under the split buttons shows disabled reasons without changing height when selection becomes empty. For an original playlist longer than five entries, starting Download, Split, or Split and mix opens a closed selection panel and returns to editing. A subsequent start while it is visible proceeds. Playlists with five or fewer entries start without interception. The media worker receives the exact nonempty selected `MediaInfo` snapshot from `MediaInfo::selected`, preserving source order. It never re-expands the original playlist, so unchecked entries cannot be downloaded due to a refreshed list. Full per-entry live checks and best-audio selection remain unchanged.
+
+### Preloading and window size / local 1.2.0
+
+Download saves audio independently. `UrlAction::{Download, Separate(Mode)}` tells the worker what follows `SourceReady`: preloading ends with `Outcome::Downloaded` and no model or inference; separation starts the normal batch. The native `DownloadedAudio` owners and their prepared `InputFiles` remain in the current form and are reused while the URL and folder are unchanged and every native and prepared file still exists. Changing URL or destination discards this selection but leaves audio on disk.
+
+The form no longer scrolls inside a fixed-height area reserving a large footer. It is measured at its natural height and a shared content width of 624 points. `EditingView` returns both the action and required size. The application sets the native minimum with panel margins, fits the window on opening, and subsequently grows it as needed. The limit accounts for monitor size, window decorations, and system-panel allowance. A whole-form fallback scroll remains for displays too small to fit the minimum; the input-file list scrolls independently. Resize commands are issued after a completed egui layout pass.
+
+Split and Split and mix are 34 points tall, use the theme's accent color, and have bold labels. Moving language selection out of the old bottom-aligned layout removed the large empty footer. Disabled-state explanations remain visible.
+
+### Compact preloading / local 1.2.0
+
+Download is in the URL row immediately after Clear URL. It uses the same `StartBlock` logic and disabled tooltip. Below source and destination is the Separation and mix disclosure header. `SeparationPanel::{Collapsed, Expanded}` controls the whole lower area: model, stems, cleanup, device, start buttons, and their explanations. Language selection remains available on the right of that header. State changes have no height animation; the window is refitted and shrinks when the section collapses.
+
+`separation_panel` saves `collapsed` or `expanded`. Unknown or missing values show the section. Collapsing does not change separation settings or independent downloading. The URL input takes the remaining row width after its buttons. Download-disabled explanations are available on the button tooltip even when separation controls are hidden; start-button explanations remain below the separation controls.
+
+Compact URL mode ignores the hidden local-file selection when measuring height. Switching to that tab also refits the window. Expanded mode retains alignment between tabs.
+
+### Multiple local files
+
+- The dialog and drag-and-drop accept several files. A new selection replaces the old; duplicates are removed. Unsupported files are skipped and reported, with only the first three named individually. If none are accepted, the previous selection stays.
+- One file is shown with its folder; multiple files show a count and a list scrolling after roughly four lines.
+- Files that would produce identical output names are rejected before starting, including `song.mp3` and `song.flac` in one folder or equal base names from different folders with a shared destination.
+- Every running file has its name, progress/status bar, and time. A model-download row precedes the files; a total clock appears for multi-file batches.
+- Results show each file's time, device, and output list or failure. The heading counts successful files. A shared destination gets one Open folder button; otherwise each file has one.
+- Cancellation before any result returns to the form. Otherwise results include cancelled or never-started files.
+
+### Time reporting
+
+A file can show `0:08 · ~0:12 left`; a batch can show `All files: elapsed 0:13 · about 0:07 left`.
+
+- File time starts with that file; batch time starts with Split, including model downloads.
+- Remaining time applies to the measurable current stage, downloading, separation, or cleanup. Reading files, loading graphs, and final output have no estimate.
+- Estimate stage completion from the average pace after its first progress report, excluding initial connection, graph loading, and warmup. It appears at the second report.
+- Between reports, estimates count down and never go negative. Display rounds up and never shows less than one second.
+- Loading another `htdemucs_ft` graph does not reset separation pace; loading time contributes to the average.
+- Results round per-file duration to the nearest second, for example `Finished in 0:13 on the graphics card.` Multi-file totals are shown separately.
+- Batch estimates simulate two scheduling lanes. Running files occupy their lanes for their measured remaining time. Waiting files cost average startup plus subsequent runs at measured pace. Startup is the average from file start to its first run. Header lengths determine expected runs; missing lengths use the observed average. Files are scheduled in order into the first free lane, and the latest lane completion is the batch estimate.
+- This keeps fixed file startup separate from model work and does not split one long file across two lanes. On four files, two 106-second tracks and two short ones, estimates at 7, 10, and 14 seconds were 14, 11, and 7 seconds, compared with actual 13, 10, and 6.
+- Arithmetic is isolated in `app::timing`, with time passed in for tests rather than sleeping. Running screens repaint every 200 ms so clocks advance without worker events.
+
+Original form sketch:
+
+```text
++ stem-split ----------------------------------------+
+| File:   [ D:\music\song.flac              ] [Browse] |
+| Output: (*) next to the file                       |
+|         ( ) [ D:\stems                   ] [Browse] |
+| Model:  [ htdemucs - 4 stems, fast              v ] |
+| [ Split ]                                         |
+| [############.........] 12 / 31 - GPU (DirectML)    |
++---------------------------------------------------+
 ```
-┌ stem-split ────────────────────────────────────────┐
-│ File:    [ D:\music\song.flac           ] [Browse] │
-│ Output:  (•) next to the file                      │
-│          ( ) [ D:\stems                 ] [Browse] │
-│ Model:   [ htdemucs — 4 stems, fast           ▾]   │
-│                                                    │
-│ [ Split ]                                          │
-│ ▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░  12 / 31 · GPU (DirectML)     │
-└────────────────────────────────────────────────────┘
-```
 
-Диалоги выбора файла и директории — нативные, через `rfd`. Они модальны: пока диалог открыт, окно не реагирует. Открыть их можно только с главной формы, во время работы задачи они недоступны.
+`rfd` provides native file and directory dialogs. They are modal, available only from the main form, and block interaction while open. `view::text` matches every `JobError` and nested error to a readable explanation plus selectable technical detail in small text.
 
-Сообщения об ошибках строит `view::text` исчерпывающим `match` по всем вариантам `JobError` и вложенных ошибок: понятная фраза для пользователя и техническое описание мелким шрифтом, которое можно выделить и скопировать.
+### Localization
 
-### Локализация
-
-Интерфейс есть на английском и русском. Сторонний i18n-крейт не используется, язык заложен в типы:
+No third-party i18n crate is used; locale completeness is enforced by types:
 
 ```rust
 closed_enum! {
     pub(crate) enum Locale { En, Ru }
 }
-
 closed_enum! {
     /// A user-visible string without parameters.
     pub(crate) enum Text { File, Browse, Split, Cancel, /* ... */ }
 }
-
 impl Text {
     pub(crate) const fn get(self, locale: Locale) -> &'static str;
 }
-
 /// Parameterized messages are functions.
 pub(crate) fn progress_status(locale: Locale, progress: Progress) -> String;
 pub(crate) fn failure(locale: Locale, failure: &Failure) -> Message;
 ```
 
-- Все видимые пользователю строки живут в `view::text`. В коде отрисовки строковых литералов нет.
-- Каждый язык — отдельный модуль (`text::en`, `text::ru`) с одним и тем же набором функций. Функции в `text` выбирают модуль исчерпывающим `match` по `Locale`, а модуль выбирает строку исчерпывающим `match` по тому, что описывается. Добавление языка, строки или варианта ошибки в ядре не компилируется, пока не переведено всё.
-- Общее для языков (формат времени, мегабайты, имя файла из пути) вычисляется один раз в `text`, в модули языков приходят готовые значения.
-- У русского своя функция согласования числительных: `4 стема`, `6 стемов`.
-- Ядро текстов для пользователя не содержит: оно возвращает типизированные `Progress` и `JobError`. Техническое описание ошибки берётся из самой ошибки и не переводится.
-- Язык выбирается в меню, которое открывает неяркий значок глобуса в правом нижнем углу главной формы. Язык меняют один раз, поэтому строки в форме он не занимает; значок вместо подписи найдёт и тот, кто не читает текущий интерфейс. По той же причине каждый язык назван в меню на самом себе (`English`, `Русский`). Для экранного диктора кнопка названа словом (`Text::Language`), оно же — всплывающая подсказка.
-- При первом запуске язык берётся из языка интерфейса системы (крейт `sys-locale`), дальше — из сохранённых настроек.
-- Встроенные шрифты egui покрывают латиницу и кириллицу. Для других письменностей понадобится подключить шрифт.
+- Every user-facing string belongs in `view::text`, not in rendering literals.
+- `text::en` and `text::ru` expose the same functions. The parent exhaustively selects a module by `Locale`; each module exhaustively selects text by the described value. A new language, string, or core error cannot compile until handled everywhere.
+- Shared formatting of time, megabytes, and filenames is computed once in the parent module.
+- Russian has its own noun/number agreement function; its translations remain intact.
+- Core returns typed `Progress` and `JobError`, not UI text. Technical error descriptions are not translated.
+- A subdued globe opens language selection. Every language labels itself in its own language, so it can be found from an unfamiliar interface. `Text::Language` supplies an accessible name and tooltip. The original form placed this in the bottom-right corner; the compact form places it beside the disclosure header.
+- First launch follows the OS interface language through `sys-locale`; subsequent launches use the saved choice.
+- Bundled egui fonts support Latin and Cyrillic; other scripts need additional fonts.
 
-### Перетаскивание файлов
+### Drag and drop
 
-Файлы можно перетащить в окно. Пока их держат над окном, оно затемняется и показывает подсказку.
+Hovering files darkens the window and shows a hint. Dropping on editing, confirmation, result, or error screens selects new inputs and returns to editing. A running batch ignores drops. Dropped files use the same validation as dialog selections.
 
-- На форме, экране подтверждения, результата и ошибки брошенные файлы становятся входными, и показывается форма. Во время работы пакета они игнорируются: входы нельзя менять на ходу.
-- Брошенные файлы проходят ту же проверку, что и выбранные в диалоге.
+### Mix and cleanup controls
 
-### Микс и очистка
+- Stems: one checkbox per current model stem, All (toggling it again clears all), None, and Save stems. Selection is retained across all six stem types, so guitar reappears when returning to `htdemucs_6s`; `StemSet::within` selects the current model's subset.
+- Cleanup: Clean up artifacts, separate Stems and The mix checkboxes, and a network selector. The mix is unavailable for an unsupported combination; its stored tick remains but has no effect. A tooltip explains how to change the selection.
+- Split and Split and mix share overwrite confirmation through `form::Mode`. The latter requires at least one selected model stem.
+- Split cleans stems only when cleanup and Stems are enabled; The mix does not affect it.
+- The form combines model and cleanup downloads through `ModelStore::missing_size`.
+- Stable keys save `mix_stems` as comma-separated tags, `keep_stems`, `cleanup`, `cleanup_stems`, and `cleanup_mix` as `on`/`off`, and `enhancer` by network name. Any unknown stem invalidates the saved stem list as a whole.
 
-Под списком моделей — два ряда.
+### Downloaded models and tools
 
-- **Стемы.** Чекбокс на каждый стем текущей модели, под ними «Все» (повторное нажатие снимает всё), «Ни одного» и «Сохранить стемы». Выбор хранится по всем шести стемам, поэтому гитара, отмеченная для `htdemucs_6s`, вернётся при возврате к этой модели. Для работы берутся только стемы текущей модели (`StemSet::within`).
-- **Очистка.** Чекбокс «Убрать артефакты». Под ним чекбоксы «Стемы» и «Микс» и выпадающий список сетей. «Микс» недоступен, если выбранная сеть не может очистить микс из отмеченных стемов; отметка при этом сохраняется, но не действует. Подсказка объясняет, что сделать.
-- Кнопки внизу: «Разделить» и «Разделить и свести». Вторая неактивна, пока не отмечен ни один стем модели. Какая кнопка нажата, хранится в `form::Mode` и переходит через экран подтверждения перезаписи.
-- «Разделить» чистит стемы, если отмечены «Убрать артефакты» и «Стемы»; отметка «Микс» для него ничего не значит.
-- Форма предупреждает о загрузке модели и сети очистки одной суммой (`ModelStore::missing_size`).
-- Запоминаются отмеченные стемы (ключ `mix_stems`, теги через запятую), `keep_stems`, `cleanup`, `cleanup_stems`, `cleanup_mix` (`on`/`off`) и `enhancer` (имя сети). Список с неизвестным именем стема отбрасывается целиком.
+Two small icon-font buttons beside the model selector open the cache folder or delete downloaded files after a popover confirmation with the size to free. Clicking outside the confirmation deletes nothing. Before the directory exists, Open is disabled but its tooltip still shows the path. Delete is disabled when nothing is cached.
 
-### Скачанные модели
+Starts are disabled during background deletion. Afterwards, model availability is checked again and the download notice returns. Folder-open, locked-file, and similar failures appear beneath the model selector. `Text::OpenDownloads` and `Text::ClearDownloads` name the icons for accessibility and tooltips.
 
-Справа от списка моделей — две маленькие кнопки со значками из встроенного шрифта egui.
+### Persistent settings
 
-- 🗁 открывает папку моделей в проводнике. Пока ничего не скачивалось, папки нет и кнопка неактивна; путь всё равно виден в подсказке.
-- 🗑 удаляет все скачанные модели. Сначала во всплывающем окне спрашивается подтверждение и называется объём, который освободится; щелчок мимо окна ничего не удаляет. Если удалять нечего, кнопка неактивна.
-- Пока идёт удаление, кнопка `Split` неактивна. После него заново проверяется, скачана ли выбранная модель, и форма снова предупреждает о загрузке.
-- Ошибка (папка не открылась, файл занят другой программой) показывается под списком моделей.
-- Значки названы для экранных дикторов словами (`Text::OpenDownloads`, `Text::ClearDownloads`), они же — во всплывающих подсказках.
+Save language, model, device, save format (`save_format`), output format (`result_format`), active tab (`source_tab`), local-file destination (`output_folder`), URL destination (`url_output_folder`), stems, cleanup, and disclosure state (`separation_panel`). Do not save selected files or URL text. For legacy settings without `source_tab`, the earlier shared folder initializes the URL destination; after saving, destinations are independent. Deleted directories are discarded.
 
-### Настройки между запусками
+- eframe's `persistence` feature stores settings in `%APPDATA%\stem-split\data\app.ron`, including window geometry; content fitting sets the minimum on opening.
+- Values use stable keys such as `htdemucs_ft`, `cpu`, and `ru`, not interface labels.
+- Validate every loaded value. A missing, unknown, or stale value falls back independently without discarding the rest.
 
-Запоминаются язык, модель, устройство и выбранная папка для результатов. Входной файл не запоминается.
+## 14. Errors
 
-- Хранение — механизм `eframe` (фича `persistence`): файл `%APPDATA%\stem-split\data\app.ron`. Он же сохраняет положение и размер окна.
-- Значения пишутся строками со стабильными ключами (`htdemucs_ft`, `cpu`, `ru`), а не подписями из интерфейса.
-- При чтении каждое значение проверяется как любой внешний ввод. Отсутствующее, неизвестное этой версии или уже неверное (папку удалили) заменяется значением по умолчанию само по себе, остальные сохраняются.
+`DecodeError`, `ResampleError`, `ModelStoreError`, `InferenceError`, and `WriteError` are wrapped by `JobError`. Cancellation is a separate outcome.
 
-## 14. Ошибки
+`CacheError` covers measuring and deleting cached downloads and is separate from `JobError`: a job never clears the cache. `MixStemsError` (empty selection or a stem outside the model layout) and `MixCleanupError` (unsupported mix content) arise while constructing a request. The form prevents these requests by disabling invalid actions and ignoring inapplicable selections.
 
-Иерархия повторяет слои: `DecodeError`, `ResampleError`, `ModelStoreError`, `InferenceError`, `WriteError` объединяются в `JobError`. Каждый вариант несёт контекст. Тип ошибки объявляется рядом с кодом, который её порождает, и появляется вместе со своим модулем.
+Domain errors `InputFileError`, `OutputDirError`, `OutputClash`, `ChannelLengthMismatch`, and `DigestParseError` occur while validating input, before a job starts. They are separate from `JobError`. The app maps every `JobError` variant to user-facing text with an exhaustive match.
 
-`CacheError` (измерение и удаление скачанных моделей) в `JobError` не входит: задача кэш не очищает.
+## 15. Dependencies
 
-`MixStemsError` (пустой выбор или стем не той модели) и `MixCleanupError` (сеть не чистит такой микс) возникают при сборке запроса. Форма до них не доводит: кнопка неактивна, а неприменимая отметка не действует.
-
-Ошибки доменного слоя уже есть: `InputFileError`, `OutputDirError`, `OutputClash`, `ChannelLengthMismatch`, `DigestParseError`. Они возникают при разборе пользовательского ввода, до запуска задачи, и в `JobError` не входят. Слой `app` сопоставляет варианты `JobError` с сообщениями для пользователя исчерпывающим `match`.
-
-## 15. Зависимости
-
-| Крейт | Версия | Назначение | Где |
+| Crate | Version | Purpose | Layer |
 |---|---|---|---|
-| `eframe` | 0.36 | Окно и интерфейс; `egui` берётся как `eframe::egui`. Фичи: `glow`, `default_fonts`, `accesskit`, `persistence`, `wayland`, `x11` | app |
-| `sys-locale` | 0.3 | Язык системы для первого запуска | app |
-| `winresource` | 0.1 | Значок и сведения о версии в exe; только при сборке | app |
-| `rfd` | 0.17 | Нативные диалоги | app |
-| `open` | 5 | Открытие папки с результатом в файловом менеджере | app |
-| `ort` | `=2.0.0-rc.13` | ONNX Runtime 1.28, фичи `std`, `download-binaries`, `copy-dylibs`, `tls-rustls`, `api-27`, на Windows — `directml`, на macOS — `coreml` | core |
-| `ort-sys` | `=2.0.0-rc.13` | Из кода не используется. Прямая зависимость нужна, чтобы его сборочный скрипт выполнялся раньше скрипта ядра | core, только Windows |
-| `realfft` | 3.5 | Прямое и обратное STFT | core |
-| `symphonia` | 0.6 | Декодирование. Включены только нужные форматы: `mp3`, `flac`, `wav` и `pcm`, `ogg` и `vorbis`, `isomp4` с `aac` и `alac`, метаданные | core |
-| `rubato` | 5 | Ресемплинг синхронным FFT-ресемплером `Fft`, блок 4096 кадров | core |
-| `hound` | 3.5 | Запись WAV | core |
-| `ureq` | 3 | Блокирующая загрузка по HTTPS. Фичи `rustls` и `platform-verifier`; сжатие не включено | core |
-| `sha2` | 0.11 | Проверка целостности модели | core |
-| `hex-literal` | 1 | Дайджесты в реестре как константы, проверенные при компиляции | core |
-| `directories` | 6 | Путь к кэшу моделей и к файлу журнала | core, app |
-| `thiserror` | 2 | Типы ошибок | core, app |
-| `tempfile` | 3 | Временные файлы и директории в тестах | core, только для тестов |
-| `log` | 0.4 | Журналирование. Ядро сообщает о пропущенных повреждённых пакетах и о переходе с GPU на CPU; приложение выводит предупреждения в stderr | core, app |
+| `eframe` | 0.36 | Window and UI; `eframe::egui`; features `glow`, `default_fonts`, `accesskit`, `persistence`, `wayland`, `x11` | app |
+| `sys-locale` | 0.3 | System language on first launch | app |
+| `winresource` | 0.1 | Executable icon and version metadata; build only | app |
+| `rfd` | 0.17 | Native dialogs | app |
+| `open` | 5 | Open the output directory | app |
+| `ort` | `=2.0.0-rc.13` | ONNX Runtime 1.28; `std`, `download-binaries`, `copy-dylibs`, `tls-rustls`, `api-27`; Windows `directml`, macOS `coreml` | core |
+| `ort-sys` | `=2.0.0-rc.13` | Direct Windows dependency to run its build script before the core build script; unused in source | core, Windows |
+| `realfft` | 3.5 | Forward and inverse STFT | core |
+| `symphonia` | 0.6 | Decode MP3, FLAC, WAV/PCM, OGG/Vorbis, ISOMP4/AAC/ALAC and metadata | core |
+| `rubato` | 5 | Synchronous FFT `Fft` resampling, 4096-frame blocks | core |
+| `hound` | 3.5 | WAV output | core |
+| `ureq` | 3 | Blocking HTTPS; `rustls` and `platform-verifier`, no compression | core |
+| `sha2` | 0.11 | Model integrity verification | core |
+| `hex-literal` | 1 | Compile-time checked registry digests | core |
+| `directories` | 6 | Model cache and log paths | core, app |
+| `thiserror` | 2 | Typed errors | core, app |
+| `tempfile` | 3 | Encoded output staging and temporary test files/directories | core |
+| `log` | 0.4 | Skipped corrupt packets, GPU fallback, app warnings to stderr | core, app |
 
-`ort` до сих пор выходит как release candidate, поэтому версия фиксируется точно. Фичи `ndarray` и `tracing` отключены: тензоры создаются из срезов, а сообщения ONNX Runtime идут в stderr.
+Media-crate dependencies and executable installation are described in section 13. `ort` remains a release candidate and is pinned exactly. Its `ndarray` and `tracing` features are disabled: tensors use slices and ONNX Runtime messages go to stderr.
 
-Состав поставки (архив собирает `tools/package.ps1`, около 21 МБ):
+### Windows distribution
 
-| Файл | Зачем |
+`tools/package.ps1` produces an approximately 21 MB archive:
+
+| File | Purpose |
 |---|---|
-| `stem-split.exe` (35 МБ) | Приложение; ONNX Runtime слинкован в него статически |
-| `DirectML.dll` (18 МБ) | Ускорение на видеокарте, версия 1.15 |
-| `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`, `msvcp140_1.dll` | Среда выполнения Visual C++. ONNX Runtime собран с динамической, а на чистой Windows её может не быть. Собрать приложение со статической нельзя: готовая библиотека ONNX Runtime с ней несовместима |
-| `README.txt` | Краткая инструкция на английском и русском |
+| `stem-split.exe` (35 MB) | Application with statically linked ONNX Runtime |
+| `DirectML.dll` (18 MB) | GPU acceleration, version 1.15 |
+| `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`, `msvcp140_1.dll` | Dynamic Visual C++ runtime required by the prebuilt ONNX Runtime; it may be absent on a clean machine |
+| `README.txt` | English installation and usage instructions |
 
-Библиотеки Visual C++ скрипт берёт из каталога распространяемых файлов самой новой установленной Visual Studio или Build Tools: среда выполнения должна быть не старше компилятора. Release-сборка — оконная программа без консоли; значок и сведения о версии встроены в exe.
+The script uses redistributables from the newest installed Visual Studio or Build Tools: the runtime must be at least as recent as the compiler. A static application runtime is incompatible with the prebuilt ONNX Runtime. Release builds have no console and embed the icon/version.
 
-Системный `DirectML.dll` из Windows 10 имеет версию 1.0 и не подходит: с ним провайдер не запускается, и в режиме `Auto` работа молча идёт на CPU.
+Windows 10's system `DirectML.dll` is version 1.0 and cannot initialize the provider; Auto would silently use CPU. `copy-dylibs` places the current library beside the application under `target/<profile>/`. Without symlink privileges it stops there; the core build script copies the library into `deps/` and `examples/` for tests and examples.
 
-В каталог сборки `target/<профиль>/`, рядом с приложением, библиотеку кладёт фича `copy-dylibs`. Без прав на создание символических ссылок она на этом останавливается, а тесты и примеры лежат в подкаталогах `deps/` и `examples/`. Туда библиотеку копирует сборочный скрипт ядра.
+### macOS distribution
 
-### Поставка macOS
+On Apple Silicon, `bash tools/package-macos.sh` builds `dist/stem-split-<version>-macos-arm64.dmg` and its SHA-256 checksum using `--locked`, explicit `aarch64-apple-darwin`, and macOS 12 minimum. The image contains the app, an Applications link, license, and English README.
 
-`bash tools/package-macos.sh` на Apple Silicon создаёт `dist/stem-split-<версия>-macos-arm64.dmg` и SHA-256. Сборка использует `--locked`, явную цель `aarch64-apple-darwin` и минимальную macOS 12. В DMG — `.app`, ссылка Applications, лицензия и английская/русская инструкция `README.txt`.
+The app contains one executable plus Info.plist/icon resources. ONNX Runtime is static. Packaging rejects any `otool -L` dependency outside `/System/Library/` and `/usr/lib/`. Models are downloaded to `~/Library/Caches/stem-split/models`; settings/logs live in `~/Library/Application Support/stem-split/`.
 
-В `.app` один исполняемый файл и ресурсы (Info.plist, значок). ONNX Runtime связан статически; `otool -L` должен показывать только `/System/Library/` и `/usr/lib/`, иначе упаковка останавливается. Модели не включаются, кэш — `~/Library/Caches/stem-split/models`, настройки и журнал — `~/Library/Application Support/stem-split/`.
+The verified ad-hoc signature does not provide Developer ID or notarization. Gatekeeper may block downloads; instructions allow this particular application in Security settings, with removing quarantine from the installed app as a fallback. They do not require disabling Gatekeeper globally. Intel/universal builds and clean macOS 12 testing remain outstanding.
 
-Подпись ad-hoc проверяется через `codesign`, но не заменяет Developer ID и нотариализацию: скачанное приложение может блокироваться Gatekeeper. Инструкция рекомендует разрешить конкретное приложение через настройки безопасности; запасной вариант — снять quarantine только с установленного `.app`. Глобальное отключение Gatekeeper не требуется. Intel/universal-сборка и проверка на чистой macOS 12 пока не выполнялись.
+### Versions and publication
 
-### Версии и публикация
+The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. Current local URL/UI work is version 1.2.0.
 
-Единая версия приложения и ядра задаётся в `[workspace.package].version` корневого `Cargo.toml` и фиксируется в `Cargo.lock`. С версии 1.0.0 новая функциональность повышает MINOR со сбросом PATCH, исправления — PATCH; при сочетании выбирается MINOR. Только документация не меняет версию. Это правило закреплено в `AGENTS.md` для последующих изменений. `rust-toolchain.toml` фиксирует Rust 1.96.1 с rustfmt и Clippy, чтобы локальные и релизные проверки использовали один компилятор и набор линтов.
+`rust-toolchain.toml` pins Rust 1.96.1 with rustfmt and Clippy. `.github/workflows/release.yml` runs version checks, formatting, Clippy, and tests for a `v<version>` tag on `windows-2022` and ARM64 `macos-15`, then packages with `--locked`. Both builds must succeed before uploading to an existing release or creating one. Manual dispatch also requires a tag. DMG format and ad-hoc signing are retained.
 
-Workflow `.github/workflows/release.yml` по тегу `v<версия>` проверяет совпадение версии, форматирование, Clippy и тесты на Windows x64 и macOS Apple Silicon, затем запускает существующие скрипты упаковки с `--locked`. После успеха обеих сборок пакеты загружаются в существующий релиз либо создаётся новый. Для ручного запуска workflow также нужно выбрать тег. Windows собирается на `windows-2022`, macOS — на ARM64-раннере `macos-15`; формат DMG и ad-hoc подпись сохранены.
+## 16. Artifact cleanup
 
-## 16. Очистка от артефактов
+### Networks
 
-### Сети
-
-| Сеть | Файл | Размер | FFT, шаг | Бины × кадры | Компенсация | Выход |
+| Network | File | Size | FFT / hop | Bins × frames | Compensation | Output |
 |---|---|---|---|---|---|---|
-| `reverb_hq` | `models/MDXNet/Reverb_HQ_By_FoxJoy.onnx` | 66.8 МБ | 6144, 1024 | 3072 × 512 (11.9 с) | 1.035 | реверберация |
-| `vocal_bleed` | `models/MDXNet/UVR-MDX-NET-Voc_FT.onnx` | 66.8 МБ | 7680, 1024 | 3072 × 256 (5.9 с) | 1.021 | вокал |
+| `reverb_hq` | `models/MDXNet/Reverb_HQ_By_FoxJoy.onnx` | 66.8 MB | 6144 / 1024 | 3072 × 512 (11.9 s) | 1.035 | Reverberation |
+| `vocal_bleed` | `models/MDXNet/UVR-MDX-NET-Voc_FT.onnx` | 66.8 MB | 7680 / 1024 | 3072 × 256 (5.9 s) | 1.021 | Vocals |
 
-Источник — [`Politrees/UVR_resources`](https://huggingface.co/Politrees/UVR_resources), ревизия `929e057b81aa49bc2e6490bef8671f47b2c120f6`. Параметры взяты из таблицы UVR `model_data_new.json`. Её ключ — MD5 последних 10 240 000 байт файла: `cd5b2989…` для Reverb HQ и `77d07b26…` для Voc_FT.
+Source: [Politrees/UVR_resources](https://huggingface.co/Politrees/UVR_resources), revision `929e057b81aa49bc2e6490bef8671f47b2c120f6`. Parameters come from UVR's `model_data_new.json`, keyed by MD5 of the final 10,240,000 bytes: `cd5b2989…` for Reverb HQ and `77d07b26…` for Voc_FT.
 
-Контракт графа: вход `input` и выход `output` формы `[1, 4, бины, кадры]`, плоскости «левый re, левый im, правый re, правый im». Слияние графа в DirectML отключено, как и для HTDemucs; результаты GPU и CPU совпадают до 5e-8.
+Graph `input` and `output` have shape `[1, 4, bins, frames]`: left real/imaginary, right real/imaginary. DirectML graph fusion is disabled as for HTDemucs; GPU/CPU differences are at most 5e-8.
 
-### Полярность
+### Polarity
 
-Сеть выдаёт либо то, что нужно убрать, либо то, что нужно оставить. `NetworkOutput` решает это по содержимому:
+`NetworkOutput` interprets the predicted content:
 
-- `Unwanted` (Reverb HQ): выход всегда вычитается — `вход − выход × компенсация`.
-- `Vocals` (Voc_FT): у стема вокала выход остаётся (`выход × компенсация`), то есть уходят просочившиеся инструменты. У любого другого стема выход вычитается, то есть уходит просочившийся голос. Микс только из инструментов или только из вокала чистится так же. Микс, где есть и то и другое, этой сетью не чистится: `MixOutput::new` такое отвергает, а форма делает отметку «Микс» недоступной.
+- `Unwanted` (Reverb HQ): always subtract `input - output × compensation`.
+- `Vocals` (Voc_FT): retain compensated output for a vocal stem, removing instrumental bleed; subtract it for instrumental stems, removing vocal bleed. Homogeneous vocal-only or instrumental-only mixes follow the same rule. `MixOutput::new` rejects mixed vocals/instruments, and the form disables Mix cleanup for that selection.
 
-### Алгоритм
+### Algorithm
 
-Повторяет `demix` UVR в варианте без смешивания окон:
+Follow UVR `demix` without window blending:
 
-1. Окно — `шаг × (кадры − 1)` отсчётов. С каждого края теряется половина FFT (`trim`), в результат идёт середина окна.
-2. Окна идут с шагом в эту середину. Первое начинается на `trim` раньше трека, недостающее заполняется тишиной.
-3. Для окна: прямое STFT каждого канала (`center=True`, отражение, периодическое окно Ханна, без нормировки), остаются нижние бины, три самых нижних обнуляются, как в UVR. Затем запуск графа, обратное STFT с тишиной в отброшенных бинах, середина окна.
-4. Результат по полярности, проверка правдоподобия, при сбое на GPU — откат на CPU.
+1. A window contains `hop × (frames - 1)` samples. Discard half an FFT (`trim`) at each edge and keep the center.
+2. Advance by that center length. The first window begins `trim` before the track, padding missing samples with silence.
+3. Compute each channel's STFT (`center=True`, reflection, periodic Hann, no normalization). Keep the low bins and zero the lowest three, as UVR does. Run the graph, inverse-transform with discarded bins zeroed, and keep the center.
+4. Apply polarity and plausibility checks; retry on CPU after a GPU failure.
 
-### Стадия в задаче
+### Job stage
 
-Очистка идёт после разделения и до публикации файлов, так что отмена и ошибка не оставляют ни результатов, ни сырых файлов.
+Cleanup runs after separation and before publication, so cancellation/errors leave neither final nor raw files.
 
-| Цели | Разделение пишет | Очистка |
+| Targets | Separation writes | Cleanup |
 |---|---|---|
-| Стемы (в том числе «Разделить») | все используемые стемы в `*.wav.raw` | каждый стем по своей полярности; микс — сумма очищенных |
-| Микс | стемы в итоговые файлы, микс в память | только микс |
-| Оба | как для «Стемы» | стемы, затем сумма очищенных ещё раз как микс |
+| Stems (including Split) | Used stems to `*.wav.raw` | Each stem with its polarity; mix sums cleaned stems |
+| Mix | Final stem files and an in-memory mix | Mix only |
+| Both | As for Stems | Stems, then clean their summed mix again |
 
-`Progress::Enhancing` считает окна по всем чистящимся стемам и миксу. `job::expected_runs` добавляет их к числу прогонов разделения. В `app::timing` очистка — отдельная стадия со своей скоростью; оценка пакета считает её окна по темпу разделения, то есть приблизительно.
+`Progress::Enhancing` counts windows across every cleaned stem/mix. `job::expected_runs` includes these windows. `app::timing` tracks cleanup at its own pace; batch estimates approximate cleanup using the separation pace.
 
-## 17. Риски и открытые вопросы
+## 17. Risks and open questions
 
-Снято на этапе 0: запуск на DirectML, скорость, расход видеопамяти (около 1.4 ГБ на сессию), настройки сессии, состав DLL, корректность собственного STFT.
+Stage 0 resolved DirectML startup, speed, session memory (about 1.4 GB), settings, DLL requirements, and custom STFT correctness.
 
-| Риск | Как снимается |
+| Risk | Mitigation/status |
 |---|---|
-| DirectML возвращает неверный результат без ошибки. На целевой машине это воспроизводится при слиянии графа; на другом железе или драйвере возможны иные случаи | Слияние отключено. Каждый чанк проверяется на правдоподобие, при нарушении — откат на CPU. Возможная дополнительная мера, пока не сделанная, — разовая сверка GPU с CPU для новой пары «модель и драйвер» с запоминанием результата |
-| Архив не запускался на чистой Windows: такой машины не было | Проверено косвенно: запуск из отдельной папки с урезанным `PATH`, все библиотеки среды выполнения и DirectML загружены из папки приложения, остальные зависимости — системные библиотеки Windows |
-| Перетаскивание файла не проверено в живом окне: его не удалось имитировать без управления мышью | Логика покрыта тестами; событие приходит из egui тем же путём, что и в других приложениях на нём |
-| Нет полного перечня лицензий сторонних компонентов для распространения, лицензия самого проекта не выбрана | В архиве краткая справка; до решения — только личное использование |
-| Все замеры сделаны на одной машине; поведение DirectML на видеокартах AMD и Intel неизвестно | Проверка правдоподобия и откат на CPU работают на любой машине; сведения о других видеокартах появятся с первыми пользователями |
-| Нет сверки с Python-версией Demucs (исключена из плана) | Сверка с эталонным экспортом на CPU, совпадение GPU и CPU на целом треке, проверка на слух — за пользователем |
-| Репозиторий с моделями изменится или исчезнет | Ссылки на фиксированную ревизию, проверка SHA-256. При исчезновении — собственный экспорт по той же схеме |
-| Отмена проверяется между блоками загрузки. Если соединение зависло и данные не приходят, отмена не сработает, пока не истечёт сетевой тайм-аут операционной системы | У `ureq` нет тайм-аута простоя для тела ответа. Если проявится — загрузка частями через запросы `Range` с тайм-аутом на часть |
-| Оборванная загрузка начинается заново, докачки нет | Файлы от 110 до 169 МБ; при необходимости — те же запросы `Range` |
-| Два экземпляра приложения, качающие одну модель, пишут в один `.part` | Проверка SHA-256 отвергнет испорченный файл; повторная попытка пройдёт |
-| Мало видеопамяти на других машинах | Сессия одна, около 1.4 ГБ; при ошибке создания или выполнения — откат на CPU |
-| Рендерер glow требует OpenGL 2.0. Без драйвера видеокарты (часть виртуальных машин, удалённый рабочий стол) окно может не создаться | Если встретится — вернуть wgpu, это замена набора фич `eframe` без правок кода |
-| Лицензия весов | Указана в README; до выяснения — только личное использование |
-| Случайный сдвиг (`shifts`) не применяется, качество может быть немного ниже, чем у Demucs с настройками по умолчанию | Возможная опция качества, см. «Позже» в плане |
-| Причина перехода с GPU на CPU видна только в журнале; в окне меняется лишь название устройства | Передать причину через `Progress`, если это окажется нужным |
-| Нативные диалоги блокируют окно, пока открыты | Доступны только с главной формы; при необходимости — асинхронный вариант `rfd` |
-| Качество очистки проверено только числами: уровни снятого сигнала и сверка GPU с CPU. Насколько стало лучше на слух, не оценивалось | Остаётся за пользователем; сравнение кандидатов записано в плане, этап 9а |
-| Сессия очистки на видеокарте занимает 2.3 ГБ (Voc_FT) – 3.6 ГБ (Reverb HQ), больше, чем разделение | Пакет с очисткой идёт по одному файлу (раздел 11) |
-| Два запущенных экземпляра приложения пишут настройки в один `app.ron` и делят видеокарту | Последний закрытый экземпляр сохраняет свои настройки; одновременная работа замедляет обе |
-| У M4A (AAC) декодер не убирает задержку кодировщика: на проверенном файле звук начинается на 1024 кадра (23 мс) позже, чем в FLAC той же записи. Стемы согласованы между собой, но сдвинуты относительно исходника в других программах | Ограничение `symphonia`: список правок контейнера читается, но не применяется. Указано в README. Для MP3 задержка убирается верно |
-| Повреждённый пакет при декодировании пропускается с записью в журнал, а не останавливает работу. Теряется несколько миллисекунд звука | Так же поступают проигрыватели; обрыв файла посреди потока остаётся ошибкой |
+| DirectML silently returns invalid output; reproduced with graph fusion, other drivers may differ | Disable fusion, validate every chunk, retry on CPU. A cached one-time GPU/CPU check per model/driver pair remains a possible addition |
+| No clean Windows machine was available | Tested from an isolated folder with restricted PATH; runtime/DirectML libraries loaded locally and remaining dependencies were Windows system libraries |
+| Drag/drop was not exercised in a live window | State transitions are tested; egui supplies its usual drop event |
+| Third-party redistribution license inventory is incomplete | Package includes a short notice. The project now uses MIT; model/dependency restrictions still apply, including the media crate's GPL-3.0-only dependency |
+| All GPU measurements use one machine; AMD/Intel behavior is unknown | Device-independent plausibility checks and CPU fallback; broader evidence awaits users |
+| No Python Demucs comparison, excluded by the owner | Compare against the CPU reference export and whole-track GPU/CPU output; listening remains the user's task |
+| Model repository may change or disappear | Pin revisions and SHA-256; export matching graphs if the source disappears |
+| Cancellation waits while an HTTP body stalls | `ureq` has no body idle timeout; consider timed Range requests if needed |
+| Interrupted model downloads restart | Models are 110–169 MB; Range requests could add resume support |
+| Two app instances write the same model `.part` | SHA-256 rejects corruption; retry |
+| Limited VRAM | One session is about 1.4 GB; session/run failures fall back to CPU |
+| glow requires OpenGL 2.0; missing drivers, some VMs/RDP sessions may prevent window creation | Switch eframe features to wgpu if this occurs; no application code changes required |
+| Weight licenses | Documented in README; personal use until clarified |
+| No random shifts; quality may be slightly below default Demucs | Possible quality option listed under Later |
+| GPU fallback reason appears only in logs | UI changes device name; add a Progress reason if needed |
+| Native dialogs block the window | Available only from the form; asynchronous rfd is an option |
+| Cleanup quality assessed numerically, not by listening | Signal-level and GPU/CPU checks completed; candidate comparison is recorded in stage 9a |
+| Cleanup sessions need 2.3 GB (Voc_FT)–3.6 GB (Reverb HQ) | The requested two-job policy may use CPU fallback on smaller GPUs; historical parallel measurements are retained in section 11 |
+| Instances share app.ron and GPU | Last closing instance saves settings; concurrent work slows both |
+| M4A/AAC decoder retains 1024 frames (23 ms) of encoder delay in the tested file | Symphonia reads but does not apply container edits. Stems align with each other but may be offset in other editors. README documents this; MP3 delay removal works |
+| Corrupt packets are skipped with a log entry, losing a few milliseconds | Matches media-player behavior; truncation midstream remains an error |

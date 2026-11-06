@@ -12,6 +12,7 @@ mod input;
 mod macros;
 mod model;
 mod output;
+mod output_format;
 mod stem;
 mod stem_set;
 mod units;
@@ -25,6 +26,7 @@ pub use self::{
     input::{InputFile, InputFileError, InputFiles},
     model::ModelId,
     output::{OutputChoice, OutputDir, OutputDirError, OverwritePolicy},
+    output_format::OutputFormat,
     stem::{Stem, StemLayout},
     stem_set::StemSet,
     units::{ByteCount, FrameCount, SampleRate},

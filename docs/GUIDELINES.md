@@ -1,114 +1,113 @@
-# Гайдлайны по коду
+# Coding guidelines
 
-Правила обязательны для всего кода в репозитории, включая тесты и примеры.
-Большая часть проверяется компилятором и clippy через секцию `[lints]` в [Cargo.toml](../Cargo.toml), остальное — на ревью.
+These rules apply to all repository code, including tests and examples. Most are enforced by the compiler and Clippy through `[lints]` in [Cargo.toml](../Cargo.toml); the rest are checked during review.
 
-Три главных принципа:
+Three main principles:
 
-1. **Никаких паник.** Любая операция, которая может не удаться, возвращает `Result` или `Option`.
-2. **Инварианты живут в типах.** Некорректное состояние должно не компилироваться, а не проверяться в рантайме.
-3. **Rust-way.** Владение, итераторы, исчерпывающий `match`, типизированные ошибки, явные зависимости.
+1. **No panics.** Any operation that can fail returns `Result` or `Option`.
+2. **Invariants belong in types.** Invalid states should fail to compile rather than be checked repeatedly at runtime.
+3. **Idiomatic Rust.** Ownership, iterators, exhaustive matches, typed errors, and explicit dependencies.
 
-## 1. Никаких паник
+## 1. No panics
 
-Запрещено в любом коде, включая тесты:
+Forbidden everywhere, including tests:
 
-| Запрещено | Чем заменить |
+| Forbidden | Replacement |
 |---|---|
-| `.unwrap()`, `.expect()` | `?` с `ok_or(..)` / `map_err(..)`, `let .. else`, `match` |
-| `panic!`, `todo!`, `unimplemented!` | вернуть ошибку; незаконченный код не коммитится |
-| `unreachable!()` | перестроить типы так, чтобы «невозможной» ветки не существовало |
-| `slice[i]`, `&s[a..b]` | `.get(i)`, итераторы, `zip`, `chunks_exact`, `split_first`, паттерны срезов `[a, b, rest @ ..]` |
-| `assert!`, `debug_assert!` вне тестов | проверяющий конструктор типа, возвращающий `Result` |
-| `std::process::exit` | вернуть значение из `main` |
-| `std::thread::spawn` (паникует при ошибке ОС) | `std::thread::Builder::spawn`, который возвращает `Result` |
-| целочисленная арифметика с возможным переполнением | `checked_*`, `saturating_*`, деление на `NonZero*` |
+| `.unwrap()`, `.expect()` | `?` with `ok_or(..)` or `map_err(..)`, `let .. else`, or `match` |
+| `panic!`, `todo!`, `unimplemented!` | Return an error; do not commit unfinished code |
+| `unreachable!()` | Change the types so the impossible branch cannot exist |
+| `slice[i]`, `&s[a..b]` | `.get(i)`, iterators, `zip`, `chunks_exact`, `split_first`, and slice patterns such as `[a, b, rest @ ..]` |
+| `assert!`, `debug_assert!` outside tests | A validating constructor returning `Result` |
+| `std::process::exit` | Return a value from `main` |
+| `std::thread::spawn`, which panics on an OS error | `std::thread::Builder::spawn`, which returns `Result` |
+| Integer arithmetic that can overflow | `checked_*`, `saturating_*`, or division by `NonZero*` |
 
-Дополнительно:
+Additional requirements:
 
-- Результат `JoinHandle::join()` обрабатывается: паника в рабочем потоке превращается в ошибку, которую видит пользователь.
-- `Mutex` по возможности не используется (см. раздел 5). Если без него не обойтись, `PoisonError` обрабатывается явно.
-- Тесты возвращают `Result<(), E>` и используют `?`. Макросы `assert!`, `assert_eq!` в тестах разрешены.
+- Handle `JoinHandle::join()`: a worker-thread panic becomes an error visible to the user.
+- Avoid `Mutex` where possible; see section 5. If one is necessary, handle `PoisonError` explicitly.
+- Tests return `Result<(), E>` and use `?`. `assert!` and `assert_eq!` are allowed in tests.
 
 ```rust
-// Плохо
+// Bad
 let rate = spec.sample_rate.unwrap();
 let first = samples[0];
 
-// Хорошо
+// Good
 let rate = spec.sample_rate.ok_or(DecodeError::MissingSampleRate)?;
 let Some((first, rest)) = samples.split_first() else {
     return Err(DecodeError::EmptyStream);
 };
 ```
 
-## 2. Инварианты в типах
+## 2. Invariants in types
 
-Принцип «parse, don't validate»: данные проверяются один раз на границе и превращаются в тип, который уже нельзя создать некорректным.
+Follow "parse, don't validate": validate external data once at the boundary and turn it into a value that cannot be constructed incorrectly.
 
-- **Newtype с приватным полем.** Единственный способ получить значение — конструктор, возвращающий `Result`. Дальше по коду повторных проверок нет.
-- **Единицы измерения в типах.** `SampleRate`, `FrameCount`, `ByteCount` вместо голых `u32`, `usize`, `f32`. Два параметра одного примитивного типа подряд в сигнатуре — повод завести newtype.
-- **Стандартные типы с инвариантом.** `NonZeroU32`, `NonZeroUsize`, `[f32; 2]` для стереокадра, `PathBuf` для путей (никогда не `String`).
-- **`enum` вместо флагов.** Никаких комбинаций `bool` + `Option`, у которых часть сочетаний бессмысленна. Никаких булевых параметров функций: вместо `write(path, true)` — `write(path, OverwritePolicy::Replace)`.
-- **Закрытые множества — это `enum` с исчерпывающим `match`.** Ветка `_ =>` для своих перечислений запрещена: добавление варианта должно ломать компиляцию во всех местах, где его нужно обработать. По той же причине внутри проекта не используется `#[non_exhaustive]`.
-- **Список вариантов порождается вместе с перечислением.** Если по перечислению нужен перебор, оно объявляется макросом `closed_enum!`, который из одного списка создаёт и `enum`, и константу `ALL`. Писать такой список вручную нельзя: он молча отстанет при добавлении варианта.
-- **Константы строятся без операций, способных не удаться.** Например, `NonZeroU32::MIN.saturating_add(44_099)` вместо `NonZeroU32::new(44_100)` с разбором `Option`.
-- **Производные данные вычисляются в конструкторе.** Если часть значения (директория файла, имя без расширения) теоретически может отсутствовать, она проверяется и сохраняется при создании, чтобы геттеры не возвращали `Option`.
-- **Этапы конвейера — разные типы.** `DecodedAudio` (любая частота) и `ModelAudio` (всегда 44.1 кГц) нельзя перепутать, потому что второй создаётся только ресемплером.
-- **Никаких сентинелов.** Ни `-1`, ни пустой строки, ни `0` в роли «нет значения». Для этого есть `Option` и `enum`.
-- **`Default` только там, где значение по умолчанию осмысленно.** Нельзя реализовывать его ради удобства конструирования.
-- **Минимальная видимость.** Поля приватные, `pub(crate)` предпочтительнее `pub`.
-- **`#[must_use]`** на типах и функциях, результат которых нельзя игнорировать.
-- **Преобразования через `From` / `TryFrom`.** Оператор `as` допустим только там, где стандартного преобразования нет (например, `usize` в `f32`), и только с `#[expect(clippy::cast_.., reason = "..")]`.
-- **RAII для ресурсов.** Временный файл удаляется в `Drop`, если не был вызван `commit()`. Очистка не должна зависеть от того, что кто-то не забыл её вызвать.
+- **Newtypes with private fields.** Construction goes through a function returning `Result`; getters and downstream code do not repeat validation.
+- **Units in types.** Use `SampleRate`, `FrameCount`, and `ByteCount` instead of bare `u32`, `usize`, or `f32`. Two parameters of the same primitive type in succession are a reason to introduce a newtype.
+- **Standard invariant-bearing types.** Use `NonZeroU32`, `NonZeroUsize`, `[f32; 2]` for a stereo frame, and `PathBuf` for paths, never `String`.
+- **Enums instead of flags.** Avoid combinations of `bool` and `Option` with meaningless states. Do not introduce boolean function parameters: prefer `write(path, OverwritePolicy::Replace)` to `write(path, true)`.
+- **Closed sets use enums and exhaustive matches.** `_ =>` is forbidden for project enums: adding a variant must break compilation wherever it needs handling. Do not use `#[non_exhaustive]` for project types.
+- **Generate iteration together with the enum.** An enum that needs iteration uses `closed_enum!`, which generates both the enum and `ALL` from one list. Do not maintain a separate list that can silently become outdated.
+- **Constants avoid fallible construction.** For example, use `NonZeroU32::MIN.saturating_add(44_099)` rather than `NonZeroU32::new(44_100)` followed by an `Option` match.
+- **Compute derived data in constructors.** Validate and retain a path's directory and base name during construction, rather than making every getter return `Option`.
+- **Distinct types for pipeline stages.** `DecodedAudio`, with any sample rate, and `ModelAudio`, always 44.1 kHz, cannot be confused because only the resampler constructs the latter.
+- **No sentinels.** Do not use `-1`, an empty string, or `0` for absence; use `Option` or an enum.
+- **Meaningful defaults only.** Do not implement `Default` merely to make construction convenient.
+- **Minimal visibility.** Keep fields private and prefer `pub(crate)` to `pub`.
+- Add **`#[must_use]`** to types and functions whose results must not be ignored.
+- **Conversions use `From` or `TryFrom`.** Use `as` only where no standard conversion exists, such as `usize` to `f32`, and only with `#[expect(clippy::cast_.., reason = "..")]`.
+- **RAII for resources.** A temporary file is removed in `Drop` unless `commit()` has been called. Cleanup must not depend on someone remembering to call a function.
 
 ```rust
-// Плохо: 0 и отрицательные значения допустимы, проверка размазана по коду
+// Bad: zero and negative values are representable; validation is scattered.
 fn resample(samples: Vec<f32>, channels: usize, from: i32, to: i32) -> Vec<f32>
 
-// Хорошо: некорректный вызов не компилируется
+// Good: the API cannot be called with invalid values.
 fn resample(audio: DecodedAudio) -> Result<ModelAudio, ResampleError>
 ```
 
-## 3. Ошибки
+## 3. Errors
 
-- На каждый слой — свой `enum` ошибок через `thiserror`. В публичных сигнатурах ядра нет `anyhow`, `Box<dyn Error>` и `String`.
-- Вариант ошибки несёт контекст (путь, идентификатор модели, ожидаемое и фактическое значение) и исходную причину через `#[source]` или `#[from]`.
-- Отмена пользователем — это не ошибка, а штатный исход: `Ok(JobEnd::Cancelled)`.
-- Ошибки не теряются. `let _ = fallible()` запрещён линтом. Если ошибку действительно нужно проигнорировать, это делается явным `match` с комментарием о причине.
-- `Display` у ошибок — технический текст на английском для логов. Текст для пользователя формирует слой UI по варианту ошибки.
+- Give each layer its own error enum derived with `thiserror`. Core public signatures contain no `anyhow`, `Box<dyn Error>`, or `String`.
+- Variants retain context: the path, model identifier, expected and actual values, and the underlying cause via `#[source]` or `#[from]`.
+- User cancellation is a normal outcome, not an error: `Ok(JobEnd::Cancelled)`.
+- Never discard errors. `let _ = fallible()` is forbidden by a lint. If an error really must be ignored, match it explicitly and explain why in a comment.
+- Error `Display` implementations produce technical English text for logs. The UI builds localized user-facing messages from typed variants.
 
-## 4. Владение и API
+## 4. Ownership and APIs
 
-- Функции принимают заимствования (`&Path`, `&[T]`), возвращают владеющие значения. `clone()` ради успокоения borrow checker — запах, требующий объяснения.
-- Чистая логика отделена от ввода-вывода. Нарезка на чанки, окно, overlap-add — чистые функции, которые тестируются без ONNX Runtime и файлов.
-- Трейты вводятся на границах с внешним миром (`Separator`, `ProgressSink`), а не для каждой структуры.
-- Итераторы вместо циклов по индексам.
-- Никакого глобального изменяемого состояния: ни `static mut`, ни синглтонов за `Mutex`. Зависимости передаются явно.
-- Платформенный код изолирован в отдельных модулях под `#[cfg(..)]`. В остальном коде `cfg` по ОС не встречается.
+- Functions accept borrowed values, such as `&Path` and `&[T]`, and return owned values. A `clone()` used only to satisfy the borrow checker needs justification.
+- Separate pure logic from I/O. Chunk planning, windows, and overlap-add are pure functions testable without ONNX Runtime or files.
+- Introduce traits at external boundaries, such as `Separator` and `ProgressSink`, rather than for every struct.
+- Prefer iterators to index-based loops.
+- No global mutable state: no `static mut` or singleton behind a `Mutex`. Pass dependencies explicitly.
+- Isolate platform code in dedicated modules guarded by `#[cfg(..)]`. OS-specific `cfg` does not appear elsewhere.
 
-## 5. Конкурентность
+## 5. Concurrency
 
-- Поток UI не делает долгой работы: в обработчике кадра нет чтения и записи файлов, сети и инференса. Допустимы только мгновенные проверки в ответ на действие пользователя (существует ли выбранный файл, есть ли уже результаты) и модальные системные диалоги.
-- Работа идёт в отдельном потоке, обмен — типизированными сообщениями через канал. Общая изменяемая память не используется.
-- Отмена — через `CancelToken`, который проверяется между чанками и между блоками загрузки.
-- `Send` и `Sync` выводятся компилятором. Ручных `unsafe impl` нет.
+- The UI thread performs no slow work: frame handlers do not read or write files, access the network, or run inference. Only immediate checks following a user action, such as whether a chosen file exists or results already exist, and modal system dialogs are allowed.
+- Work runs in a separate thread and communicates through typed channel messages. Do not use shared mutable memory.
+- Cancellation uses `CancelToken`, checked between chunks and between download blocks.
+- Let the compiler derive `Send` and `Sync`. No manual `unsafe impl`.
 
 ## 6. `unsafe`
 
-Запрещён на уровне крейта (`unsafe_code = "forbid"`). Если когда-нибудь понадобится, он выносится в отдельный крейт с собственным обоснованием и ревью.
+Crate-level `unsafe_code = "forbid"` prohibits unsafe code. If it is ever needed, isolate it in a separate crate with its own justification and review.
 
-## 7. Зависимости
+## 7. Dependencies
 
-- Каждая новая зависимость обосновывается в сообщении коммита.
-- При прочих равных выбирается крейт на чистом Rust без системных библиотек.
-- `default-features = false` там, где значения по умолчанию тянут лишнее.
-- Пререлизные версии (сейчас это `ort`) фиксируются точно, через `=x.y.z-rc.N`.
-- Крейт ядра не зависит от GUI-библиотек.
+- Justify every new dependency in the commit message.
+- Prefer pure-Rust crates without system libraries when other factors are equal.
+- Set `default-features = false` when defaults pull in unnecessary functionality.
+- Pin prerelease dependencies, currently `ort`, exactly with `=x.y.z-rc.N`.
+- The core crate must not depend on GUI libraries.
 
-## 8. Линты и форматирование
+## 8. Lints and formatting
 
-Перед каждым коммитом должны проходить без предупреждений:
+Before every commit, these checks must pass without warnings:
 
 ```sh
 cargo fmt --all --check
@@ -116,27 +115,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-- Исключение из линта оформляется как `#[expect(lint, reason = "...")]` на минимальной области. Голый `#[allow]` запрещён линтом.
-- Набор линтов в `Cargo.toml` ослабляется только отдельным коммитом с объяснением.
+- Apply a lint exception as `#[expect(lint, reason = "...")]` at the narrowest useful scope. Bare `#[allow]` is forbidden.
+- Weaken the `Cargo.toml` lint set only in a separate, explicitly justified commit.
 
-## 9. Тесты
+## 9. Tests
 
-- Конструкторы типов с инвариантами покрываются тестами на корректные и некорректные входы.
-- Чистая логика конвейера проверяется с подставным `Separator`. Тождественный разделитель (каждый стем равен входу) должен после overlap-add вернуть исходный сигнал с точностью до эпсилон.
-- Тесты, которым нужны сеть, GPU или файл модели, помечаются `#[ignore = "причина"]` и не входят в обычный `cargo test`.
+- Test constructors of invariant-bearing types with valid and invalid inputs.
+- Test pure pipeline logic using a fake `Separator`. An identity separator, which returns its input for every stem, must reproduce the original signal after overlap-add within epsilon.
+- Tests requiring network access, a GPU, or model files use `#[ignore = "reason"]` and are excluded from ordinary `cargo test` runs.
 
-## 10. Язык и комментарии
+## 10. Language and comments
 
-- Идентификаторы, комментарии, doc-комментарии и сообщения коммитов — на английском.
-- README и документы в `docs/` — на русском.
-- Интерфейс — на английском и русском. Все видимые пользователю строки проходят через модуль локализации (`view::text`); строковых литералов в коде отрисовки нет. Перевод выбирается исчерпывающим `match` по локали, каждый язык — отдельный модуль с одинаковым набором функций.
-- Комментарий объясняет, почему код такой, а не что он делает.
-- У публичных функций, возвращающих `Result`, в doc-комментарии есть раздел `# Errors`.
+- Identifiers, comments, documentation comments, and commit messages are in English.
+- README files, `docs/`, contributor instructions, release descriptions, and packaged instructions are in English.
+- The interface is available in English and Russian. All UI text goes through `view::text`; rendering code contains no user-facing string literals. Choose translations through exhaustive locale matches, with the same function set in each language module. Preserve Russian localization and translation tests.
+- Comments explain why code works a certain way, rather than restating what it does.
+- Public functions returning `Result` have an `# Errors` section in their documentation.
 
-## Чек-лист перед коммитом
+## Before-commit checklist
 
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings` и `cargo test` проходят.
-- [ ] Новых `#[expect]` нет, либо у каждого есть `reason`.
-- [ ] Новые данные извне (путь, число, строка) превращаются в типизированное значение на границе.
-- [ ] В новых `match` по своим перечислениям нет ветки `_ =>`.
-- [ ] Новый код в потоке UI не делает ввода-вывода.
+- [ ] Formatting, strict Clippy, and tests pass.
+- [ ] Every new `#[expect]` has a `reason`.
+- [ ] New external inputs, including paths, numbers, and strings, become validated domain types at the boundary.
+- [ ] Matches on project enums have no `_ =>` arm.
+- [ ] New UI-thread code performs no I/O.

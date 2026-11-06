@@ -16,8 +16,31 @@ use crate::{downloads::DownloadsProblem, worker::Failure};
 pub(super) const fn text(text: Text) -> &'static str {
     match text {
         Text::WindowTitle => "stem-split",
+        Text::FileTab => "Files",
+        Text::UrlTab => "URL",
+        Text::Url => "Audio URL",
+        Text::ClearUrl => "Clear URL",
+        Text::ChooseFiles => "Choose at least one audio file to start.",
+        Text::EnterUrl => "Enter an audio or video URL to start.",
+        Text::WaitForCache => "Wait until the cache has finished clearing.",
+        Text::UrlPlaceholder => "https://… (audio or video)",
+        Text::Playlist => "Playlist",
+        Text::PlaylistAll | Text::AllStems => "All",
+        Text::PlaylistNone | Text::NoStems => "None",
+        Text::PlaylistSelectionHint => "Select videos, then press Download or Split again.",
+        Text::NoPlaylistItems => "Select at least one playlist item.",
+        Text::UrlHint => "Audio is kept in the chosen folder. Playlists are supported.",
+        Text::LoadingMetadata => "Loading information…",
+        Text::MetadataFailed => "Could not read the link.",
+        Text::InvalidUrl => "Enter a valid HTTP or HTTPS URL.",
+        Text::RequiredFolder => "Choose a folder for the audio and stems before starting.",
         Text::File => "File",
         Text::NoFileChosen => "No file chosen",
+        Text::Wav => "WAV",
+        Text::Mp3 => "MP3",
+        Text::OriginalFormat => "Original",
+        Text::SaveFormat => "Saved audio format",
+        Text::OutputFormat => "Stem and mix format",
         Text::Browse => "Browse…",
         Text::Output => "Save to",
         Text::OutputBesideFile => "The folder of the file",
@@ -25,17 +48,19 @@ pub(super) const fn text(text: Text) -> &'static str {
         Text::Model => "Model",
         Text::Device => "Device",
         Text::Language => "Language",
-        Text::OpenDownloads => "Open the folder of downloaded models",
-        Text::ClearDownloads => "Delete downloaded models",
-        Text::NothingDownloaded => "No models have been downloaded yet",
+        Text::OpenDownloads => "Open the cache of models and download tools",
+        Text::ClearDownloads => "Delete cached models and download tools",
+        Text::NothingDownloaded => "No models or tools have been downloaded yet",
         Text::Delete => "Delete",
         Text::Split => "Split",
+        Text::Download => "Download",
+        Text::SeparationSettings => "Separation and mix",
+        Text::DownloadComplete => "The audio has been saved to the chosen folder.",
+        Text::DownloadFailed => "The audio was not downloaded",
         Text::SplitAndMix => "Split and mix",
         Text::NoStemsForMix => "Tick at least one stem for the mix",
         // The row of stems and the tick for cleaning them: the same word.
         Text::Stems | Text::CleanupStems => "Stems",
-        Text::AllStems => "All",
-        Text::NoStems => "None",
         Text::KeepStems => "Save stems",
         Text::KeepStemsHint => "With \"Split and mix\", also save every stem to a file of its own",
         Text::Cleanup => "Cleanup",
@@ -103,9 +128,26 @@ pub(super) fn download_notice(megabytes: u64) -> String {
 
 pub(super) fn clear_question(megabytes: u64) -> String {
     format!(
-        "The downloaded models take {megabytes} MB. Delete them? \
-         Each one will be downloaded again the next time it is used."
+        "Cached models and download tools take {megabytes} MB. Delete them? \
+         They will be downloaded again the next time they are used."
     )
+}
+
+pub(super) fn media_status(progress: stem_split_media::Progress) -> String {
+    use stem_split_media::Progress;
+    match progress {
+        Progress::InstallingDownloader => "Downloading yt-dlp…".to_owned(),
+        Progress::InstallingFfmpeg => "Downloading FFmpeg…".to_owned(),
+        Progress::Inspecting => "Reading the audio URL…".to_owned(),
+        Progress::Downloading { downloaded, total } => match total {
+            Some(total) => format!(
+                "Downloading audio: {}%",
+                (downloaded.saturating_mul(100) / total.get()).min(100)
+            ),
+            None => format!("Downloading audio: {} MB", downloaded / 1_000_000),
+        },
+        Progress::Converting => "Preparing the audio file…".to_owned(),
+    }
 }
 
 pub(super) const fn device_preference(device: DevicePreference) -> &'static str {
@@ -171,6 +213,15 @@ pub(super) fn batch_time_status(elapsed: &str, remaining: Option<&str>) -> Strin
         Some(remaining) => format!("All files: elapsed {elapsed} · about {remaining} left"),
         None => format!("All files: elapsed {elapsed}"),
     }
+}
+
+pub(super) fn playlist_selected(selected: usize, total: usize) -> String {
+    format!("Selected: {selected} of {total}")
+}
+
+pub(super) fn playlist_count(count: usize) -> String {
+    let noun = if count == 1 { "track" } else { "tracks" };
+    format!("{count} {noun}")
 }
 
 pub(super) fn files_chosen(count: usize) -> String {
@@ -265,6 +316,10 @@ pub(super) fn start_failure(error: &eframe::Error) -> Message {
 
 pub(super) fn failure(failure: &Failure) -> Message {
     match failure {
+        Failure::Media(error) => Message::with_detail(
+            "The audio could not be downloaded. Check the URL and try again; live streams are not supported.",
+            error,
+        ),
         Failure::Job(error) => job_error(error),
         Failure::NotStarted(error) => Message::with_detail("The work could not be started.", error),
         Failure::Crashed => {
@@ -285,6 +340,10 @@ fn job_error(error: &JobError) -> Message {
 
 fn write_error(error: &WriteError) -> Message {
     match error {
+        WriteError::Encode { path, .. } => Message::with_detail(
+            format!("Could not encode the output file: {}", path.display()),
+            error,
+        ),
         WriteError::AlreadyExists { path } => Message::plain(format!(
             "\"{}\" already exists. Nothing was replaced.",
             file_name(path)

@@ -16,8 +16,31 @@ use crate::{downloads::DownloadsProblem, worker::Failure};
 pub(super) const fn text(text: Text) -> &'static str {
     match text {
         Text::WindowTitle => "stem-split",
+        Text::FileTab => "Файлы",
+        Text::UrlTab => "Ссылка",
+        Text::Url => "Ссылка на аудио",
+        Text::ClearUrl => "Очистить ссылку",
+        Text::ChooseFiles => "Для запуска выберите хотя бы один аудиофайл.",
+        Text::EnterUrl => "Для запуска введите ссылку на аудио или видео.",
+        Text::WaitForCache => "Дождитесь завершения очистки кэша.",
+        Text::UrlPlaceholder => "https://… (аудио или видео)",
+        Text::Playlist => "Плейлист",
+        Text::PlaylistAll | Text::AllStems => "Все",
+        Text::PlaylistNone | Text::NoStems => "Ни одного",
+        Text::PlaylistSelectionHint => "Выберите видео и снова нажмите «Скачать» или «Разделить».",
+        Text::NoPlaylistItems => "Выберите хотя бы одну запись плейлиста.",
+        Text::UrlHint => "Аудио останется в выбранной папке. Плейлисты поддерживаются.",
+        Text::LoadingMetadata => "Загрузка информации…",
+        Text::MetadataFailed => "Не удалось прочитать ссылку.",
+        Text::InvalidUrl => "Введите корректную ссылку HTTP или HTTPS.",
+        Text::RequiredFolder => "Перед запуском выберите папку для аудио и стемов.",
         Text::File => "Файл",
         Text::NoFileChosen => "Файл не выбран",
+        Text::Wav => "WAV",
+        Text::Mp3 => "MP3",
+        Text::OriginalFormat => "Исходный",
+        Text::SaveFormat => "Формат сохранения аудио",
+        Text::OutputFormat => "Формат стемов и микса",
         Text::Browse => "Обзор…",
         // The two choices below continue this phrase: "Сохранить в папку с файлом".
         Text::Output => "Сохранить в",
@@ -26,17 +49,19 @@ pub(super) const fn text(text: Text) -> &'static str {
         Text::Model => "Модель",
         Text::Device => "Устройство",
         Text::Language => "Язык",
-        Text::OpenDownloads => "Открыть папку со скачанными моделями",
-        Text::ClearDownloads => "Удалить скачанные модели",
-        Text::NothingDownloaded => "Модели ещё не скачивались",
+        Text::OpenDownloads => "Открыть кэш моделей и инструментов загрузки",
+        Text::ClearDownloads => "Удалить модели и инструменты загрузки из кэша",
+        Text::NothingDownloaded => "Модели и инструменты ещё не скачивались",
         Text::Delete => "Удалить",
         Text::Split => "Разделить",
+        Text::Download => "Скачать",
+        Text::SeparationSettings => "Разделение и микс",
+        Text::DownloadComplete => "Аудио сохранено в выбранной папке.",
+        Text::DownloadFailed => "Аудио не скачано",
         Text::SplitAndMix => "Разделить и свести",
         Text::NoStemsForMix => "Отметьте хотя бы один стем для микса",
         // The row of stems and the tick for cleaning them: the same word.
         Text::Stems | Text::CleanupStems => "Стемы",
-        Text::AllStems => "Все",
-        Text::NoStems => "Ни одного",
         Text::KeepStems => "Сохранить стемы",
         Text::KeepStemsHint => "При «Разделить и свести» сохранить и каждый стем в отдельный файл",
         Text::Cleanup => "Очистка",
@@ -122,9 +147,26 @@ pub(super) fn download_notice(megabytes: u64) -> String {
 
 pub(super) fn clear_question(megabytes: u64) -> String {
     format!(
-        "Скачанные модели занимают {megabytes} МБ. Удалить их? \
-         Каждая скачается заново, когда понадобится."
+        "Модели и инструменты загрузки в кэше занимают {megabytes} МБ. Удалить их? \
+         Они скачаются заново, когда понадобятся."
     )
+}
+
+pub(super) fn media_status(progress: stem_split_media::Progress) -> String {
+    use stem_split_media::Progress;
+    match progress {
+        Progress::InstallingDownloader => "Скачивание yt-dlp…".to_owned(),
+        Progress::InstallingFfmpeg => "Скачивание FFmpeg…".to_owned(),
+        Progress::Inspecting => "Чтение ссылки на аудио…".to_owned(),
+        Progress::Downloading { downloaded, total } => match total {
+            Some(total) => format!(
+                "Скачивание аудио: {}%",
+                (downloaded.saturating_mul(100) / total.get()).min(100)
+            ),
+            None => format!("Скачивание аудио: {} МБ", downloaded / 1_000_000),
+        },
+        Progress::Converting => "Подготовка аудиофайла…".to_owned(),
+    }
 }
 
 pub(super) const fn device_preference(device: DevicePreference) -> &'static str {
@@ -191,6 +233,17 @@ pub(super) fn batch_time_status(elapsed: &str, remaining: Option<&str>) -> Strin
         Some(remaining) => format!("Все файлы: прошло {elapsed} · осталось около {remaining}"),
         None => format!("Все файлы: прошло {elapsed}"),
     }
+}
+
+pub(super) fn playlist_selected(selected: usize, total: usize) -> String {
+    format!("Выбрано: {selected} из {total}")
+}
+
+pub(super) fn playlist_count(count: usize) -> String {
+    format!(
+        "{count} {}",
+        plural(count, "композиция", "композиции", "композиций")
+    )
 }
 
 pub(super) fn files_chosen(count: usize) -> String {
@@ -287,6 +340,10 @@ pub(super) fn start_failure(error: &eframe::Error) -> Message {
 
 pub(super) fn failure(failure: &Failure) -> Message {
     match failure {
+        Failure::Media(error) => Message::with_detail(
+            "Не удалось скачать аудио. Проверьте ссылку и повторите попытку; прямые эфиры не поддерживаются.",
+            error,
+        ),
         Failure::Job(error) => job_error(error),
         Failure::NotStarted(error) => Message::with_detail("Не удалось начать работу.", error),
         Failure::Crashed => {
@@ -307,6 +364,10 @@ fn job_error(error: &JobError) -> Message {
 
 fn write_error(error: &WriteError) -> Message {
     match error {
+        WriteError::Encode { path, .. } => Message::with_detail(
+            format!("Не удалось закодировать выходной файл: {}", path.display()),
+            error,
+        ),
         WriteError::AlreadyExists { path } => Message::plain(format!(
             "Файл «{}» уже существует. Ничего не заменено.",
             file_name(path)

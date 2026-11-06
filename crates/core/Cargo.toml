@@ -17,6 +17,7 @@ rubato.workspace = true
 sha2.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 ureq.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -25,9 +26,6 @@ ort-sys.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { workspace = true, features = ["coreml"] }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

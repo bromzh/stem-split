@@ -8,7 +8,9 @@ use std::{
 use hound::{SampleFormat, WavSpec};
 
 use crate::{
-    domain::{OverwritePolicy, SampleRate},
+    CancelToken,
+    audio::{AudioEncoder, EncodeError, Encoded},
+    domain::{OutputFormat, OverwritePolicy, SampleRate},
     partial::{PartialFile, PartialFileError},
 };
 
@@ -24,6 +26,12 @@ const MAX_DATA_BYTES: u64 = 0xFFFF_F000;
 /// Why a stem could not be written.
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
+    #[error("cannot encode `{}`: {source}", path.display())]
+    Encode {
+        path: PathBuf,
+        #[source]
+        source: EncodeError,
+    },
     #[error("`{}` already exists", path.display())]
     AlreadyExists { path: PathBuf },
     #[error("cannot create `{}`: {source}", path.display())]
@@ -153,6 +161,57 @@ impl WavWriter {
     /// Returns an error if the remaining data cannot be written or the file
     /// cannot be moved into place. Nothing is left on disk in that case.
     pub fn finish(self) -> Result<(), WriteError> {
+        self.finalized()?.publish()?;
+        Ok(())
+    }
+
+    /// Finalizes the PCM staging file and atomically publishes the chosen encoding.
+    ///
+    /// # Errors
+    /// Returns writing, encoding or publication failures; previous targets survive.
+    pub fn finish_as(
+        self,
+        format: OutputFormat,
+        encoder: &dyn AudioEncoder,
+        cancel: &CancelToken,
+    ) -> Result<Encoded, WriteError> {
+        if cancel.is_cancelled() {
+            return Ok(Encoded::Cancelled);
+        }
+        if format == OutputFormat::Wav {
+            self.finish()?;
+            return Ok(Encoded::Ready);
+        }
+        let partial = self.finalized()?;
+        let fail = |source| WriteError::Encode {
+            path: partial.target().to_path_buf(),
+            source,
+        };
+        let folder = partial
+            .target()
+            .parent()
+            .ok_or_else(|| fail(EncodeError::Io(io::Error::other("output has no directory"))))?;
+        let compressed = tempfile::Builder::new()
+            .prefix(".stem-split-encode-")
+            .suffix(".mp3")
+            .tempfile_in(folder)
+            .map_err(|error| fail(EncodeError::Io(error)))?
+            .into_temp_path();
+        if encoder
+            .encode_mp3(partial.path(), &compressed, cancel)
+            .map_err(fail)?
+            == Encoded::Cancelled
+            || cancel.is_cancelled()
+        {
+            return Ok(Encoded::Cancelled);
+        }
+        std::fs::rename(&compressed, partial.path())
+            .map_err(|error| fail(EncodeError::Io(error)))?;
+        partial.publish()?;
+        Ok(Encoded::Ready)
+    }
+
+    fn finalized(self) -> Result<PartialFile, WriteError> {
         let Self {
             writer, partial, ..
         } = self;
@@ -160,8 +219,7 @@ impl WavWriter {
             path: partial.target().to_path_buf(),
             source,
         })?;
-        partial.publish()?;
-        Ok(())
+        Ok(partial)
     }
 }
 
@@ -171,6 +229,72 @@ mod tests {
 
     use super::*;
     use crate::{audio::decode, domain::InputFile};
+
+    #[derive(Debug, thiserror::Error)]
+    enum EncodingTestError {
+        #[error(transparent)]
+        Io(#[from] io::Error),
+        #[error(transparent)]
+        Write(#[from] WriteError),
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum EncodingStep {
+        Ready,
+        Cancel,
+        Fail,
+    }
+
+    impl AudioEncoder for EncodingStep {
+        fn encode_mp3(
+            &self,
+            _source: &Path,
+            destination: &Path,
+            cancel: &CancelToken,
+        ) -> Result<Encoded, EncodeError> {
+            fs::write(destination, b"encoded bytes")?;
+            match self {
+                Self::Ready => Ok(Encoded::Ready),
+                Self::Cancel => {
+                    cancel.cancel();
+                    Ok(Encoded::Ready)
+                }
+                Self::Fail => Err(EncodeError::Io(io::Error::other("encoder stopped"))),
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_outputs_publish_only_after_success() -> Result<(), EncodingTestError> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("track.vocals.mp3");
+        for step in [
+            EncodingStep::Cancel,
+            EncodingStep::Fail,
+            EncodingStep::Ready,
+        ] {
+            fs::write(&path, b"previous")?;
+            let mut writer = WavWriter::create(&path, SampleRate::MODEL, OverwritePolicy::Replace)?;
+            writer.write(&[[0.1, -0.1]; 100])?;
+            let result = writer.finish_as(OutputFormat::Mp3, &step, &CancelToken::new());
+            match step {
+                EncodingStep::Ready => {
+                    assert_eq!(result?, Encoded::Ready);
+                    assert_eq!(fs::read(&path)?, b"encoded bytes");
+                }
+                EncodingStep::Cancel => {
+                    assert_eq!(result?, Encoded::Cancelled);
+                    assert_eq!(fs::read(&path)?, b"previous");
+                }
+                EncodingStep::Fail => {
+                    assert!(matches!(result, Err(WriteError::Encode { .. })));
+                    assert_eq!(fs::read(&path)?, b"previous");
+                }
+            }
+            assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        }
+        Ok(())
+    }
 
     fn part_of(target: &Path) -> PathBuf {
         let mut name = target.as_os_str().to_os_string();

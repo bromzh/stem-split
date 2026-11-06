@@ -14,9 +14,39 @@ use stem_split_core::{
 };
 
 use crate::{
-    settings::{CleanupChoice, MixChoice, Settings},
+    settings::{CleanupChoice, MixChoice, SeparationPanel, Settings},
     view::text::Locale,
 };
+
+/// Which input tab is active; file selections survive switching tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Files,
+    Url,
+}
+
+impl Source {
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Url => "url",
+        }
+    }
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "files" => Some(Self::Files),
+            "url" => Some(Self::Url),
+            _ => None,
+        }
+    }
+}
+
+/// Whether URL preparation should stop at the saved audio or keep going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UrlAction {
+    Download,
+    Separate(Mode),
+}
 
 /// Which of the two buttons started the work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +55,20 @@ pub(crate) enum Mode {
     Split,
     /// A mix of the ticked stems, and the stems too if they are kept.
     SplitAndMix,
+}
+
+/// The actionable reason a start button is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartBlock {
+    NoFiles,
+    NoUrl,
+    InvalidUrl,
+    NoOutputFolder,
+    NoMixStems,
+    LoadingMetadata,
+    MetadataFailed,
+    NoPlaylistItems,
+    ClearingCache,
 }
 
 /// Why what the user last picked, or asked for, was not accepted.
@@ -42,8 +86,19 @@ pub(crate) enum Problem {
 /// was and is remembered in `problem` to be shown.
 #[derive(Debug)]
 pub(crate) struct Form {
+    source: Source,
+    save_format: stem_split_media::SaveFormat,
+    output_format: stem_split_core::domain::OutputFormat,
+    url: String,
+    preview: crate::preview::Preview,
+    playlist: Option<crate::playlist::Choices>,
     inputs: Option<InputFiles>,
+    url_inputs: Option<InputFiles>,
+    downloaded_audio: Vec<stem_split_media::DownloadedAudio>,
+    download_failures: Vec<crate::tracker::FileResult>,
     output: OutputChoice,
+    url_folder: Option<OutputDir>,
+    separation_panel: SeparationPanel,
     model: ModelId,
     device: DevicePreference,
     mix: MixChoice,
@@ -65,8 +120,19 @@ impl Form {
     /// A form with no file chosen and the remembered choices filled in.
     pub(crate) fn with(settings: &Settings) -> Self {
         Self {
+            source: settings.source,
+            save_format: settings.save_format,
+            output_format: settings.output_format,
+            url: String::new(),
+            preview: crate::preview::Preview::default(),
+            playlist: None,
             inputs: None,
+            url_inputs: None,
+            downloaded_audio: Vec::new(),
+            download_failures: Vec::new(),
             output: settings.output.clone(),
+            url_folder: settings.url_folder.clone(),
+            separation_panel: settings.separation_panel,
             model: settings.model,
             device: settings.device,
             mix: settings.mix,
@@ -80,9 +146,14 @@ impl Form {
     pub(crate) fn settings(&self, locale: Locale) -> Settings {
         Settings {
             locale,
+            save_format: self.save_format,
+            output_format: self.output_format,
             model: self.model,
             device: self.device,
             output: self.output.clone(),
+            source: self.source,
+            url_folder: self.url_folder.clone(),
+            separation_panel: self.separation_panel,
             mix: self.mix,
             cleanup: self.cleanup,
         }
@@ -107,7 +178,261 @@ impl Form {
     }
 
     pub(crate) const fn inputs(&self) -> Option<&InputFiles> {
+        match self.source {
+            Source::Files => self.inputs.as_ref(),
+            Source::Url => self.url_inputs.as_ref(),
+        }
+    }
+
+    pub(crate) const fn source(&self) -> Source {
+        self.source
+    }
+
+    pub(crate) const fn separation_panel(&self) -> SeparationPanel {
+        self.separation_panel
+    }
+
+    pub(crate) const fn set_separation_panel(&mut self, panel: SeparationPanel) {
+        self.separation_panel = panel;
+    }
+
+    pub(crate) const fn local_inputs(&self) -> Option<&InputFiles> {
         self.inputs.as_ref()
+    }
+
+    pub(crate) const fn set_source(&mut self, source: Source) {
+        self.source = source;
+    }
+
+    pub(crate) const fn save_format(&self) -> stem_split_media::SaveFormat {
+        self.save_format
+    }
+    pub(crate) const fn output_format(&self) -> stem_split_core::domain::OutputFormat {
+        self.output_format
+    }
+    pub(crate) fn set_save_format(&mut self, format: stem_split_media::SaveFormat) {
+        if self.save_format != format {
+            self.invalidate_url_inputs();
+            self.save_format = format;
+        }
+    }
+    pub(crate) const fn set_output_format(
+        &mut self,
+        format: stem_split_core::domain::OutputFormat,
+    ) {
+        self.output_format = format;
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(crate) fn set_url(&mut self, url: String) {
+        if self.url != url {
+            self.invalidate_url_inputs();
+            self.playlist = None;
+            self.preview.change(&url, std::time::Instant::now());
+        }
+        self.url = url;
+    }
+
+    pub(crate) const fn preview(&self) -> &crate::preview::State {
+        self.preview.state()
+    }
+
+    pub(crate) fn poll_preview(&mut self, context: &eframe::egui::Context, enabled: bool) {
+        self.preview.poll(
+            context,
+            enabled && self.source == Source::Url,
+            std::time::Instant::now(),
+        );
+        self.sync_playlist();
+    }
+
+    fn sync_playlist(&mut self) {
+        match self.preview() {
+            crate::preview::State::Ready(stem_split_media::MediaInfo::Playlist { .. }) => {
+                if self.playlist.is_none() {
+                    self.playlist = Some(crate::playlist::Choices::default());
+                }
+            }
+            crate::preview::State::Empty
+            | crate::preview::State::Pending { .. }
+            | crate::preview::State::Loading(_)
+            | crate::preview::State::Failed(_)
+            | crate::preview::State::Ready(stem_split_media::MediaInfo::Single(_)) => {
+                self.playlist = None;
+            }
+        }
+    }
+
+    pub(crate) fn playlist(
+        &self,
+    ) -> Option<(&stem_split_media::MediaInfo, &crate::playlist::Choices)> {
+        match self.preview() {
+            crate::preview::State::Ready(info @ stem_split_media::MediaInfo::Playlist { .. }) => {
+                Some((info, self.playlist.as_ref()?))
+            }
+            crate::preview::State::Empty
+            | crate::preview::State::Pending { .. }
+            | crate::preview::State::Loading(_)
+            | crate::preview::State::Failed(_)
+            | crate::preview::State::Ready(stem_split_media::MediaInfo::Single(_)) => None,
+        }
+    }
+
+    pub(crate) fn set_playlist_panel(&mut self, panel: crate::playlist::Panel) {
+        if let Some(choices) = &mut self.playlist {
+            choices.set_panel(panel);
+        }
+    }
+
+    pub(crate) fn toggle_playlist_item(&mut self, index: usize) {
+        let count = self.playlist().map_or(0, |(info, _)| info.items().count());
+        if index < count
+            && let Some(choices) = &mut self.playlist
+        {
+            choices.toggle(index);
+            self.invalidate_url_inputs();
+        }
+    }
+
+    pub(crate) fn select_playlist(&mut self, selection: crate::playlist::Selection) {
+        let count = self.playlist().map_or(0, |(info, _)| info.items().count());
+        if let Some(choices) = &mut self.playlist {
+            choices.select(selection, count);
+            self.invalidate_url_inputs();
+        }
+    }
+
+    pub(crate) fn review_playlist(&mut self) -> bool {
+        let count = self.playlist().map_or(0, |(info, _)| info.items().count());
+        self.playlist
+            .as_mut()
+            .is_some_and(|choices| choices.review_before_start(count))
+    }
+
+    pub(crate) fn cancel_preview(&mut self) {
+        self.preview.cancel();
+    }
+
+    pub(crate) fn stop_preview(&mut self, patience: std::time::Duration) {
+        self.preview.stop(patience);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_preview(&mut self, state: crate::preview::State) {
+        self.preview.show(state);
+        self.playlist = None;
+        self.sync_playlist();
+    }
+
+    pub(crate) fn take_preview_usage(&mut self) -> Option<stem_split_core::model::Usage> {
+        self.preview.take_usage()
+    }
+
+    pub(crate) fn preview_busy(&self) -> bool {
+        self.preview.is_busy()
+    }
+
+    pub(crate) const fn url_folder(&self) -> Option<&OutputDir> {
+        self.url_folder.as_ref()
+    }
+
+    pub(crate) fn url_request(&self) -> Option<(stem_split_media::MediaInfo, OutputDir)> {
+        let crate::preview::State::Ready(info) = self.preview() else {
+            return None;
+        };
+        let selected = match self.playlist() {
+            Some((info, choices)) => info.selected(|index| choices.includes(index))?,
+            None => info.clone(),
+        };
+        Some((selected, self.url_folder.as_ref()?.clone()))
+    }
+
+    pub(crate) fn start_block(&self, mode: Mode) -> Option<StartBlock> {
+        match self.source {
+            Source::Files => {
+                if self.inputs.is_none() {
+                    return Some(StartBlock::NoFiles);
+                }
+            }
+            Source::Url => {
+                if self.url.trim().is_empty() {
+                    return Some(StartBlock::NoUrl);
+                }
+                if stem_split_media::MediaUrl::new(&self.url).is_err() {
+                    return Some(StartBlock::InvalidUrl);
+                }
+                if self.url_folder.is_none() {
+                    return Some(StartBlock::NoOutputFolder);
+                }
+                match self.preview() {
+                    crate::preview::State::Ready(_) => {}
+                    crate::preview::State::Failed(_) => return Some(StartBlock::MetadataFailed),
+                    crate::preview::State::Empty
+                    | crate::preview::State::Pending { .. }
+                    | crate::preview::State::Loading(_) => {
+                        return Some(StartBlock::LoadingMetadata);
+                    }
+                }
+                if self.playlist().is_some_and(|(info, choices)| {
+                    !info
+                        .items()
+                        .enumerate()
+                        .any(|(index, _)| choices.includes(index))
+                }) {
+                    return Some(StartBlock::NoPlaylistItems);
+                }
+            }
+        }
+        match mode {
+            Mode::Split => None,
+            Mode::SplitAndMix => (!self.can_mix()).then_some(StartBlock::NoMixStems),
+        }
+    }
+
+    fn invalidate_url_inputs(&mut self) {
+        self.url_inputs = None;
+        self.downloaded_audio.clear();
+        self.download_failures.clear();
+    }
+
+    pub(crate) fn set_downloads(
+        &mut self,
+        audio: Vec<stem_split_media::DownloadedAudio>,
+        failures: Vec<crate::tracker::FileResult>,
+    ) {
+        self.url_inputs = InputFiles::new(audio.iter().map(|item| item.input().clone()));
+        self.downloaded_audio = audio;
+        self.download_failures = failures;
+        self.problem = None;
+    }
+
+    pub(crate) fn download_sources(&self) -> impl Iterator<Item = &Path> {
+        self.downloaded_audio
+            .iter()
+            .map(stem_split_media::DownloadedAudio::source)
+    }
+
+    pub(crate) fn remember_download_failures(&mut self, failures: Vec<crate::tracker::FileResult>) {
+        self.download_failures = failures;
+    }
+
+    pub(crate) fn take_download_failures(&mut self) -> Vec<crate::tracker::FileResult> {
+        std::mem::take(&mut self.download_failures)
+    }
+
+    /// The downloaded file feeds the usual pipeline without changing tabs.
+    #[cfg(test)]
+    pub(crate) fn set_downloaded_inputs(&mut self, inputs: InputFiles) {
+        self.url_inputs = Some(inputs);
+        self.problem = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_downloaded_input(&mut self, input: InputFile) {
+        self.set_downloaded_inputs(InputFiles::one(input));
     }
 
     pub(crate) const fn output(&self) -> &OutputChoice {
@@ -147,6 +472,7 @@ impl Form {
         }
         if let Some(inputs) = InputFiles::new(accepted) {
             self.inputs = Some(inputs);
+            self.source = Source::Files;
         }
         self.problem = (!rejected.is_empty()).then_some(Problem::Inputs(rejected));
     }
@@ -154,7 +480,15 @@ impl Form {
     pub(crate) fn set_output_folder(&mut self, path: &Path) {
         match OutputDir::new(path) {
             Ok(directory) => {
-                self.output = OutputChoice::Custom(directory);
+                match self.source {
+                    Source::Files => self.output = OutputChoice::Custom(directory),
+                    Source::Url => {
+                        if self.url_folder.as_ref() != Some(&directory) {
+                            self.invalidate_url_inputs();
+                        }
+                        self.url_folder = Some(directory);
+                    }
+                }
                 self.problem = None;
             }
             Err(error) => self.problem = Some(Problem::Output(error)),
@@ -258,15 +592,22 @@ impl Form {
         mode: Mode,
         overwrite: OverwritePolicy,
     ) -> Option<Result<Batch, OutputClash>> {
-        let inputs = self.inputs.as_ref()?;
-        Some(Batch::new(
-            inputs,
-            &self.output,
-            self.model,
-            self.device,
-            overwrite,
-            self.output_kind(mode)?,
-        ))
+        let inputs = self.inputs()?;
+        let output = match self.source {
+            Source::Files => self.output.clone(),
+            Source::Url => OutputChoice::Custom(self.url_folder.as_ref()?.clone()),
+        };
+        Some(
+            Batch::new(
+                inputs,
+                &output,
+                self.model,
+                self.device,
+                overwrite,
+                self.output_kind(mode)?,
+            )
+            .map(|batch| batch.with_output_format(self.output_format)),
+        )
     }
 
     /// Remembers why the chosen files cannot be split together, to show it.
@@ -282,6 +623,163 @@ mod tests {
     use stem_split_core::{domain::Stem, job::SeparationRequest};
 
     use super::*;
+
+    #[test]
+    fn playlist_selection_controls_downloads_and_large_list_review() -> Result<(), Box<dyn Error>> {
+        use crate::{playlist::Panel, preview::State};
+        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        let directory = tempfile::tempdir()?;
+        for count in [4, 5, 6] {
+            let url = MediaUrl::new("https://example.org/list")?;
+            let mut form = Form::default();
+            form.set_source(Source::Url);
+            form.set_url(url.as_str().to_owned());
+            form.set_output_folder(directory.path());
+            form.show_preview(State::Ready(MediaInfo::Playlist {
+                title: "Playlist".to_owned(),
+                first: MediaItem::new("Track 0".to_owned(), url.clone()),
+                rest: (1..count)
+                    .map(|index| MediaItem::new(format!("Track {index}"), url.clone()))
+                    .collect(),
+            }));
+            assert_eq!(form.review_playlist(), count > 5);
+            assert!(
+                !form.review_playlist(),
+                "a visible list must not intercept another start"
+            );
+            form.set_playlist_panel(Panel::Open);
+            form.toggle_playlist_item(0);
+            let (selected, _) = form.url_request().ok_or("missing request")?;
+            assert_eq!(selected.items().count(), count - 1);
+            assert_eq!(
+                selected.items().next().map(MediaItem::title),
+                Some("Track 1")
+            );
+            for index in 1..count {
+                form.toggle_playlist_item(index);
+            }
+            assert_eq!(
+                form.start_block(Mode::Split),
+                Some(StartBlock::NoPlaylistItems)
+            );
+            assert!(form.url_request().is_none());
+            form.select_playlist(crate::playlist::Selection::All);
+            assert_eq!(
+                form.url_request().map(|(info, _)| info.items().count()),
+                Some(count)
+            );
+            form.select_playlist(crate::playlist::Selection::None);
+            assert!(form.url_request().is_none());
+            form.select_playlist(crate::playlist::Selection::All);
+            assert_eq!(form.start_block(Mode::Split), None);
+            form.set_url("https://example.org/other".to_owned());
+            assert!(form.playlist().is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_downloaded_playlist_item_enters_the_batch() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut downloaded = Vec::new();
+        for name in ["first.wav", "second.wav"] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"")?;
+            downloaded.push(InputFile::new(path)?);
+        }
+        let inputs = InputFiles::new(downloaded).ok_or("empty playlist")?;
+        let mut form = Form::default();
+        form.set_source(Source::Url);
+        form.set_url("https://example.org/playlist".to_owned());
+        form.set_output_folder(directory.path());
+        form.set_downloaded_inputs(inputs);
+        let jobs = requests(&form)?;
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.input().base_name())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(
+            jobs.iter()
+                .all(|job| job.output().path() == directory.path())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn url_requires_a_valid_link_and_an_explicit_folder() -> Result<(), std::io::Error> {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        form.set_source(Source::Url);
+        form.set_url("https://example.org/audio".to_owned());
+        assert_eq!(
+            form.start_block(Mode::Split),
+            Some(StartBlock::NoOutputFolder)
+        );
+        form.set_output_folder(directory.path());
+        assert_eq!(
+            form.start_block(Mode::Split),
+            Some(StartBlock::LoadingMetadata)
+        );
+        let url = stem_split_media::MediaUrl::new(form.url()).map_err(std::io::Error::other)?;
+        form.show_preview(crate::preview::State::Ready(
+            stem_split_media::MediaInfo::Single(stem_split_media::MediaItem::new(
+                "Track".to_owned(),
+                url,
+            )),
+        ));
+        assert_eq!(form.start_block(Mode::Split), None);
+        form.set_url("not a link".to_owned());
+        assert_eq!(form.start_block(Mode::Split), Some(StartBlock::InvalidUrl));
+        Ok(())
+    }
+
+    #[test]
+    fn changing_url_or_folder_discards_the_preloaded_input() -> Result<(), std::io::Error> {
+        let directory = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        let audio = directory.path().join("preloaded.wav");
+        fs::write(&audio, b"")?;
+        let input = InputFile::new(&audio).map_err(std::io::Error::other)?;
+        let mut form = Form::default();
+        form.set_source(Source::Url);
+        form.set_output_folder(directory.path());
+        form.set_url("https://example.org/first".to_owned());
+        form.set_downloaded_input(input.clone());
+        assert!(form.inputs().is_some());
+        form.set_url("https://example.org/second".to_owned());
+        assert!(form.inputs().is_none());
+        form.set_downloaded_input(input);
+        form.set_output_folder(other.path());
+        assert!(form.inputs().is_none());
+        assert!(audio.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn downloaded_audio_does_not_replace_the_local_file_selection() -> Result<(), std::io::Error> {
+        let directory = tempfile::tempdir()?;
+        let local = directory.path().join("local.wav");
+        let downloaded = directory.path().join("downloaded.wav");
+        fs::write(&local, b"")?;
+        fs::write(&downloaded, b"")?;
+        let mut form = Form::default();
+        form.set_inputs(std::slice::from_ref(&local));
+        form.set_source(Source::Url);
+        form.set_downloaded_input(InputFile::new(&downloaded).map_err(std::io::Error::other)?);
+        assert_eq!(
+            form.inputs().map(|inputs| inputs.first().path()),
+            Some(downloaded.as_path())
+        );
+        form.set_source(Source::Files);
+        assert_eq!(
+            form.inputs().map(|inputs| inputs.first().path()),
+            Some(local.as_path())
+        );
+        Ok(())
+    }
 
     fn audio(directory: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
         let path = directory.join(name);
@@ -307,6 +805,11 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let settings = Settings {
+            save_format: stem_split_media::SaveFormat::Mp3,
+            output_format: stem_split_core::domain::OutputFormat::Mp3,
+            source: Source::Files,
+            url_folder: None,
+            separation_panel: SeparationPanel::Expanded,
             locale: Locale::Ru,
             model: ModelId::HtdemucsFt,
             device: DevicePreference::Cpu,

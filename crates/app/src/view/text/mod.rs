@@ -83,9 +83,32 @@ closed_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Text {
         WindowTitle,
+        FileTab,
+        UrlTab,
+        Url,
+        ClearUrl,
+        ChooseFiles,
+        EnterUrl,
+        WaitForCache,
+        UrlPlaceholder,
+        UrlHint,
+        LoadingMetadata,
+        MetadataFailed,
+        Playlist,
+        PlaylistAll,
+        PlaylistNone,
+        PlaylistSelectionHint,
+        NoPlaylistItems,
+        InvalidUrl,
+        RequiredFolder,
         File,
         NoFileChosen,
         Browse,
+        Wav,
+        Mp3,
+        OriginalFormat,
+        SaveFormat,
+        OutputFormat,
         Output,
         OutputBesideFile,
         OutputOtherFolder,
@@ -97,6 +120,10 @@ closed_enum! {
         NothingDownloaded,
         Delete,
         Split,
+        Download,
+        SeparationSettings,
+        DownloadComplete,
+        DownloadFailed,
         SplitAndMix,
         NoStemsForMix,
         Stems,
@@ -137,6 +164,29 @@ impl Text {
             Locale::Ru => ru::text(self),
         }
     }
+}
+
+pub(crate) fn media_status(locale: Locale, progress: stem_split_media::Progress) -> String {
+    match locale {
+        Locale::En => en::media_status(progress),
+        Locale::Ru => ru::media_status(progress),
+    }
+}
+
+pub(crate) const fn start_block(locale: Locale, reason: crate::form::StartBlock) -> &'static str {
+    use crate::form::StartBlock;
+    let text = match reason {
+        StartBlock::LoadingMetadata => Text::LoadingMetadata,
+        StartBlock::MetadataFailed => Text::MetadataFailed,
+        StartBlock::NoPlaylistItems => Text::NoPlaylistItems,
+        StartBlock::NoFiles => Text::ChooseFiles,
+        StartBlock::NoUrl => Text::EnterUrl,
+        StartBlock::InvalidUrl => Text::InvalidUrl,
+        StartBlock::NoOutputFolder => Text::RequiredFolder,
+        StartBlock::NoMixStems => Text::NoStemsForMix,
+        StartBlock::ClearingCache => Text::WaitForCache,
+    };
+    text.get(locale)
 }
 
 /// Megabytes, rounded to the nearest whole one.
@@ -306,6 +356,41 @@ pub(crate) fn batch_time_status(locale: Locale, time: Clock) -> String {
 }
 
 /// How many files are chosen, next to the button that chose them.
+pub(crate) const fn output_format(
+    locale: Locale,
+    format: stem_split_core::domain::OutputFormat,
+) -> &'static str {
+    match format {
+        stem_split_core::domain::OutputFormat::Wav => Text::Wav.get(locale),
+        stem_split_core::domain::OutputFormat::Mp3 => Text::Mp3.get(locale),
+    }
+}
+
+pub(crate) const fn save_format(
+    locale: Locale,
+    format: stem_split_media::SaveFormat,
+) -> &'static str {
+    match format {
+        stem_split_media::SaveFormat::Original => Text::OriginalFormat.get(locale),
+        stem_split_media::SaveFormat::Wav => Text::Wav.get(locale),
+        stem_split_media::SaveFormat::Mp3 => Text::Mp3.get(locale),
+    }
+}
+
+pub(crate) fn playlist_selected(locale: Locale, selected: usize, total: usize) -> String {
+    match locale {
+        Locale::En => en::playlist_selected(selected, total),
+        Locale::Ru => ru::playlist_selected(selected, total),
+    }
+}
+
+pub(crate) fn playlist_count(locale: Locale, count: usize) -> String {
+    match locale {
+        Locale::En => en::playlist_count(count),
+        Locale::Ru => ru::playlist_count(count),
+    }
+}
+
 pub(crate) fn files_chosen(locale: Locale, count: NonZeroUsize) -> String {
     match locale {
         Locale::En => en::files_chosen(count.get()),
@@ -445,10 +530,14 @@ mod tests {
 
     #[test]
     fn languages_do_not_share_translations_by_accident() {
-        // Only the application name is the same everywhere.
+        // The application name and standard format names are language-independent.
         for &text in Text::ALL {
             let same = text.get(EN) == text.get(RU);
-            assert_eq!(same, text == Text::WindowTitle, "{text:?}");
+            assert_eq!(
+                same,
+                matches!(text, Text::WindowTitle | Text::Wav | Text::Mp3),
+                "{text:?}"
+            );
         }
     }
 
@@ -543,18 +632,23 @@ mod tests {
     }
 
     #[test]
-    fn clear_question_gives_the_size() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "project tests use Result even when their current setup is infallible"
+    )]
+    fn clear_question_gives_the_size() -> Result<(), io::Error> {
         let size = ByteCount::new(954_386_000);
         assert_eq!(
             clear_question(EN, size),
-            "The downloaded models take 954 MB. Delete them? \
-             Each one will be downloaded again the next time it is used."
+            "Cached models and download tools take 954 MB. Delete them? \
+             They will be downloaded again the next time they are used."
         );
         assert_eq!(
             clear_question(RU, size),
-            "Скачанные модели занимают 954 МБ. Удалить их? \
-             Каждая скачается заново, когда понадобится."
+            "Модели и инструменты загрузки в кэше занимают 954 МБ. Удалить их? \
+             Они скачаются заново, когда понадобятся."
         );
+        Ok(())
     }
 
     #[test]
@@ -700,6 +794,14 @@ mod tests {
     #[test]
     fn counts_of_files_agree_with_their_number() {
         let count = |n| NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
+        assert_eq!(playlist_selected(EN, 2, 5), "Selected: 2 of 5");
+        assert_eq!(playlist_selected(RU, 2, 5), "Выбрано: 2 из 5");
+        assert_eq!(playlist_count(EN, 1), "1 track");
+        assert_eq!(playlist_count(EN, 5), "5 tracks");
+        assert_eq!(playlist_count(RU, 1), "1 композиция");
+        assert_eq!(playlist_count(RU, 2), "2 композиции");
+        assert_eq!(playlist_count(RU, 11), "11 композиций");
+        assert_eq!(playlist_count(RU, 21), "21 композиция");
         assert_eq!(files_chosen(EN, count(3)), "3 files");
         assert_eq!(files_chosen(RU, count(2)), "2 файла");
         assert_eq!(files_chosen(RU, count(5)), "5 файлов");

@@ -26,6 +26,13 @@ use crate::{
 #[derive(Debug)]
 enum State {
     Waiting,
+    Downloading {
+        progress: stem_split_media::Progress,
+        started: Instant,
+    },
+    Downloaded {
+        took: Duration,
+    },
     Running {
         timing: Timing,
         progress: Option<Progress>,
@@ -70,15 +77,18 @@ pub(crate) enum RowStatus {
     Waiting,
     /// `None` until the job has said what it is doing.
     Working(Option<Progress>),
+    Downloading(stem_split_media::Progress),
+    Downloaded,
     Completed(ActiveDevice),
     Failed,
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Row<'a> {
     pub(crate) input: &'a Path,
     pub(crate) status: RowStatus,
+    pub(crate) failure: Option<&'a Failure>,
     /// The file's own time; `None` before it starts and once cancelled.
     pub(crate) clock: Option<Clock>,
 }
@@ -91,7 +101,7 @@ pub(crate) struct DownloadRow {
 }
 
 /// Everything the progress screen shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Overview<'a> {
     pub(crate) download: Option<DownloadRow>,
     pub(crate) rows: Vec<Row<'a>>,
@@ -102,6 +112,7 @@ pub(crate) struct Overview<'a> {
 /// How one file of a finished batch ended.
 #[derive(Debug)]
 pub(crate) enum Outcome {
+    Downloaded,
     Completed {
         output: SeparationOutput,
         took: Duration,
@@ -137,7 +148,12 @@ impl Results {
     pub(crate) fn completed(&self) -> usize {
         self.files
             .iter()
-            .filter(|file| matches!(file.outcome, Outcome::Completed { .. }))
+            .filter(|file| {
+                matches!(
+                    file.outcome,
+                    Outcome::Completed { .. } | Outcome::Downloaded
+                )
+            })
             .count()
     }
 }
@@ -171,6 +187,31 @@ fn count(value: usize) -> u64 {
 }
 
 impl Tracker {
+    pub(crate) fn for_url(
+        model: ModelId,
+        info: &stem_split_media::MediaInfo,
+        folder: &Path,
+        now: Instant,
+    ) -> Self {
+        Self {
+            started: now,
+            model,
+            download: None,
+            fetch_failure: None,
+            files: info
+                .items()
+                .map(|item| File {
+                    input: PathBuf::from(item.title()),
+                    folder: folder.to_path_buf(),
+                    state: State::Waiting,
+                    expected: None,
+                })
+                .collect(),
+            first_start: None,
+            lanes: NonZeroUsize::MIN,
+        }
+    }
+
     pub(crate) fn new(batch: &Batch, now: Instant) -> Self {
         Self {
             started: now,
@@ -191,9 +232,61 @@ impl Tracker {
         }
     }
 
+    pub(crate) fn name_sources<'a>(&mut self, sources: impl Iterator<Item = &'a Path>) {
+        for (file, source) in self.files.iter_mut().zip(sources) {
+            file.input = source.to_path_buf();
+        }
+    }
+
+    fn source_progress(
+        &mut self,
+        index: usize,
+        progress: stem_split_media::Progress,
+        now: Instant,
+    ) {
+        self.first_start.get_or_insert(now);
+        if let Some(file) = self.files.get_mut(index) {
+            let started = match file.state {
+                State::Downloading { started, .. } => started,
+                State::Waiting
+                | State::Downloaded { .. }
+                | State::Running { .. }
+                | State::Completed { .. }
+                | State::Failed { .. }
+                | State::Cancelled => now,
+            };
+            file.state = State::Downloading { progress, started };
+        }
+    }
+
+    fn source_finished(&mut self, index: usize, result: Result<PathBuf, Failure>, now: Instant) {
+        if let Some(file) = self.files.get_mut(index) {
+            let took = match file.state {
+                State::Downloading { started, .. } => now.saturating_duration_since(started),
+                State::Waiting
+                | State::Downloaded { .. }
+                | State::Running { .. }
+                | State::Completed { .. }
+                | State::Failed { .. }
+                | State::Cancelled => Duration::ZERO,
+            };
+            file.state = match result {
+                Ok(path) => {
+                    file.input = path;
+                    State::Downloaded { took }
+                }
+                Err(failure) => State::Failed { failure, took },
+            };
+        }
+    }
+
     /// Takes in an event that arrived at `now`.
     pub(crate) fn apply(&mut self, event: Event, now: Instant) {
         match event {
+            Event::SourceProgress(index, progress) => self.source_progress(index, progress, now),
+            Event::SourceFinished(index, result) => self.source_finished(index, result, now),
+            // Consumed by the screen transition before tracking begins.
+            Event::SourceReady(_, _) => {}
             Event::Expected(index, runs) => {
                 if let Some(file) = self.files.get_mut(index) {
                     file.expected = Some(count(runs.get()));
@@ -260,6 +353,8 @@ impl Tracker {
                     } => (timing.elapsed(now), *runs, *pace),
                     // Never started: its thread could not be created.
                     State::Waiting
+                    | State::Downloading { .. }
+                    | State::Downloaded { .. }
                     | State::Completed { .. }
                     | State::Failed { .. }
                     | State::Cancelled => (Duration::ZERO, None, None),
@@ -294,6 +389,20 @@ impl Tracker {
             .map(|file| {
                 let (status, clock) = match &file.state {
                     State::Waiting => (RowStatus::Waiting, None),
+                    State::Downloading { progress, started } => (
+                        RowStatus::Downloading(*progress),
+                        Some(Clock {
+                            elapsed: now.saturating_duration_since(*started),
+                            remaining: None,
+                        }),
+                    ),
+                    State::Downloaded { took } => (
+                        RowStatus::Downloaded,
+                        Some(Clock {
+                            elapsed: *took,
+                            remaining: None,
+                        }),
+                    ),
                     State::Running {
                         timing, progress, ..
                     } => (
@@ -322,6 +431,15 @@ impl Tracker {
                 Row {
                     input: &file.input,
                     status,
+                    failure: match &file.state {
+                        State::Failed { failure, .. } => Some(failure),
+                        State::Waiting
+                        | State::Downloading { .. }
+                        | State::Downloaded { .. }
+                        | State::Running { .. }
+                        | State::Completed { .. }
+                        | State::Cancelled => None,
+                    },
                     clock,
                 }
             })
@@ -343,7 +461,11 @@ impl Tracker {
             .iter()
             .filter_map(|file| match &file.state {
                 State::Running { pace, .. } | State::Completed { pace, .. } => *pace,
-                State::Waiting | State::Failed { .. } | State::Cancelled => None,
+                State::Waiting
+                | State::Downloading { .. }
+                | State::Downloaded { .. }
+                | State::Failed { .. }
+                | State::Cancelled => None,
             })
             .collect();
         // A file whose length is not known is taken to be as long as the
@@ -356,7 +478,10 @@ impl Tracker {
                     runs.or(file.expected)
                 }
                 State::Waiting => file.expected,
-                State::Failed { .. } | State::Cancelled => None,
+                State::Downloading { .. }
+                | State::Downloaded { .. }
+                | State::Failed { .. }
+                | State::Cancelled => None,
             })
             .collect();
         let average = u64::try_from(known.len())
@@ -412,12 +537,15 @@ impl Tracker {
             .map(|file| {
                 let outcome = match file.state {
                     State::Completed { output, took, .. } => Outcome::Completed { output, took },
+                    State::Downloaded { .. } => Outcome::Downloaded,
                     State::Failed { failure, .. } => Outcome::Failed(failure),
                     State::Cancelled => Outcome::Cancelled,
                     // Left out by a cancellation, unless the worker died.
-                    State::Waiting if !lost => Outcome::Cancelled,
+                    State::Waiting | State::Downloading { .. } if !lost => Outcome::Cancelled,
                     // A job that never reported its end.
-                    State::Waiting | State::Running { .. } => Outcome::Failed(Failure::Crashed),
+                    State::Waiting | State::Downloading { .. } | State::Running { .. } => {
+                        Outcome::Failed(Failure::Crashed)
+                    }
                 };
                 FileResult {
                     input: file.input,
@@ -452,6 +580,70 @@ mod tests {
     use super::*;
 
     const SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn downloads_keep_independent_progress_and_file_failures() -> Result<(), Box<dyn Error>> {
+        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        let directory = tempfile::tempdir()?;
+        let url = MediaUrl::new("https://example.org/item")?;
+        let info = MediaInfo::Playlist {
+            title: "List".to_owned(),
+            first: MediaItem::new("First".to_owned(), url.clone()),
+            rest: vec![MediaItem::new("Second".to_owned(), url)],
+        };
+        let now = Instant::now();
+        let mut tracker = Tracker::for_url(ModelId::Htdemucs, &info, directory.path(), now);
+        tracker.apply(
+            Event::SourceProgress(
+                0,
+                stem_split_media::Progress::Downloading {
+                    downloaded: 50,
+                    total: None,
+                },
+            ),
+            now,
+        );
+        assert!(matches!(
+            statuses(&tracker, now).as_slice(),
+            [RowStatus::Downloading(_), RowStatus::Waiting]
+        ));
+        tracker.apply(
+            Event::SourceFinished(
+                0,
+                Err(Failure::Media(stem_split_media::DownloadError::LiveStream)),
+            ),
+            now + SECOND,
+        );
+        tracker.apply(
+            Event::SourceProgress(1, stem_split_media::Progress::Inspecting),
+            now + SECOND,
+        );
+        assert!(matches!(
+            statuses(&tracker, now).as_slice(),
+            [RowStatus::Failed, RowStatus::Downloading(_)]
+        ));
+        tracker.apply(
+            Event::SourceFinished(1, Ok(directory.path().join("second.webm"))),
+            now + 2 * SECOND,
+        );
+        let End::Results(results) = tracker.finish(Channel::Ended, now + 2 * SECOND) else {
+            return Err("missing per-file results".into());
+        };
+        assert!(matches!(
+            results.files.as_slice(),
+            [
+                FileResult {
+                    outcome: Outcome::Failed(_),
+                    ..
+                },
+                FileResult {
+                    outcome: Outcome::Downloaded,
+                    ..
+                }
+            ]
+        ));
+        Ok(())
+    }
 
     fn tracker_for(
         directory: &Path,
@@ -621,6 +813,7 @@ mod tests {
             .files
             .iter()
             .map(|file| match file.outcome {
+                Outcome::Downloaded => "downloaded",
                 Outcome::Completed { .. } => "completed",
                 Outcome::Failed(_) => "failed",
                 Outcome::Cancelled => "cancelled",

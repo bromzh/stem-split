@@ -115,6 +115,10 @@ impl PartialFile {
         Ok((guard, file))
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.part
+    }
+
     pub(crate) fn target(&self) -> &Path {
         &self.target
     }

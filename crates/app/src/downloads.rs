@@ -107,6 +107,14 @@ impl Downloads {
         }
     }
 
+    /// Accepts a cache measurement made by the metadata worker.
+    pub(crate) fn record_usage(&mut self, measured: Usage) {
+        match &mut self.state {
+            State::Idle { usage, .. } => *usage = Some(measured),
+            State::Clearing(_) => {}
+        }
+    }
+
     /// Shows the folder in the file manager. A folder that does not exist
     /// yet has nothing to show; the form offers no way to ask for it.
     pub(crate) fn open_folder(&mut self) {

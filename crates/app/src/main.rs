@@ -9,6 +9,8 @@ mod dialogs;
 mod downloads;
 mod form;
 mod logging;
+mod playlist;
+mod preview;
 mod settings;
 mod timing;
 mod tracker;
@@ -49,8 +51,9 @@ fn run() -> eframe::Result {
                 width: ICON_SIZE,
                 height: ICON_SIZE,
             })
-            .with_inner_size([640.0, 520.0])
-            .with_min_inner_size([520.0, 440.0]),
+            .with_inner_size(view::INITIAL_WINDOW_SIZE)
+            .with_min_inner_size([1.0, 1.0])
+            .with_clamp_size_to_monitor_size(true),
         ..Default::default()
     };
     eframe::run_native(

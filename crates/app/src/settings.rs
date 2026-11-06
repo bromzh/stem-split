@@ -1,22 +1,57 @@
 //! Choices remembered between launches.
 
 use stem_split_core::{
-    domain::{EnhancerId, ModelId, OutputChoice, OutputDir, Stem, StemSet},
+    domain::{EnhancerId, ModelId, OutputChoice, OutputDir, OutputFormat, Stem, StemSet},
     separate::DevicePreference,
 };
 
-use crate::view::text::Locale;
+use crate::{form::Source, view::text::Locale};
+
+const SAVE_FORMAT: &str = "save_format";
+const RESULT_FORMAT: &str = "result_format";
 
 const LOCALE: &str = "locale";
 const MODEL: &str = "model";
 const DEVICE: &str = "device";
 const OUTPUT_FOLDER: &str = "output_folder";
+const URL_OUTPUT_FOLDER: &str = "url_output_folder";
+const SOURCE_TAB: &str = "source_tab";
+const SEPARATION_PANEL: &str = "separation_panel";
 const MIX_STEMS: &str = "mix_stems";
 const KEEP_STEMS: &str = "keep_stems";
 const CLEANUP: &str = "cleanup";
 const CLEANUP_STEMS: &str = "cleanup_stems";
 const CLEANUP_MIX: &str = "cleanup_mix";
 const ENHANCER: &str = "enhancer";
+
+/// Whether the separation controls are visible on the input form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeparationPanel {
+    Collapsed,
+    Expanded,
+}
+
+impl SeparationPanel {
+    pub(crate) const fn toggled(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Expanded,
+            Self::Expanded => Self::Collapsed,
+        }
+    }
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+        }
+    }
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "collapsed" => Some(Self::Collapsed),
+            "expanded" => Some(Self::Expanded),
+            _ => None,
+        }
+    }
+}
 
 /// How a mix is made: from which stems, and whether the stems are saved
 /// as well.
@@ -75,9 +110,14 @@ impl CleanupChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub(crate) locale: Locale,
+    pub(crate) save_format: stem_split_media::SaveFormat,
+    pub(crate) output_format: OutputFormat,
     pub(crate) model: ModelId,
     pub(crate) device: DevicePreference,
     pub(crate) output: OutputChoice,
+    pub(crate) source: Source,
+    pub(crate) url_folder: Option<OutputDir>,
+    pub(crate) separation_panel: SeparationPanel,
     pub(crate) mix: MixChoice,
     pub(crate) cleanup: CleanupChoice,
 }
@@ -133,9 +173,14 @@ impl Settings {
     pub(crate) fn initial() -> Self {
         Self {
             locale: Locale::of_system(),
+            save_format: stem_split_media::SaveFormat::Original,
+            output_format: OutputFormat::Wav,
             model: ModelId::default(),
             device: DevicePreference::default(),
             output: OutputChoice::default(),
+            source: Source::Files,
+            url_folder: None,
+            separation_panel: SeparationPanel::Expanded,
             mix: MixChoice::initial(),
             cleanup: CleanupChoice::initial(),
         }
@@ -150,7 +195,23 @@ impl Settings {
     pub(crate) fn load(storage: &dyn eframe::Storage) -> Self {
         let initial = Self::initial();
         let read = |key| storage.get_string(key);
+        let legacy = read(SOURCE_TAB).is_none();
         Self {
+            save_format: read(SAVE_FORMAT)
+                .and_then(|key| stem_split_media::SaveFormat::from_key(&key))
+                .unwrap_or_default(),
+            output_format: read(RESULT_FORMAT)
+                .and_then(|key| OutputFormat::from_key(&key))
+                .unwrap_or_default(),
+            source: read(SOURCE_TAB)
+                .and_then(|key| Source::from_key(&key))
+                .unwrap_or(Source::Files),
+            separation_panel: read(SEPARATION_PANEL)
+                .and_then(|key| SeparationPanel::from_key(&key))
+                .unwrap_or(SeparationPanel::Expanded),
+            url_folder: read(URL_OUTPUT_FOLDER)
+                .or_else(|| if legacy { read(OUTPUT_FOLDER) } else { None })
+                .and_then(|path| OutputDir::new(path).ok()),
             locale: read(LOCALE)
                 .and_then(|code| Locale::from_code(&code))
                 .unwrap_or(initial.locale),
@@ -204,6 +265,18 @@ impl Settings {
     }
 
     pub(crate) fn save(&self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(SAVE_FORMAT, self.save_format.key().to_owned());
+        storage.set_string(RESULT_FORMAT, self.output_format.extension().to_owned());
+        storage.set_string(SEPARATION_PANEL, self.separation_panel.key().to_owned());
+        storage.set_string(SOURCE_TAB, self.source.key().to_owned());
+        match self
+            .url_folder
+            .as_ref()
+            .and_then(|folder| folder.path().to_str())
+        {
+            Some(path) => storage.set_string(URL_OUTPUT_FOLDER, path.to_owned()),
+            None => storage.remove_string(URL_OUTPUT_FOLDER),
+        }
         storage.set_string(LOCALE, self.locale.code().to_owned());
         storage.set_string(MODEL, self.model.name().to_owned());
         storage.set_string(DEVICE, device_key(self.device).to_owned());
@@ -264,6 +337,54 @@ mod tests {
     }
 
     #[test]
+    fn tabs_and_folders_survive_without_files_or_url_text() -> Result<(), std::io::Error> {
+        use crate::form::Form;
+        let directory = tempfile::tempdir()?;
+        let files_folder = directory.path().join("files");
+        let url_folder = directory.path().join("urls");
+        std::fs::create_dir(&files_folder)?;
+        std::fs::create_dir(&url_folder)?;
+        let input = directory.path().join("private-track.wav");
+        std::fs::write(&input, b"")?;
+        let mut form = Form::default();
+        form.set_inputs(std::slice::from_ref(&input));
+        form.set_output_folder(&files_folder);
+        form.select_no_stems();
+        form.toggle_stem(Stem::Bass);
+        form.set_source(Source::Url);
+        form.set_separation_panel(SeparationPanel::Collapsed);
+        form.set_url("https://example.org/private-track".to_owned());
+        form.set_output_folder(&url_folder);
+        let mut storage = MemoryStorage::default();
+        form.settings(Locale::Ru).save(&mut storage);
+
+        let mut restored = Form::with(&Settings::load(&storage));
+        assert_eq!(restored.source(), Source::Url);
+        assert_eq!(restored.separation_panel(), SeparationPanel::Collapsed);
+        assert_eq!(restored.url(), "");
+        assert!(restored.inputs().is_none());
+        assert_eq!(
+            restored.url_folder().map(OutputDir::path),
+            Some(url_folder.as_path())
+        );
+        assert_eq!(restored.mix_stems(), form.mix_stems());
+        restored.set_source(Source::Files);
+        assert!(restored.inputs().is_none());
+        let saved_folder = match restored.output() {
+            OutputChoice::BesideInput => None,
+            OutputChoice::Custom(folder) => Some(folder.path()),
+        };
+        assert_eq!(saved_folder, Some(files_folder.as_path()));
+        assert!(
+            storage
+                .0
+                .values()
+                .all(|value| !value.contains("private-track"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn empty_storage_gives_the_initial_settings() {
         assert_eq!(
             Settings::load(&MemoryStorage::default()),
@@ -278,6 +399,11 @@ mod tests {
     fn saved_settings_are_read_back() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let settings = Settings {
+            save_format: stem_split_media::SaveFormat::Mp3,
+            output_format: stem_split_core::domain::OutputFormat::Mp3,
+            source: Source::Url,
+            url_folder: Some(OutputDir::new(directory.path())?),
+            separation_panel: SeparationPanel::Expanded,
             locale: Locale::Ru,
             model: ModelId::Htdemucs6s,
             device: DevicePreference::Cpu,
@@ -298,6 +424,22 @@ mod tests {
         settings.save(&mut storage);
 
         assert_eq!(Settings::load(&storage), settings);
+        for &source in stem_split_media::SaveFormat::ALL {
+            for &result in OutputFormat::ALL {
+                let mut choices = settings.clone();
+                choices.save_format = source;
+                choices.output_format = result;
+                choices.save(&mut storage);
+                assert_eq!(Settings::load(&storage), choices);
+            }
+        }
+        storage.set_string(SAVE_FORMAT, "unsupported".to_owned());
+        storage.set_string(RESULT_FORMAT, "unsupported".to_owned());
+        assert_eq!(
+            Settings::load(&storage).save_format,
+            stem_split_media::SaveFormat::Original
+        );
+        assert_eq!(Settings::load(&storage).output_format, OutputFormat::Wav);
         Ok(())
     }
 

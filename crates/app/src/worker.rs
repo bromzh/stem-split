@@ -19,13 +19,17 @@ use eframe::egui;
 use stem_split_core::{
     CancelToken,
     batch::Batch,
+    domain::OutputDir,
     job::{self, JobEnd, JobError, Progress, ProgressSink, SeparationRequest},
     model::{DownloadProgress, Ensured, ModelStore},
 };
 
+use crate::form::UrlAction;
+
 /// Why a file was not split.
 #[derive(Debug)]
 pub(crate) enum Failure {
+    Media(stem_split_media::DownloadError),
     Job(JobError),
     /// A thread could not be created.
     NotStarted(io::Error),
@@ -38,6 +42,9 @@ pub(crate) enum Failure {
 /// batch.
 #[derive(Debug)]
 pub(crate) enum Event {
+    SourceProgress(usize, stem_split_media::Progress),
+    SourceFinished(usize, Result<std::path::PathBuf, Failure>),
+    SourceReady(Vec<stem_split_media::DownloadedAudio>, UrlAction),
     /// How many model runs a file will take, as far as its stated length
     /// tells; reported for every file whose length is known, before any
     /// file starts.
@@ -91,6 +98,87 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+    /// Downloads source items; the UI hands the set to the existing batch path.
+    pub(crate) fn start_url(
+        info: stem_split_media::MediaInfo,
+        folder: OutputDir,
+        format: stem_split_media::SaveFormat,
+        action: UrlAction,
+        repaint: egui::Context,
+    ) -> io::Result<Self> {
+        let (sender, messages) = mpsc::channel();
+        let cancel = CancelToken::new();
+        let token = cancel.clone();
+        let thread = thread::Builder::new()
+            .name("media download".to_owned())
+            .spawn(move || {
+                let report = |event| {
+                    if sender.send(Message::Event(event)).is_err() {
+                        token.cancel();
+                    }
+                    repaint.request_repaint();
+                };
+                match ModelStore::in_user_cache() {
+                    Ok(store) => {
+                        let result = stem_split_media::download(
+                            &info,
+                            &folder,
+                            store.directory(),
+                            format,
+                            |event| match event {
+                                stem_split_media::DownloadEvent::Progress(index, progress) => {
+                                    report(Event::SourceProgress(index, progress));
+                                }
+                                stem_split_media::DownloadEvent::Finished(index, result) => report(
+                                    Event::SourceFinished(index, result.map_err(Failure::Media)),
+                                ),
+                            },
+                            &token,
+                        );
+                        match result {
+                            Ok(stem_split_media::Downloaded::Ready(input)) => {
+                                report(Event::SourceReady(input, action));
+                            }
+                            Ok(stem_split_media::Downloaded::Cancelled) => {}
+                            Err(error) => {
+                                for (index, _) in info.items().enumerate() {
+                                    report(Event::SourceFinished(
+                                        index,
+                                        Err(Failure::Media(
+                                            stem_split_media::DownloadError::Process(
+                                                error.to_string(),
+                                            ),
+                                        )),
+                                    ));
+                                }
+                                report(Event::SourceReady(Vec::new(), action));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for (index, _) in info.items().enumerate() {
+                            report(Event::SourceFinished(
+                                index,
+                                Err(Failure::Media(stem_split_media::DownloadError::Process(
+                                    error.to_string(),
+                                ))),
+                            ));
+                        }
+                        report(Event::SourceReady(Vec::new(), action));
+                    }
+                }
+                match sender.send(Message::Ended) {
+                    Ok(()) | Err(_) => {}
+                }
+                repaint.request_repaint();
+            })?;
+        Ok(Self {
+            messages,
+            cancel,
+            thread,
+        })
+    }
+
     /// Starts `batch`. `repaint` is asked to redraw the window whenever
     /// there is news, since an idle window does not redraw.
     pub(crate) fn start(batch: Batch, repaint: egui::Context) -> io::Result<Self> {
@@ -116,13 +204,7 @@ impl Worker {
                     }
                 }
                 match ModelStore::in_user_cache() {
-                    Ok(store) => run_batch(
-                        &batch,
-                        |on_progress| fetch(&store, &batch, on_progress, &token),
-                        &|request, sink| job::run(request, &store, sink, &token),
-                        &report,
-                        &token,
-                    ),
+                    Ok(store) => run_encoded_batch(&batch, &store, &report, &token),
                     Err(error) => report(Event::FetchFailed(Failure::Job(error.into()))),
                 }
                 // If the window is gone, there is nobody left to tell.
@@ -215,6 +297,44 @@ fn fetch(
 /// `batch`, [`Batch::parallel_jobs`] at a time, in the order of the batch.
 /// Stops starting files once `cancel` is set, and returns when every started
 /// job has ended.
+fn run_encoded_batch(
+    batch: &Batch,
+    store: &ModelStore,
+    report: &(impl Fn(Event) + Sync),
+    cancel: &CancelToken,
+) {
+    use stem_split_core::{
+        audio::{AudioEncoder, WavOnly},
+        domain::OutputFormat,
+    };
+    let compressed = match batch.output_format() {
+        OutputFormat::Wav => None,
+        OutputFormat::Mp3 => match stem_split_media::FfmpegEncoder::in_cache(
+            store.directory(),
+            |progress| report(Event::SourceProgress(0, progress)),
+            cancel,
+        ) {
+            Ok(Some(encoder)) => Some(encoder),
+            Ok(None) => return,
+            Err(error) => {
+                report(Event::FetchFailed(Failure::Media(error)));
+                return;
+            }
+        },
+    };
+    let encoder: &dyn AudioEncoder = match &compressed {
+        Some(encoder) => encoder,
+        None => &WavOnly,
+    };
+    run_batch(
+        batch,
+        |on_progress| fetch(store, batch, on_progress, cancel),
+        &|request, sink| job::run_with_encoder(request, store, sink, cancel, encoder),
+        report,
+        cancel,
+    );
+}
+
 fn run_batch<F, J>(
     batch: &Batch,
     fetch: F,
@@ -343,6 +463,9 @@ mod tests {
             .filter_map(|event| match event {
                 Event::Started(index) => Some(*index),
                 Event::Expected(..)
+                | Event::SourceProgress(..)
+                | Event::SourceReady(..)
+                | Event::SourceFinished(..)
                 | Event::Fetching(_)
                 | Event::FetchFailed(_)
                 | Event::Progress(..)
@@ -357,6 +480,9 @@ mod tests {
             .filter_map(|event| match event {
                 Event::Finished(index, _) => Some(*index),
                 Event::Expected(..)
+                | Event::SourceProgress(..)
+                | Event::SourceReady(..)
+                | Event::SourceFinished(..)
                 | Event::Fetching(_)
                 | Event::FetchFailed(_)
                 | Event::Started(_)
@@ -459,6 +585,9 @@ mod tests {
                     Some((*index, matches!(outcome, Err(Failure::Crashed))))
                 }
                 Event::Expected(..)
+                | Event::SourceProgress(..)
+                | Event::SourceReady(..)
+                | Event::SourceFinished(..)
                 | Event::Fetching(_)
                 | Event::FetchFailed(_)
                 | Event::Started(_)

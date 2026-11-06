@@ -2,7 +2,7 @@
 
 use std::{
     io, mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -12,14 +12,14 @@ use stem_split_core::{batch::Batch, domain::OverwritePolicy, model::ModelStore};
 use crate::{
     dialogs,
     downloads::{Downloads, Polled},
-    form::{Form, Mode},
+    form::{Form, Mode, Source, UrlAction},
     settings::Settings,
-    tracker::{End, Results, Tracker},
+    tracker::{End, Outcome, Results, Tracker},
     view::{
         self, ConfirmingAction, DoneAction, EditingAction, FailedAction, RunningAction, Stopping,
         text::Locale,
     },
-    worker::{Channel, Failure, Worker},
+    worker::{Channel, Event, Failure, Worker},
 };
 
 /// How long closing the window waits for running jobs to clean up after
@@ -126,7 +126,15 @@ impl Screen {
 }
 
 #[derive(Debug)]
+enum WindowSizing {
+    Opening,
+    Following,
+    PlaylistPanel,
+}
+
+#[derive(Debug)]
 pub(crate) struct StemSplitApp {
+    window_sizing: WindowSizing,
     locale: Locale,
     /// What the form shows about the model store: whether a model still has
     /// to be downloaded, and how much the downloaded ones take. Jobs open
@@ -152,6 +160,7 @@ impl StemSplitApp {
         form.refresh_download(downloads.as_ref().map(Downloads::store));
         form.set_inputs(inputs);
         Self {
+            window_sizing: WindowSizing::Opening,
             locale: settings.locale,
             downloads,
             screen: Screen::Editing(form),
@@ -160,6 +169,46 @@ impl StemSplitApp {
 
     fn store(&self) -> Option<&ModelStore> {
         self.downloads.as_ref().map(Downloads::store)
+    }
+
+    fn fit_window(&mut self, context: &egui::Context, required: egui::Vec2) {
+        if context.will_discard() {
+            return;
+        }
+        let fallback = context.content_rect().size();
+        let (current, limit, expanded) = context.input(|input| {
+            let viewport = input.viewport();
+            let current = viewport.inner_rect.map_or(fallback, |rect| rect.size());
+            let decoration = viewport
+                .outer_rect
+                .zip(viewport.inner_rect)
+                .map_or(egui::vec2(0.0, 32.0), |(outer, inner)| {
+                    (outer.size() - inner.size()).max(egui::Vec2::ZERO)
+                });
+            let limit = viewport
+                .monitor_size
+                .map_or(required.max(current), |monitor| {
+                    (monitor - decoration - egui::vec2(24.0, 64.0)).max(egui::Vec2::splat(1.0))
+                });
+            (
+                current,
+                limit,
+                viewport.maximized == Some(true) || viewport.fullscreen == Some(true),
+            )
+        });
+        let minimum = required.min(limit).floor();
+        context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(minimum));
+        let target = match self.window_sizing {
+            WindowSizing::Opening => minimum,
+            WindowSizing::PlaylistPanel => {
+                egui::vec2(minimum.x, current.y.max(minimum.y).min(limit.y))
+            }
+            WindowSizing::Following => current.max(minimum).min(limit),
+        };
+        if !expanded && (target - current).length() > 0.5 {
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+        }
+        self.window_sizing = WindowSizing::Following;
     }
 
     /// Whether downloaded models are being deleted right now. No batch may
@@ -172,8 +221,16 @@ impl StemSplitApp {
     fn step(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, screen: Screen) -> Screen {
         let locale = self.locale;
         match screen {
-            Screen::Editing(form) => {
-                match view::editing(ui, locale, &form, self.downloads.as_ref()) {
+            Screen::Editing(mut form) => {
+                form.poll_preview(ui.ctx(), !self.clearing());
+                if let Some(usage) = form.take_preview_usage()
+                    && let Some(downloads) = &mut self.downloads
+                {
+                    downloads.record_usage(usage);
+                }
+                let editing = view::editing(ui, locale, &form, self.downloads.as_ref());
+                self.fit_window(ui.ctx(), editing.minimum);
+                match editing.action {
                     Some(action) => self.edit(form, action, ui.ctx(), frame),
                     None => Screen::Editing(form),
                 }
@@ -184,7 +241,7 @@ impl StemSplitApp {
                 existing,
             } => match view::confirming(ui, locale, &existing) {
                 Some(ConfirmingAction::Replace) => {
-                    prepare(form, mode, OverwritePolicy::Replace, ui.ctx())
+                    prepare_batch(form, mode, OverwritePolicy::Replace, ui.ctx())
                 }
                 Some(ConfirmingAction::Back) => Screen::Editing(form),
                 None => Screen::Confirming {
@@ -214,6 +271,46 @@ impl StemSplitApp {
         frame: &eframe::Frame,
     ) -> Screen {
         match action {
+            EditingAction::PlaylistPanel(panel) => {
+                form.set_playlist_panel(panel);
+                self.window_sizing = WindowSizing::PlaylistPanel;
+            }
+            EditingAction::PlaylistSelection(selection) => form.select_playlist(selection),
+            EditingAction::PlaylistItem(index) => form.toggle_playlist_item(index),
+            EditingAction::SaveFormat(format) => form.set_save_format(format),
+            EditingAction::OutputFormat(format) => form.set_output_format(format),
+            EditingAction::Download => {
+                if self.clearing() {
+                    return Screen::Editing(form);
+                }
+                return prepare_url(form, UrlAction::Download, context);
+            }
+            EditingAction::Source(source) => {
+                let panel_was_visible = form.source() == Source::Url
+                    && form.playlist().is_some_and(|(_, choices)| {
+                        choices.panel() == crate::playlist::Panel::Open
+                    });
+                form.set_source(source);
+                if panel_was_visible && source == Source::Files {
+                    self.window_sizing = WindowSizing::PlaylistPanel;
+                }
+                if form.separation_panel() == crate::settings::SeparationPanel::Collapsed {
+                    self.window_sizing = WindowSizing::Opening;
+                }
+            }
+            EditingAction::SeparationPanel(panel) => {
+                form.set_separation_panel(panel);
+                self.window_sizing = WindowSizing::Opening;
+            }
+            EditingAction::Url(url) => {
+                let panel_was_open = form
+                    .playlist()
+                    .is_some_and(|(_, choices)| choices.panel() == crate::playlist::Panel::Open);
+                form.set_url(url);
+                if panel_was_open {
+                    self.window_sizing = WindowSizing::PlaylistPanel;
+                }
+            }
             EditingAction::PickInputs => {
                 if let Some(paths) = dialogs::pick_audio_files(self.locale, frame) {
                     form.set_inputs(&paths);
@@ -242,6 +339,10 @@ impl StemSplitApp {
                 }
             }
             EditingAction::ClearDownloads => {
+                if form.preview_busy() {
+                    return Screen::Editing(form);
+                }
+                form.cancel_preview();
                 if let Some(downloads) = &mut self.downloads {
                     downloads.clear(context);
                 }
@@ -262,6 +363,37 @@ impl StemSplitApp {
         let now = Instant::now();
         let polled = run.worker.poll();
         for event in polled.events {
+            if let Event::SourceReady(input, action) = event {
+                let mut form = run.form;
+                let results = match run.tracker.finish(Channel::Ended, now) {
+                    End::Results(results) => results,
+                    End::Cancelled => Results {
+                        files: Vec::new(),
+                        took: Duration::ZERO,
+                    },
+                    End::NotFetched(failure) => return Screen::Failed { form, failure },
+                };
+                if let Some(downloads) = &mut self.downloads {
+                    downloads.refresh();
+                }
+                let mode = match action {
+                    UrlAction::Download => return source_done(form, input, results),
+                    UrlAction::Separate(mode) => mode,
+                };
+                if input.is_empty() {
+                    return source_done(form, input, results);
+                }
+                let failures = results
+                    .files
+                    .into_iter()
+                    .filter(|file| matches!(file.outcome, Outcome::Failed(_) | Outcome::Cancelled))
+                    .collect();
+                form.set_downloads(input, failures);
+                if run.stopping == Stopping::Requested {
+                    return Screen::Editing(form);
+                }
+                return prepare_batch(form, mode, OverwritePolicy::Refuse, ui.ctx());
+            }
             run.tracker.apply(event, now);
         }
         match polled.channel {
@@ -289,19 +421,87 @@ impl StemSplitApp {
         match run.tracker.finish(polled.channel, now) {
             End::NotFetched(failure) => Screen::Failed { form, failure },
             End::Cancelled => Screen::Editing(form),
-            End::Results(results) => Screen::Done(Finished {
-                form,
-                results,
-                problem: None,
-            }),
+            End::Results(mut results) => {
+                results.files.extend(form.take_download_failures());
+                Screen::Done(Finished {
+                    form,
+                    results,
+                    problem: None,
+                })
+            }
         }
     }
+}
+
+fn source_done(
+    mut form: Form,
+    input: Vec<stem_split_media::DownloadedAudio>,
+    results: Results,
+) -> Screen {
+    form.set_downloads(input, Vec::new());
+    if results.files.is_empty() {
+        return Screen::Editing(form);
+    }
+    Screen::Done(Finished {
+        form,
+        results,
+        problem: None,
+    })
 }
 
 /// Starts the batch the form describes for `mode`, unless its files clash
 /// or results of an earlier run are in the way and `overwrite` does not
 /// allow replacing them, in which case the user is asked first.
 fn prepare(
+    mut form: Form,
+    mode: Mode,
+    overwrite: OverwritePolicy,
+    context: &egui::Context,
+) -> Screen {
+    match form.source() {
+        Source::Files => prepare_batch(form, mode, overwrite, context),
+        Source::Url => {
+            if form.review_playlist() {
+                return Screen::Editing(form);
+            }
+            if form.inputs().is_some_and(|inputs| {
+                inputs.iter().all(|input| input.path().is_file())
+                    && form.download_sources().all(Path::is_file)
+            }) {
+                return prepare_batch(form, mode, overwrite, context);
+            }
+            prepare_url(form, UrlAction::Separate(mode), context)
+        }
+    }
+}
+
+fn prepare_url(mut form: Form, action: UrlAction, context: &egui::Context) -> Screen {
+    let Some((url, folder)) = form.url_request() else {
+        return Screen::Editing(form);
+    };
+    if action == UrlAction::Separate(Mode::SplitAndMix) && !form.can_mix() {
+        return Screen::Editing(form);
+    }
+    if form.review_playlist() {
+        return Screen::Editing(form);
+    }
+    form.cancel_preview();
+    let tracker = Tracker::for_url(form.model(), &url, folder.path(), Instant::now());
+    match Worker::start_url(url, folder, form.save_format(), action, context.clone()) {
+        Ok(worker) => Screen::Running(Box::new(Run {
+            form,
+            worker,
+            tracker,
+            stopping: Stopping::No,
+        })),
+        Err(error) => Screen::Failed {
+            form,
+            failure: Failure::NotStarted(error),
+        },
+    }
+}
+
+fn prepare_batch(
     mut form: Form,
     mode: Mode,
     overwrite: OverwritePolicy,
@@ -341,14 +541,27 @@ fn show_finished(ui: &mut egui::Ui, locale: Locale, mut finished: Finished) -> S
             }
             Screen::Done(finished)
         }
-        Some(DoneAction::Back) => Screen::Editing(finished.form),
+        Some(DoneAction::Back) => {
+            finished.form.remember_download_failures(
+                finished
+                    .results
+                    .files
+                    .into_iter()
+                    .filter(|file| matches!(file.outcome, Outcome::Failed(Failure::Media(_))))
+                    .collect(),
+            );
+            Screen::Editing(finished.form)
+        }
         None => Screen::Done(finished),
     }
 }
 
 /// Starts the batch and shows its progress, or the reason it could not start.
 fn launch(form: Form, batch: Batch, context: &egui::Context) -> Screen {
-    let tracker = Tracker::new(&batch, Instant::now());
+    let mut tracker = Tracker::new(&batch, Instant::now());
+    if form.source() == Source::Url {
+        tracker.name_sources(form.download_sources());
+    }
     match Worker::start(batch, context.clone()) {
         Ok(worker) => Screen::Running(Box::new(Run {
             form,
@@ -415,6 +628,7 @@ impl eframe::App for StemSplitApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.screen.form_mut().stop_preview(EXIT_PATIENCE);
         match mem::take(&mut self.screen) {
             // Give the jobs the chance to remove their unfinished files.
             Screen::Running(run) => run.worker.stop(EXIT_PATIENCE),
@@ -433,6 +647,90 @@ mod tests {
     use stem_split_core::domain::InputFile;
 
     use super::*;
+
+    #[test]
+    fn every_url_start_reviews_a_large_playlist_before_starting_a_worker()
+    -> Result<(), Box<dyn Error>> {
+        use crate::{playlist::Panel, preview::State};
+        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        let directory = tempfile::tempdir()?;
+        let context = egui::Context::default();
+        for action in [
+            UrlAction::Download,
+            UrlAction::Separate(Mode::Split),
+            UrlAction::Separate(Mode::SplitAndMix),
+        ] {
+            let url = MediaUrl::new("https://example.org/playlist")?;
+            let mut form = Form::default();
+            form.set_source(Source::Url);
+            form.set_url(url.as_str().to_owned());
+            form.set_output_folder(directory.path());
+            form.select_all_stems();
+            form.show_preview(State::Ready(MediaInfo::Playlist {
+                title: "Playlist".to_owned(),
+                first: MediaItem::new("First".to_owned(), url.clone()),
+                rest: (1..6)
+                    .map(|number| MediaItem::new(format!("Track {number}"), url.clone()))
+                    .collect(),
+            }));
+            let next = match action {
+                UrlAction::Download => prepare_url(form, action, &context),
+                UrlAction::Separate(mode) => prepare(form, mode, OverwritePolicy::Refuse, &context),
+            };
+            let Screen::Editing(form) = next else {
+                return Err("start bypassed playlist review".into());
+            };
+            assert_eq!(
+                form.playlist().map(|(_, choices)| choices.panel()),
+                Some(Panel::Open)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn window_minimum_is_limited_by_a_small_monitor() -> Result<(), io::Error> {
+        let context = egui::Context::default();
+        let mut application = StemSplitApp {
+            locale: Locale::En,
+            downloads: None,
+            screen: Screen::default(),
+            window_sizing: WindowSizing::Opening,
+        };
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+        viewport.monitor_size = Some(egui::vec2(400.0, 300.0));
+        viewport.inner_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 540.0),
+        ));
+        viewport.outer_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 572.0),
+        ));
+        let output = context.run_ui(input, |ui| {
+            application.fit_window(ui.ctx(), egui::vec2(640.0, 600.0));
+        });
+        let viewport = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .ok_or_else(|| io::Error::other("root viewport output is absent"))?;
+        let sizes: Vec<_> = viewport
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::ViewportCommand::MinInnerSize(size)
+                | egui::ViewportCommand::InnerSize(size) => Some(size),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes.len(), 2);
+        for size in sizes {
+            assert!(size.x > 0.0 && size.x < 400.0 && size.y > 0.0 && size.y < 300.0);
+        }
+        output.drop_without_applying_deltas();
+        Ok(())
+    }
 
     fn audio_file(directory: &Path, name: &str) -> Result<PathBuf, io::Error> {
         let path = directory.join(name);

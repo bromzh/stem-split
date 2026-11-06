@@ -25,16 +25,8 @@ use crate::{
 /// responsive.
 pub const PARALLEL_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
 
-/// How many files with a cleanup are split at the same time: one.
-///
-/// A cleanup session takes 2.3 GB (`vocal_bleed`) to 3.6 GB (`reverb_hq`)
-/// of the card's memory, against 1.4 GB for a separation one. Measured on
-/// the 6 GB target card with two copies of a 5:50 track, a mix of drums and
-/// bass cleaned stem by stem and as a mix: with `reverb_hq` two at once took
-/// 620 s against 154 s one after the other, the card full to 5.9 GB; with
-/// `vocal_bleed` 120 s against 142 s. One rule for both keeps a card with
-/// less memory from the fourfold slowdown.
-pub const PARALLEL_JOBS_WITH_CLEANUP: NonZeroUsize = NonZeroUsize::MIN;
+/// Cleanup uses the same two-file concurrency requested for separation.
+pub const PARALLEL_JOBS_WITH_CLEANUP: NonZeroUsize = PARALLEL_JOBS;
 
 /// Two of the chosen files would produce stem files with the same names.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -147,6 +139,22 @@ impl Batch {
         self.first.output_kind().enhancer()
     }
 
+    #[must_use]
+    pub fn with_output_format(mut self, format: crate::domain::OutputFormat) -> Self {
+        self.first = self.first.with_output_format(format);
+        self.rest = self
+            .rest
+            .into_iter()
+            .map(|request| request.with_output_format(format))
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub const fn output_format(&self) -> crate::domain::OutputFormat {
+        self.first.output_format()
+    }
+
     /// How many jobs run at the same time.
     #[must_use]
     pub const fn parallel_jobs(&self) -> NonZeroUsize {
@@ -242,6 +250,19 @@ mod tests {
         assert_eq!(single.parallel_jobs().get(), 1);
         assert_eq!(single.first.cpu_threads(), CpuThreads::all());
         assert_eq!(several.parallel_jobs(), PARALLEL_JOBS);
+        for enhancer in crate::domain::EnhancerId::ALL {
+            let cleanup = Batch::new(
+                &three,
+                &OutputChoice::BesideInput,
+                ModelId::Htdemucs,
+                DevicePreference::Auto,
+                OverwritePolicy::Refuse,
+                OutputKind::Stems {
+                    cleanup: Some(*enhancer),
+                },
+            )?;
+            assert_eq!(cleanup.parallel_jobs().get(), 2);
+        }
         for request in several.requests() {
             assert_eq!(request.cpu_threads(), CpuThreads::share(PARALLEL_JOBS));
         }

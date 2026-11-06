@@ -1,7 +1,6 @@
 stem-split — macOS / Apple Silicon
 =================================
 
-ENGLISH
 
 Requirements: Apple Silicon Mac (M1 or newer), macOS 12 or newer.
 This is not an Intel or universal build. Rust, Python and ffmpeg are not needed.
@@ -43,49 +42,3 @@ Log: ~/Library/Application Support/stem-split/stem-split.log
 Use the app's folder button to locate downloaded models.
 Code: MIT (see LICENSE.txt). Model weights have separate licensing terms;
 this application is intended for personal, non-commercial use.
-
-РУССКИЙ
-
-Требования: Mac с Apple Silicon (M1 или новее), macOS 12 или новее.
-Это не сборка для Intel и не universal. Rust, Python и ffmpeg не нужны.
-В приложении один исполняемый файл со встроенным ONNX Runtime; внешние
-библиотеки — только системные фреймворки macOS. Модели скачиваются при первом
-использовании. Аудио обрабатывается локально. CoreML может использовать GPU
-и Neural Engine; при отказе провайдера обработка переходит на CPU. Скорость
-ускорения зависит от модели.
-
-Установка
-1. Скачайте DMG с https://github.com/bromzh/stem-split/releases.
-2. Откройте DMG и перетащите stem-split.app на ярлык Applications.
-3. Извлеките образ диска и откройте stem-split из «Программы».
-
-Gatekeeper / первый запуск
-Сборка подписана локально (ad-hoc), но НЕ сертификатом Apple Developer ID
-и НЕ прошла нотариализацию Apple. Поэтому macOS может блокировать скачанное
-приложение. Разрешайте запуск только если доверяете источнику.
-
-Попробуйте открыть установленное приложение один раз. Если macOS блокирует:
-- В macOS 13 и новее: «Системные настройки» > «Конфиденциальность и безопасность».
-- В macOS 12: «Системные настройки» > «Защита и безопасность» > «Основные».
-Найдите сообщение о stem-split, нажмите «Всё равно открыть» («Open Anyway»),
-затем подтвердите «Открыть». Может потребоваться пароль. В старых версиях
-macOS также можно нажать Control и щёлкнуть приложение в Finder, выбрать
-«Открыть» и ещё раз подтвердить «Открыть».
-
-Если macOS сообщает, что приложение «повреждено», сначала скачайте его заново
-из официального релиза. Для сверки с файлом .sha256 положите оба файла в одну
-папку, откройте в ней Терминал и выполните:
-  shasum -a 256 -c stem-split-0.1.0-macos-arm64.dmg.sha256
-Если доверяете загрузке, но блокировка остаётся, снимите quarantine ТОЛЬКО
-с установленного приложения в Терминале (sudo не нужен):
-  xattr -dr com.apple.quarantine "/Applications/stem-split.app"
-После этого откройте приложение снова. Если установили в другую папку,
-измените путь. Не отключайте Gatekeeper целиком. На корпоративном Mac может
-потребоваться разрешение администратора; инструкция не обходит политику
-безопасности организации.
-
-Модели: ~/Library/Caches/stem-split/models
-Журнал: ~/Library/Application Support/stem-split/stem-split.log
-Папку моделей можно открыть кнопкой в приложении.
-Код: MIT (см. LICENSE.txt). У весов моделей отдельные условия лицензирования;
-приложение рассчитано на личное некоммерческое использование.

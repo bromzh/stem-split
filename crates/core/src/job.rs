@@ -8,11 +8,14 @@ use std::{
 };
 
 use crate::{
-    audio::{self, DecodeError, ResampleError, Spill, WavWriter, WriteError},
+    audio::{
+        self, AudioEncoder, DecodeError, Encoded, ResampleError, Spill, WavOnly, WavWriter,
+        WriteError,
+    },
     cancel::CancelToken,
     domain::{
-        CleanupTargets, EnhancerId, InputFile, ModelId, OutputChoice, OutputDir, OverwritePolicy,
-        SampleRate, Stem, StemLayout, StemSet,
+        CleanupTargets, EnhancerId, InputFile, ModelId, OutputChoice, OutputDir, OutputFormat,
+        OverwritePolicy, SampleRate, Stem, StemLayout, StemSet,
     },
     enhance::{self, Cleaned, Enhancer, MdxParams, OrtEnhancer, Prediction},
     model::{DownloadProgress, Ensured, LocalGraph, ModelStore, ModelStoreError, StemSelection},
@@ -165,9 +168,9 @@ impl MixOutput {
 /// choice of what to clean exists only for a mix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputKind {
-    /// One WAV per model stem, each cleaned by `cleanup` when there is one.
+    /// One encoded file per model stem, each cleaned by `cleanup` when there is one.
     Stems { cleanup: Option<EnhancerId> },
-    /// A mix WAV made from selected stems, optionally accompanied by stems.
+    /// An encoded mix made from selected stems, optionally accompanied by stems.
     Mix(MixOutput),
 }
 
@@ -244,6 +247,7 @@ pub struct SeparationRequest {
     device: DevicePreference,
     overwrite: OverwritePolicy,
     output_kind: OutputKind,
+    output_format: OutputFormat,
     cpu_threads: CpuThreads,
 }
 
@@ -267,8 +271,20 @@ impl SeparationRequest {
             device,
             overwrite,
             output_kind: OutputKind::STEMS,
+            output_format: OutputFormat::Wav,
             cpu_threads: CpuThreads::all(),
         }
+    }
+
+    #[must_use]
+    pub const fn output_format(&self) -> OutputFormat {
+        self.output_format
+    }
+
+    #[must_use]
+    pub fn with_output_format(mut self, format: OutputFormat) -> Self {
+        self.output_format = format;
+        self
     }
 
     /// The same request with CPU sessions limited to `threads`.
@@ -310,13 +326,14 @@ impl SeparationRequest {
         self.output_kind
     }
 
-    /// Where a stem is written: `<output>/<input name>.<stem>.wav`.
+    /// Where a stem is written, using the selected output extension.
     #[must_use]
     pub fn stem_path(&self, stem: Stem) -> PathBuf {
         let mut name = OsString::from(self.input.base_name());
         name.push(".");
         name.push(stem.file_tag());
-        name.push(".wav");
+        name.push(".");
+        name.push(self.output_format.extension());
         self.output.path().join(name)
     }
 
@@ -324,7 +341,8 @@ impl SeparationRequest {
     #[must_use]
     pub fn mix_path(&self) -> PathBuf {
         let mut name = OsString::from(self.input.base_name());
-        name.push(".mix.wav");
+        name.push(".mix.");
+        name.push(self.output_format.extension());
         self.output.path().join(name)
     }
 
@@ -537,6 +555,7 @@ struct SpilledStem {
 /// clash is reported before anything is downloaded or computed, and where
 /// the separation puts its stems on the way to them.
 struct Outputs {
+    format: OutputFormat,
     /// Final stem files, in the model's stem order.
     stems: Vec<StemFile>,
     mix: Option<MixFile>,
@@ -629,6 +648,20 @@ pub fn run(
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
 ) -> Result<JobEnd, JobError> {
+    run_with_encoder(request, store, progress, cancel, &WavOnly)
+}
+
+/// Runs a job with an application-supplied MP3 encoder.
+///
+/// # Errors
+/// Returns the same job failures as `run`, including output encoding errors.
+pub fn run_with_encoder(
+    request: &SeparationRequest,
+    store: &ModelStore,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+    encoder: &dyn AudioEncoder,
+) -> Result<JobEnd, JobError> {
     let layout = request.model.layout();
     let mut outputs = create_outputs(request, layout)?;
 
@@ -683,7 +716,7 @@ pub fn run(
             }),
         }
     });
-    finish(outputs, device, length, cleaner, progress, cancel)
+    finish(outputs, device, length, cleaner, progress, cancel, encoder)
 }
 
 /// The pass that runs `graph` through ONNX Runtime.
@@ -751,6 +784,7 @@ fn create_outputs(request: &SeparationRequest, layout: StemLayout) -> Result<Out
         mix.as_ref().map(|_| MixAccumulator::new())
     };
     Ok(Outputs {
+        format: request.output_format,
         stems,
         mix,
         cleaning,
@@ -1004,8 +1038,10 @@ fn finish(
     cleaner: Option<Cleaner<'_>>,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
+    encoder: &dyn AudioEncoder,
 ) -> Result<JobEnd, JobError> {
     let Outputs {
+        format,
         mut stems,
         mut mix,
         cleaning,
@@ -1095,12 +1131,16 @@ fn finish(
     progress.report(Progress::Finalizing);
     let mut published = Vec::with_capacity(stems.len());
     for file in stems {
-        file.writer.finish()?;
+        if file.writer.finish_as(format, encoder, cancel)? == Encoded::Cancelled {
+            return Ok(JobEnd::Cancelled);
+        }
         published.push((file.stem, file.path));
     }
     let mix = match mix {
         Some(mix) => {
-            mix.writer.finish()?;
+            if mix.writer.finish_as(format, encoder, cancel)? == Encoded::Cancelled {
+                return Ok(JobEnd::Cancelled);
+            }
             Some(mix.path)
         }
         None => None,
@@ -1192,7 +1232,7 @@ mod tests {
             cancel,
         )? {
             Separated::Completed(device) => {
-                finish(outputs, device, length, cleaner, progress, cancel)
+                finish(outputs, device, length, cleaner, progress, cancel, &WavOnly)
             }
             Separated::Cancelled => Ok(JobEnd::Cancelled),
         }
@@ -1291,6 +1331,23 @@ mod tests {
             directory.path().join("My Song.drums.wav")
         );
         assert_eq!(request.mix_path(), directory.path().join("My Song.mix.wav"));
+        fs::write(request.stem_path(Stem::Vocals), b"existing WAV")?;
+        let compressed = request.with_output_format(OutputFormat::Mp3);
+        assert_eq!(
+            compressed.stem_path(Stem::Vocals),
+            directory.path().join("My Song.vocals.mp3")
+        );
+        assert_eq!(
+            compressed.mix_path(),
+            directory.path().join("My Song.mix.mp3")
+        );
+        assert!(compressed.existing_outputs().is_empty());
+        fs::write(compressed.stem_path(Stem::Vocals), b"existing MP3")?;
+        assert_eq!(
+            compressed.existing_outputs(),
+            [compressed.stem_path(Stem::Vocals)]
+        );
+
         Ok(())
     }
 
