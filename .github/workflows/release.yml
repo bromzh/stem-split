@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
+        run: rustup show active-toolchain
         shell: bash
       - name: Verify release version
         shell: bash
