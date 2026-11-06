@@ -8,12 +8,13 @@ use std::{
 };
 
 use crate::{
-    audio::{self, DecodeError, ResampleError, WavWriter, WriteError},
+    audio::{self, DecodeError, ResampleError, Spill, WavWriter, WriteError},
     cancel::CancelToken,
     domain::{
-        InputFile, ModelId, OutputChoice, OutputDir, OverwritePolicy, SampleRate, Stem, StemLayout,
-        StemSet,
+        CleanupTargets, EnhancerId, InputFile, ModelId, OutputChoice, OutputDir, OverwritePolicy,
+        SampleRate, Stem, StemLayout, StemSet,
     },
+    enhance::{self, Cleaned, Enhancer, MdxParams, OrtEnhancer, Prediction},
     model::{DownloadProgress, Ensured, LocalGraph, ModelStore, ModelStoreError, StemSelection},
     separate::{
         ActiveDevice, CpuThreads, DevicePreference, InferenceError, OrtSeparator, Separator,
@@ -62,6 +63,10 @@ impl MixStems {
         self.0.contains(stem)
     }
 
+    pub const fn set(self) -> StemSet {
+        self.0
+    }
+
     /// Positions of the selected stems in the model's output, in layout
     /// order. The selection is a subset of the layout, so every stem has a
     /// position.
@@ -73,14 +78,161 @@ impl MixStems {
     }
 }
 
-/// The files a separation job produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// How a job that makes a mix cleans up after the separation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cleanup {
+    pub enhancer: EnhancerId,
+    pub targets: CleanupTargets,
+}
+
+/// A cleanup network was asked to clean a mix it cannot: one that tells
+/// vocals from instruments, of a mix meant to have both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the `{}` network cannot clean a mix of these stems", enhancer.name())]
+pub struct MixCleanupError {
+    enhancer: EnhancerId,
+}
+
+/// A mix to make: of which stems, whether the stems are written as well,
+/// and what is cleaned up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixOutput {
+    stems: MixStems,
+    keep_stems: bool,
+    cleanup: Option<Cleanup>,
+    /// How the cleanup treats the mix, when it cleans it. Worked out once
+    /// here, so that no job asks a network to clean a mix it cannot.
+    mix_prediction: Option<Prediction>,
+}
+
+impl MixOutput {
+    /// # Errors
+    ///
+    /// Returns [`MixCleanupError`] when `cleanup` is to clean the mix and
+    /// its network cannot clean a mix of `stems`; see
+    /// [`MixOutput::can_clean_mix`].
+    pub fn new(
+        stems: MixStems,
+        keep_stems: bool,
+        cleanup: Option<Cleanup>,
+    ) -> Result<Self, MixCleanupError> {
+        let mix_prediction = match cleanup {
+            Some(cleanup) if cleanup.targets.mix() => Some(
+                cleanup
+                    .enhancer
+                    .spec()
+                    .output()
+                    .for_mix(stems.set())
+                    .ok_or(MixCleanupError {
+                        enhancer: cleanup.enhancer,
+                    })?,
+            ),
+            Some(_) | None => None,
+        };
+        Ok(Self {
+            stems,
+            keep_stems,
+            cleanup,
+            mix_prediction,
+        })
+    }
+
+    /// Whether `enhancer` can clean a mix of `stems`.
+    #[must_use]
+    pub fn can_clean_mix(enhancer: EnhancerId, stems: StemSet) -> bool {
+        enhancer.spec().output().for_mix(stems).is_some()
+    }
+
+    #[must_use]
+    pub const fn stems(&self) -> MixStems {
+        self.stems
+    }
+
+    #[must_use]
+    pub const fn keeps_stems(&self) -> bool {
+        self.keep_stems
+    }
+
+    #[must_use]
+    pub const fn cleanup(&self) -> Option<Cleanup> {
+        self.cleanup
+    }
+}
+
+/// The files a separation job produces, and what is cleaned up in them.
+///
+/// A job that writes only stems can clean nothing but its stems, so the
+/// choice of what to clean exists only for a mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputKind {
-    /// One WAV per model stem.
-    #[default]
-    Stems,
+    /// One WAV per model stem, each cleaned by `cleanup` when there is one.
+    Stems { cleanup: Option<EnhancerId> },
     /// A mix WAV made from selected stems, optionally accompanied by stems.
-    Mix { stems: MixStems, keep_stems: bool },
+    Mix(MixOutput),
+}
+
+/// What the cleanup stage of a job works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cleaning {
+    enhancer: EnhancerId,
+    /// Every stem the job uses is cleaned before it is written or mixed.
+    stems: bool,
+    /// The mix is cleaned this way before it is written.
+    mix: Option<Prediction>,
+}
+
+impl OutputKind {
+    /// Stem files without cleanup: what a job makes unless told otherwise.
+    pub const STEMS: Self = Self::Stems { cleanup: None };
+
+    /// Whether a file is written for every stem of the model.
+    #[must_use]
+    pub const fn writes_stems(self) -> bool {
+        match self {
+            Self::Stems { .. } => true,
+            Self::Mix(mix) => mix.keep_stems,
+        }
+    }
+
+    /// The stems of the mix, when the job makes one.
+    #[must_use]
+    pub const fn mix(self) -> Option<MixStems> {
+        match self {
+            Self::Stems { .. } => None,
+            Self::Mix(mix) => Some(mix.stems),
+        }
+    }
+
+    /// The cleanup network the job runs, if any.
+    #[must_use]
+    pub fn enhancer(self) -> Option<EnhancerId> {
+        self.cleaning().map(|cleaning| cleaning.enhancer)
+    }
+
+    fn cleaning(self) -> Option<Cleaning> {
+        match self {
+            Self::Stems { cleanup } => cleanup.map(|enhancer| Cleaning {
+                enhancer,
+                stems: true,
+                mix: None,
+            }),
+            Self::Mix(mix) => mix.cleanup.map(|cleanup| Cleaning {
+                enhancer: cleanup.enhancer,
+                stems: cleanup.targets.stems(),
+                mix: mix.mix_prediction,
+            }),
+        }
+    }
+
+    /// Every stem the job writes or mixes.
+    fn used_stems(self, layout: StemLayout) -> StemSet {
+        let mixed = self.mix().map_or(StemSet::none(), MixStems::set);
+        if self.writes_stems() {
+            StemSet::all(layout)
+        } else {
+            mixed
+        }
+    }
 }
 
 /// Everything a job needs to know, already checked.
@@ -96,8 +248,10 @@ pub struct SeparationRequest {
 }
 
 impl SeparationRequest {
-    /// A request whose CPU sessions use every core; see
-    /// [`SeparationRequest::with_cpu_threads`] for jobs that run side by side.
+    /// A request for stem files without cleanup, whose CPU sessions use
+    /// every core; see [`SeparationRequest::with_cpu_threads`] for jobs that
+    /// run side by side and [`SeparationRequest::with_output_kind`] for
+    /// other results.
     #[must_use]
     pub fn new(
         input: InputFile,
@@ -112,7 +266,7 @@ impl SeparationRequest {
             model,
             device,
             overwrite,
-            output_kind: OutputKind::Stems,
+            output_kind: OutputKind::STEMS,
             cpu_threads: CpuThreads::all(),
         }
     }
@@ -174,18 +328,22 @@ impl SeparationRequest {
         self.output.path().join(name)
     }
 
+    /// Where a stem waits to be cleaned up: next to the file it becomes,
+    /// under a name no result has. It exists only while the job runs.
+    fn spill_path(&self, stem: Stem) -> PathBuf {
+        let mut name = self.stem_path(stem).into_os_string();
+        name.push(".raw");
+        PathBuf::from(name)
+    }
+
     /// Output files that are already there. A caller can show them to the
     /// user before asking to start with [`OverwritePolicy::Replace`]. Only
     /// the files the job will produce are listed: a mix without kept stems
     /// does not touch the stem files.
     #[must_use]
     pub fn existing_outputs(&self) -> Vec<PathBuf> {
-        let writes_stems = match self.output_kind {
-            OutputKind::Stems => true,
-            OutputKind::Mix { keep_stems, .. } => keep_stems,
-        };
         let mut outputs = Vec::new();
-        if writes_stems {
+        if self.output_kind.writes_stems() {
             outputs.extend(
                 self.model
                     .layout()
@@ -194,7 +352,7 @@ impl SeparationRequest {
                     .filter(|path| path.exists()),
             );
         }
-        if matches!(self.output_kind, OutputKind::Mix { .. }) {
+        if self.output_kind.mix().is_some() {
             let mix = self.mix_path();
             if mix.exists() {
                 outputs.push(mix);
@@ -208,8 +366,9 @@ impl SeparationRequest {
 /// file states, so that the time of several jobs can be estimated before
 /// they start. `None` when the file does not state its length.
 ///
-/// The count is the one [`Progress::Separating`] will report, unless
-/// resampling changes the length enough to add or drop a chunk.
+/// The count is the one [`Progress::Separating`] will report plus the
+/// windows of the cleanup, unless resampling changes the length enough to
+/// add or drop a chunk.
 #[must_use]
 pub fn expected_runs(request: &SeparationRequest) -> Option<NonZeroUsize> {
     let length = audio::stated_length(&request.input)?;
@@ -218,27 +377,43 @@ pub fn expected_runs(request: &SeparationRequest) -> Option<NonZeroUsize> {
         .saturating_mul(u128::from(SampleRate::MODEL.hertz().get()))
         / 1_000_000_000;
     let frames = NonZeroUsize::new(usize::try_from(frames).ok()?)?;
-    // The passes the job runs: all of them when every stem is written, and
-    // only the graphs of the selected stems for a bare mix of a model with
-    // one graph per stem.
+    runs_for(request, frames)
+}
+
+/// The model runs of `request` for a track of `frames` frames.
+fn runs_for(request: &SeparationRequest, frames: NonZeroUsize) -> Option<NonZeroUsize> {
+    let layout = request.model.layout();
+    let used = request.output_kind.used_stems(layout);
+    // The passes the job runs: those of combined graphs, and of specialist
+    // graphs whose stem it uses.
     let passes = request
         .model
         .spec()
         .graphs()
-        .filter(|graph| match (graph.emits(), request.output_kind) {
-            (_, OutputKind::Stems)
-            | (StemSelection::All, OutputKind::Mix { .. })
-            | (
-                StemSelection::Only(_),
-                OutputKind::Mix {
-                    keep_stems: true, ..
-                },
-            ) => true,
-            (StemSelection::Only(stem), OutputKind::Mix { stems, .. }) => stems.contains(stem),
+        .filter(|graph| match graph.emits() {
+            StemSelection::All => true,
+            StemSelection::Only(stem) => used.contains(stem),
         })
         .count();
     let passes = NonZeroUsize::new(passes)?;
-    Some(ChunkPlan::new(frames).count().saturating_mul(passes))
+    let separation = ChunkPlan::new(frames).count().saturating_mul(passes);
+    let windows = |enhancer: EnhancerId| {
+        enhancer
+            .spec()
+            .params()
+            .chunking()
+            .map_or(0, |chunking| chunking.windows(frames.get()))
+    };
+    let cleanup = request.output_kind.cleaning().map_or(0, |cleaning| {
+        let stems = if cleaning.stems {
+            used.iter(layout).count()
+        } else {
+            0
+        };
+        let mix = usize::from(cleaning.mix.is_some());
+        windows(cleaning.enhancer).saturating_mul(stems.saturating_add(mix))
+    });
+    Some(separation.saturating_add(cleanup))
 }
 
 /// What a running job is doing.
@@ -252,6 +427,12 @@ pub enum Progress {
     LoadingModel,
     /// `done` of `total` model runs are finished.
     Separating {
+        done: usize,
+        total: NonZeroUsize,
+        device: ActiveDevice,
+    },
+    /// `done` of `total` windows of the cleanup are finished.
+    Enhancing {
         done: usize,
         total: NonZeroUsize,
         device: ActiveDevice,
@@ -346,11 +527,27 @@ struct MixFile {
     writer: WavWriter,
 }
 
+/// A stem set aside to be cleaned up.
+struct SpilledStem {
+    stem: Stem,
+    spill: Spill,
+}
+
 /// The files a job will produce, claimed before any work starts so that a
-/// clash is reported before anything is downloaded or computed.
+/// clash is reported before anything is downloaded or computed, and where
+/// the separation puts its stems on the way to them.
 struct Outputs {
+    /// Final stem files, in the model's stem order.
     stems: Vec<StemFile>,
     mix: Option<MixFile>,
+    cleaning: Option<Cleaning>,
+    /// When each stem is cleaned, the separation writes every used stem
+    /// here instead, in the model's stem order.
+    spills: Vec<SpilledStem>,
+    /// Otherwise the mix is summed here: the passes of a model with one
+    /// graph per stem add one stem each, and a mix that is cleaned is
+    /// cleaned as a whole.
+    accumulator: Option<MixAccumulator>,
 }
 
 /// One run of a graph over the track: which stems it yields and how to get
@@ -358,6 +555,15 @@ struct Outputs {
 struct Pass<L> {
     emits: StemSelection,
     load: L,
+}
+
+/// Loads the cleanup network when the cleanup stage begins.
+type LoadEnhancer<'a> = Box<dyn FnOnce() -> Result<Box<dyn Enhancer + 'a>, InferenceError> + 'a>;
+
+/// The cleanup network of a job and how it is fed.
+struct Cleaner<'a> {
+    params: MdxParams,
+    load: LoadEnhancer<'a>,
 }
 
 /// Sums the settled frames of consecutive passes into one track-long buffer.
@@ -373,7 +579,7 @@ struct MixAccumulator {
 }
 
 impl MixAccumulator {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             frames: Vec::new(),
             cursor: 0,
@@ -381,7 +587,7 @@ impl MixAccumulator {
     }
 
     /// Starts the next pass: it reports the same positions from zero.
-    fn next_pass(&mut self) {
+    const fn next_pass(&mut self) {
         self.cursor = 0;
     }
 }
@@ -405,9 +611,10 @@ impl pipeline::FrameSink for MixAccumulator {
 /// Separates the input of `request` into stem files.
 ///
 /// The output names are claimed first, so a clash with existing files is
-/// reported before anything is downloaded or computed. Then the model is
-/// fetched if needed, the input decoded, and each graph of the model run over
-/// the track. Files appear under their final names only at the very end.
+/// reported before anything is downloaded or computed. Then the model and
+/// the cleanup network are fetched if needed, the input decoded, each graph
+/// of the model run over the track, and what the request asks for cleaned.
+/// Files appear under their final names only at the very end.
 ///
 /// `cancel` is honoured between downloaded blocks and between model runs.
 ///
@@ -423,38 +630,60 @@ pub fn run(
     cancel: &CancelToken,
 ) -> Result<JobEnd, JobError> {
     let layout = request.model.layout();
-    let outputs = create_outputs(request, layout)?;
+    let mut outputs = create_outputs(request, layout)?;
 
-    let model = match store.ensure(
+    let files = match store.ensure_files(
         request.model,
+        request.output_kind.enhancer(),
         &mut |download| progress.report(Progress::FetchingModel(download)),
         cancel,
     )? {
-        Ensured::Ready(model) => model,
+        Ensured::Ready(files) => files,
         Ensured::Cancelled => return Ok(JobEnd::Cancelled),
     };
     if cancel.is_cancelled() {
         return Ok(JobEnd::Cancelled);
     }
 
-    progress.report(Progress::Decoding);
-    let audio = audio::resample(audio::decode(&request.input)?)?;
-    let frames = audio.frames().as_slice();
-    let frame_count = NonZeroUsize::new(frames.len()).ok_or_else(|| DecodeError::Empty {
-        path: request.input.path().to_path_buf(),
-    })?;
+    // The input is dropped at the end of this block, before the cleanup
+    // holds stems of its own in memory.
+    let (separated, length) = {
+        progress.report(Progress::Decoding);
+        let audio = audio::resample(audio::decode(&request.input)?)?;
+        let frames = audio.frames().as_slice();
+        let frame_count = NonZeroUsize::new(frames.len()).ok_or_else(|| DecodeError::Empty {
+            path: request.input.path().to_path_buf(),
+        })?;
+        let pass = |graph| pass_for(graph, layout, request.device, request.cpu_threads);
+        let separated = separate_into(
+            frames,
+            &ChunkPlan::new(frame_count),
+            layout,
+            pass(files.model().first()),
+            files.model().rest().iter().map(pass).collect(),
+            &mut outputs,
+            progress,
+            cancel,
+        )?;
+        (separated, frame_count)
+    };
+    let device = match separated {
+        Separated::Completed(device) => device,
+        Separated::Cancelled => return Ok(JobEnd::Cancelled),
+    };
 
-    let pass = |graph| pass_for(graph, layout, request.device, request.cpu_threads);
-    separate_into(
-        frames,
-        &ChunkPlan::new(frame_count),
-        layout,
-        pass(model.first()),
-        model.rest().iter().map(pass).collect(),
-        outputs,
-        progress,
-        cancel,
-    )
+    let cleaner = files.enhancer().map(|enhancer| {
+        let (path, params) = (enhancer.path(), *enhancer.params());
+        let (preference, threads) = (request.device, request.cpu_threads);
+        Cleaner {
+            params,
+            load: Box::new(move || {
+                OrtEnhancer::load(path, &params, preference, threads)
+                    .map(|enhancer| Box::new(enhancer) as Box<dyn Enhancer>)
+            }),
+        }
+    });
+    finish(outputs, device, length, cleaner, progress, cancel)
 }
 
 /// The pass that runs `graph` through ONNX Runtime.
@@ -474,11 +703,8 @@ fn pass_for(
 /// when they are kept, and the mix when one is requested. If a name cannot
 /// be claimed, the writers created so far are dropped and release theirs.
 fn create_outputs(request: &SeparationRequest, layout: StemLayout) -> Result<Outputs, WriteError> {
-    let keep_stems = match request.output_kind {
-        OutputKind::Stems => true,
-        OutputKind::Mix { keep_stems, .. } => keep_stems,
-    };
-    let stems = if keep_stems {
+    let kind = request.output_kind;
+    let stems = if kind.writes_stems() {
         layout
             .iter()
             .map(|stem| {
@@ -490,34 +716,70 @@ fn create_outputs(request: &SeparationRequest, layout: StemLayout) -> Result<Out
     } else {
         Vec::new()
     };
-    let mix = match request.output_kind {
-        OutputKind::Stems => None,
-        OutputKind::Mix { stems, .. } => {
+    let mix = match kind.mix() {
+        None => None,
+        Some(selection) => {
             let path = request.mix_path();
             let writer = WavWriter::create(&path, SampleRate::MODEL, request.overwrite)?;
             Some(MixFile {
-                selection: stems,
+                selection,
                 path,
                 writer,
             })
         }
     };
-    Ok(Outputs { stems, mix })
+    let cleaning = kind.cleaning();
+    let stems_cleaned = cleaning.is_some_and(|cleaning| cleaning.stems);
+    let spills = if stems_cleaned {
+        kind.used_stems(layout)
+            .iter(layout)
+            .map(|stem| {
+                Ok(SpilledStem {
+                    stem,
+                    spill: Spill::create(request.spill_path(stem))?,
+                })
+            })
+            .collect::<Result<_, WriteError>>()?
+    } else {
+        Vec::new()
+    };
+    // Cleaned stems are summed into the mix after the cleanup; otherwise
+    // the separation sums them as it goes.
+    let accumulator = if stems_cleaned {
+        None
+    } else {
+        mix.as_ref().map(|_| MixAccumulator::new())
+    };
+    Ok(Outputs {
+        stems,
+        mix,
+        cleaning,
+        spills,
+        accumulator,
+    })
 }
 
-/// Runs the contributing passes over the track and completes the files.
+/// How the separation stage of a job ended, short of an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Separated {
+    /// Every stem is in place; the last run was on this device.
+    Completed(ActiveDevice),
+    Cancelled,
+}
+
+/// Runs the contributing passes over the track into `outputs`.
 ///
 /// `outputs.stems` are in the model's stem order, so a file's position is
 /// also the position of its stem in the model output. A pass that feeds
-/// neither a stem file nor the mix is skipped: for a model with one graph
-/// per stem, only the graphs of the selected stems run.
+/// nothing the job uses is skipped: for a model with one graph per stem,
+/// only the graphs of the used stems run. No file is completed here.
 #[expect(
     clippy::too_many_arguments,
     reason = "the typed inputs describe one job boundary and keeping them explicit prevents invalid combinations"
 )]
 #[expect(
     clippy::too_many_lines,
-    reason = "the pass scheduling, output routing, cancellation, and final publishing must remain adjacent to show their resource lifetimes"
+    reason = "the pass scheduling, output routing and cancellation must remain adjacent to show their borrows"
 )]
 fn separate_into<L, S>(
     frames: &[[f32; 2]],
@@ -525,10 +787,10 @@ fn separate_into<L, S>(
     layout: StemLayout,
     first_pass: Pass<L>,
     other_passes: Vec<Pass<L>>,
-    mut outputs: Outputs,
+    outputs: &mut Outputs,
     progress: &dyn ProgressSink,
     cancel: &CancelToken,
-) -> Result<JobEnd, JobError>
+) -> Result<Separated, JobError>
 where
     L: FnOnce() -> Result<S, InferenceError>,
     S: Separator,
@@ -538,15 +800,30 @@ where
         plan,
         normalization: Normalization::of(frames),
     };
-    let mix = outputs.mix.as_ref().map(|mix| mix.selection);
-    // The closure below runs across the loop that mutably borrows the
-    // files, so it captures a copy instead.
-    let file_stems: Vec<Stem> = outputs.stems.iter().map(|file| file.stem).collect();
-
+    // The mix is summed during the separation unless its stems are cleaned
+    // one by one first.
+    let mix = outputs
+        .mix
+        .as_ref()
+        .map(|mix| mix.selection)
+        .filter(|_| outputs.accumulator.is_some());
+    // Stems that are cleaned one by one go aside first, and only the
+    // cleaned ones reach their files.
+    let into_files = !outputs.cleaning.is_some_and(|cleaning| cleaning.stems);
+    // The stems the separation writes out, as files or to be cleaned. The
+    // closure below runs across the loop that mutably borrows the outputs,
+    // so it captures a copy.
+    let sunk: Vec<Stem> = outputs
+        .stems
+        .iter()
+        .filter(|_| into_files)
+        .map(|file| file.stem)
+        .chain(outputs.spills.iter().map(|spilled| spilled.stem))
+        .collect();
     let contributes = |emits: StemSelection| match emits {
         StemSelection::All => true,
         StemSelection::Only(stem) => {
-            file_stems.contains(&stem) || mix.is_some_and(|mix| mix.contains(stem))
+            sunk.contains(&stem) || mix.is_some_and(|mix| mix.contains(stem))
         }
     };
     let pass_count = iter::once(&first_pass)
@@ -561,10 +838,6 @@ where
         .count()
         .saturating_mul(NonZeroUsize::new(pass_count).unwrap_or(NonZeroUsize::MIN));
 
-    // With one pass the mix is streamed to its file as the frames settle.
-    // With several, each adds one stem, so they are summed in memory and
-    // written at the end.
-    let mut accumulator = (mix.is_some() && pass_count > 1).then_some(MixAccumulator::new());
     // Positions of the mixed stems in the model output, for the pass that
     // emits them all.
     let mix_positions = mix.map(|mix| mix.positions(layout));
@@ -579,26 +852,40 @@ where
             continue;
         }
         if cancel.is_cancelled() {
-            return Ok(JobEnd::Cancelled);
+            return Ok(Separated::Cancelled);
         }
         progress.report(Progress::LoadingModel);
         let mut separator = (pass.load)()?;
 
-        if let Some(accumulator) = &mut accumulator {
+        if let Some(accumulator) = &mut outputs.accumulator {
             accumulator.next_pass();
         }
 
+        let emitted = |stem: Stem| match pass.emits {
+            StemSelection::All => true,
+            StemSelection::Only(only) => only == stem,
+        };
         let mut targets: Vec<Target<'_>> = Vec::new();
-        for (index, file) in outputs.stems.iter_mut().enumerate() {
-            let emitted = match pass.emits {
-                StemSelection::All => true,
-                StemSelection::Only(stem) => stem == file.stem,
-            };
-            if emitted {
+        let sinks = outputs
+            .stems
+            .iter_mut()
+            .filter(|_| into_files)
+            .map(|file| (file.stem, &mut file.writer as &mut dyn pipeline::FrameSink))
+            .chain(outputs.spills.iter_mut().map(|spilled| {
+                (
+                    spilled.stem,
+                    &mut spilled.spill as &mut dyn pipeline::FrameSink,
+                )
+            }));
+        for (stem, sink) in sinks {
+            if emitted(stem) {
+                let index = layout
+                    .position(stem)
+                    .ok_or(InferenceError::StemNotInLayout { stem })?;
                 targets.push(Target {
                     stem: index,
                     extra_stems: &[],
-                    sink: &mut file.writer,
+                    sink,
                 });
             }
         }
@@ -614,23 +901,12 @@ where
             }
             StemSelection::Only(_) => None,
         };
-        if let Some((first, rest)) = mixed {
-            let sink: Option<&mut dyn pipeline::FrameSink> = match accumulator.as_mut() {
-                Some(accumulator) => Some(accumulator),
-                // A mix always has its file; the fold to `None` exists
-                // because the compiler cannot see that.
-                None => outputs
-                    .mix
-                    .as_mut()
-                    .map(|mix| &mut mix.writer as &mut dyn pipeline::FrameSink),
-            };
-            if let Some(sink) = sink {
-                targets.push(Target {
-                    stem: first,
-                    extra_stems: rest,
-                    sink,
-                });
-            }
+        if let (Some((first, rest)), Some(accumulator)) = (mixed, outputs.accumulator.as_mut()) {
+            targets.push(Target {
+                stem: first,
+                extra_stems: rest,
+                sink: accumulator,
+            });
         }
 
         let end = pipeline::run_pass(
@@ -650,21 +926,179 @@ where
         )?;
         match end {
             PassEnd::Completed => {}
-            PassEnd::Cancelled => return Ok(JobEnd::Cancelled),
+            PassEnd::Cancelled => return Ok(Separated::Cancelled),
         }
     }
+    Ok(Separated::Completed(device))
+}
 
-    if let (Some(accumulator), Some(mix)) = (&accumulator, &mut outputs.mix) {
-        mix.writer.write(&accumulator.frames)?;
+/// The cleanup stage once its network is loaded: how it is fed, and how far
+/// it has come.
+struct CleanupStage<'a> {
+    params: MdxParams,
+    enhancer: Box<dyn Enhancer + 'a>,
+    done: usize,
+    total: NonZeroUsize,
+    device: ActiveDevice,
+}
+
+impl CleanupStage<'_> {
+    /// Cleans `frames` as `prediction` says; `None` if the job was
+    /// cancelled meanwhile.
+    fn clean(
+        &mut self,
+        frames: &[[f32; 2]],
+        prediction: Prediction,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<Option<Vec<[f32; 2]>>, InferenceError> {
+        let Self {
+            params,
+            enhancer,
+            done,
+            total,
+            device,
+        } = self;
+        let end = enhance::clean(
+            frames,
+            params,
+            prediction,
+            enhancer.as_mut(),
+            &mut |used| {
+                *done += 1;
+                *device = used;
+                progress.report(Progress::Enhancing {
+                    done: *done,
+                    total: *total,
+                    device: used,
+                });
+            },
+            cancel,
+        )?;
+        Ok(match end {
+            Cleaned::Completed(cleaned) => Some(cleaned),
+            Cleaned::Cancelled => None,
+        })
     }
+}
+
+/// Adds `frames` into `sum`, frame by frame.
+fn add_into(sum: &mut [[f32; 2]], frames: &[[f32; 2]]) {
+    for (held, &[left, right]) in sum.iter_mut().zip(frames) {
+        let [held_left, held_right] = held;
+        *held_left += left;
+        *held_right += right;
+    }
+}
+
+/// Cleans what the job cleans, writes what was set aside or kept in memory,
+/// and completes every file. `length` is the length of the track, which
+/// every stem has; `device` is where the separation ran last.
+///
+/// `cleaner` is there exactly when the outputs ask for a cleanup; without
+/// it, the audio set aside for one is written as it is.
+fn finish(
+    outputs: Outputs,
+    device: ActiveDevice,
+    length: NonZeroUsize,
+    cleaner: Option<Cleaner<'_>>,
+    progress: &dyn ProgressSink,
+    cancel: &CancelToken,
+) -> Result<JobEnd, JobError> {
+    let Outputs {
+        mut stems,
+        mut mix,
+        cleaning,
+        spills,
+        accumulator,
+    } = outputs;
+
+    // How the cleanup treats each stem, and the mix; `None` for what it
+    // leaves alone.
+    let stem_prediction = |stem: Stem| {
+        cleaning
+            .filter(|cleaning| cleaning.stems)
+            .map(|cleaning| cleaning.enhancer.spec().output().for_stem(stem))
+    };
+    let mix_prediction = cleaning
+        .and_then(|cleaning| cleaning.mix)
+        .filter(|_| mix.is_some());
+    let tracks = spills
+        .len()
+        .saturating_add(usize::from(mix_prediction.is_some()));
+    let tracks = cleaning.and_then(|_| NonZeroUsize::new(tracks));
+    let mut stage = match (tracks, cleaner) {
+        (Some(tracks), Some(cleaner)) => {
+            if cancel.is_cancelled() {
+                return Ok(JobEnd::Cancelled);
+            }
+            progress.report(Progress::LoadingModel);
+            let enhancer = (cleaner.load)()?;
+            let windows = NonZeroUsize::new(cleaner.params.chunking()?.windows(length.get()))
+                .unwrap_or(NonZeroUsize::MIN);
+            Some(CleanupStage {
+                params: cleaner.params,
+                enhancer,
+                done: 0,
+                total: windows.saturating_mul(tracks),
+                device,
+            })
+        }
+        (None, _) | (Some(_), None) => None,
+    };
+    // Frames go through the cleanup when there is one for them, and pass
+    // unchanged otherwise; `None` when the job was cancelled.
+    let mut through_cleanup = |frames: Vec<[f32; 2]>,
+                               prediction: Option<Prediction>|
+     -> Result<Option<Vec<[f32; 2]>>, InferenceError> {
+        match (&mut stage, prediction) {
+            (Some(stage), Some(prediction)) => stage.clean(&frames, prediction, progress, cancel),
+            (Some(_) | None, _) => Ok(Some(frames)),
+        }
+    };
+
+    // Stems set aside are cleaned one at a time: the raw stem is read and
+    // its file removed before the cleaned one is held next to it.
+    let mut sum = (!spills.is_empty())
+        .then(|| mix.as_ref().map(|_| vec![[0.0_f32; 2]; length.get()]))
+        .flatten();
+    for SpilledStem { stem, mut spill } in spills {
+        let raw = spill.read()?;
+        drop(spill);
+        let Some(stem_frames) = through_cleanup(raw, stem_prediction(stem))? else {
+            return Ok(JobEnd::Cancelled);
+        };
+        if let Some(file) = stems.iter_mut().find(|file| file.stem == stem) {
+            file.writer.write(&stem_frames)?;
+        }
+        if let (Some(sum), Some(mix)) = (sum.as_mut(), mix.as_ref())
+            && mix.selection.contains(stem)
+        {
+            add_into(sum, &stem_frames);
+        }
+    }
+    // The mix, summed from the cleaned stems or during the separation, is
+    // cleaned as a whole when that is asked for too.
+    let mix_frames = match (sum, accumulator) {
+        (Some(sum), _) => Some(sum),
+        (None, Some(accumulator)) => Some(accumulator.frames),
+        (None, None) => None,
+    };
+    if let (Some(frames), Some(mix)) = (mix_frames, mix.as_mut()) {
+        let Some(frames) = through_cleanup(frames, mix_prediction)? else {
+            return Ok(JobEnd::Cancelled);
+        };
+        mix.writer.write(&frames)?;
+    }
+    let device = stage.map_or(device, |stage| stage.device);
 
     progress.report(Progress::Finalizing);
-    let mut published = Vec::with_capacity(outputs.stems.len().saturating_add(1));
-    for file in outputs.stems {
+    let mut published = Vec::with_capacity(stems.len());
+    for file in stems {
         file.writer.finish()?;
         published.push((file.stem, file.path));
     }
-    let mix = match outputs.mix {
+    let mix = match mix {
         Some(mix) => {
             mix.writer.finish()?;
             Some(mix.path)
@@ -722,6 +1156,72 @@ mod tests {
             .collect()
     }
 
+    /// Both stages of a job without the model files: the separation into
+    /// `outputs`, then completing them, with `cleaner` for the cleanup.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the job's own stages, whose inputs the tests vary"
+    )]
+    fn separate_and_cleanup<L, S>(
+        track: &[[f32; 2]],
+        plan: &ChunkPlan,
+        layout: StemLayout,
+        first: Pass<L>,
+        rest: Vec<Pass<L>>,
+        mut outputs: Outputs,
+        cleaner: Option<Cleaner<'_>>,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<JobEnd, JobError>
+    where
+        L: FnOnce() -> Result<S, InferenceError>,
+        S: Separator,
+    {
+        let length = NonZeroUsize::new(track.len()).ok_or("empty track");
+        let Ok(length) = length else {
+            return Ok(JobEnd::Cancelled);
+        };
+        match separate_into(
+            track,
+            plan,
+            layout,
+            first,
+            rest,
+            &mut outputs,
+            progress,
+            cancel,
+        )? {
+            Separated::Completed(device) => {
+                finish(outputs, device, length, cleaner, progress, cancel)
+            }
+            Separated::Cancelled => Ok(JobEnd::Cancelled),
+        }
+    }
+
+    /// [`separate_and_cleanup`] for jobs without a cleanup.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the job's own stages, whose inputs the tests vary"
+    )]
+    fn separate_and_finish<L, S>(
+        track: &[[f32; 2]],
+        plan: &ChunkPlan,
+        layout: StemLayout,
+        first: Pass<L>,
+        rest: Vec<Pass<L>>,
+        outputs: Outputs,
+        progress: &dyn ProgressSink,
+        cancel: &CancelToken,
+    ) -> Result<JobEnd, JobError>
+    where
+        L: FnOnce() -> Result<S, InferenceError>,
+        S: Separator,
+    {
+        separate_and_cleanup(
+            track, plan, layout, first, rest, outputs, None, progress, cancel,
+        )
+    }
+
     fn plan_for(frames: &[[f32; 2]]) -> Result<ChunkPlan, &'static str> {
         NonZeroUsize::new(frames.len())
             .map(ChunkPlan::new)
@@ -760,7 +1260,7 @@ mod tests {
     ) -> Result<SeparationRequest, Box<dyn Error>> {
         let request = request_in(directory, model, OverwritePolicy::Refuse)?;
         let stems = MixStems::new(stems, model.layout())?;
-        Ok(request.with_output_kind(OutputKind::Mix { stems, keep_stems }))
+        Ok(request.with_output_kind(OutputKind::Mix(MixOutput::new(stems, keep_stems, None)?)))
     }
 
     #[test]
@@ -835,7 +1335,7 @@ mod tests {
         let track = frames(SEGMENT_FRAMES + 50_000);
         let reports = RefCell::new(Vec::new());
 
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -887,6 +1387,7 @@ mod tests {
                 Progress::FetchingModel(_)
                 | Progress::Decoding
                 | Progress::LoadingModel
+                | Progress::Enhancing { .. }
                 | Progress::Finalizing => None,
             })
             .collect();
@@ -916,7 +1417,7 @@ mod tests {
         };
         let mut stems = layout.iter();
         let first = pass(stems.next().ok_or("layout without stems")?);
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -947,6 +1448,7 @@ mod tests {
                 Progress::FetchingModel(_)
                 | Progress::Decoding
                 | Progress::LoadingModel
+                | Progress::Enhancing { .. }
                 | Progress::Finalizing => None,
             });
         assert_eq!(last_run, Some((8, 8)));
@@ -962,7 +1464,7 @@ mod tests {
         let cancel = CancelToken::new();
         let runs = RefCell::new(0);
 
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -997,7 +1499,7 @@ mod tests {
         let track = frames(1000);
         let failing: Loader = Box::new(|| Err(InferenceError::GpuUnsupported));
 
-        let result = separate_into(
+        let result = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1055,7 +1557,7 @@ mod tests {
         fs::write(&previous, b"previous result")?;
         let track = frames(2000);
 
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1084,7 +1586,7 @@ mod tests {
         let track = frames(SEGMENT_FRAMES + 50_000);
         let reports = RefCell::new(Vec::new());
 
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1122,6 +1624,7 @@ mod tests {
                 Progress::FetchingModel(_)
                 | Progress::Decoding
                 | Progress::LoadingModel
+                | Progress::Enhancing { .. }
                 | Progress::Finalizing => None,
             });
         assert_eq!(last_run, Some((2, 2)));
@@ -1137,7 +1640,7 @@ mod tests {
         let layout = model.layout();
         let track = frames(300_000);
 
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1183,7 +1686,7 @@ mod tests {
         };
         let mut stems = layout.iter();
         let first = pass(stems.next().ok_or("layout without stems")?);
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1230,7 +1733,7 @@ mod tests {
         };
         let mut stems = layout.iter();
         let first = pass(stems.next().ok_or("layout without stems")?);
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1262,7 +1765,7 @@ mod tests {
         let track = frames(1_500_000);
         let cancel = CancelToken::new();
 
-        let end = separate_into(
+        let end = separate_and_finish(
             &track,
             &plan_for(&track)?,
             layout,
@@ -1282,6 +1785,410 @@ mod tests {
 
         assert_eq!(end, JobEnd::Cancelled);
         assert_eq!(names_in(directory.path())?, ["My Song.flac"]);
+        Ok(())
+    }
+
+    /// A small cleanup window, so that the tests run quickly: 16 304 frames
+    /// a window.
+    const TEST_CLEANUP: MdxParams = MdxParams::new(64, 16, 32, 1024, 1.0);
+
+    /// A cleaner whose network halves what it is given.
+    fn halving_cleaner<'a>() -> Cleaner<'a> {
+        scaling_cleaner(0.5)
+    }
+
+    /// A cleaner whose network outputs what it is given times `gain`.
+    fn scaling_cleaner<'a>(gain: f32) -> Cleaner<'a> {
+        Cleaner {
+            params: TEST_CLEANUP,
+            load: Box::new(move || {
+                Ok(
+                    Box::new(crate::enhance::testing::ScalingEnhancer::new(gain))
+                        as Box<dyn Enhancer>,
+                )
+            }),
+        }
+    }
+
+    fn cleanup_windows(reports: &[Progress]) -> Vec<(usize, usize)> {
+        reports
+            .iter()
+            .filter_map(|report| match report {
+                Progress::Enhancing { done, total, .. } => Some((*done, total.get())),
+                Progress::FetchingModel(_)
+                | Progress::Decoding
+                | Progress::LoadingModel
+                | Progress::Separating { .. }
+                | Progress::Finalizing => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stems_job_with_cleanup_cleans_every_stem() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?
+            .with_output_kind(OutputKind::Stems {
+                cleanup: Some(EnhancerId::ReverbHq),
+            });
+        let layout = model.layout();
+        let track = frames(20_000);
+        let reports = RefCell::new(Vec::new());
+
+        let end = separate_and_cleanup(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            Some(halving_cleaner()),
+            &|progress| reports.borrow_mut().push(progress),
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        // Stem `k` is the input times `k + 1`, halved by the cleanup.
+        for ((_, path), gain) in output.files().iter().zip([0.5, 1.0, 1.5, 2.0]) {
+            let written = read(path)?;
+            assert_eq!(written.len().get(), track.len());
+            assert!(
+                worst_error(&written, &track, gain) < 1e-4,
+                "{}",
+                path.display()
+            );
+        }
+        // The stems set aside for the cleanup are gone.
+        assert_eq!(
+            names_in(directory.path())?,
+            [
+                "My Song.bass.wav",
+                "My Song.drums.wav",
+                "My Song.flac",
+                "My Song.other.wav",
+                "My Song.vocals.wav",
+            ]
+        );
+        // Two windows for each of the four stems, after the separation.
+        let reports = reports.into_inner();
+        let windows = cleanup_windows(&reports);
+        assert_eq!(windows.len(), 8);
+        assert_eq!(windows.last(), Some(&(8, 8)));
+        assert_eq!(reports.last(), Some(&Progress::Finalizing));
+        Ok(())
+    }
+
+    #[test]
+    fn mix_of_cleaned_stems_writes_no_stem_files() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let layout = model.layout();
+        let selected = StemSet::none().toggled(Stem::Drums).toggled(Stem::Bass);
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?
+            .with_output_kind(OutputKind::Mix(MixOutput::new(
+                MixStems::new(selected, layout)?,
+                false,
+                Some(Cleanup {
+                    enhancer: EnhancerId::ReverbHq,
+                    targets: CleanupTargets::Stems,
+                }),
+            )?));
+        let track = frames(20_000);
+        let reports = RefCell::new(Vec::new());
+
+        let end = separate_and_cleanup(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            Some(halving_cleaner()),
+            &|progress| reports.borrow_mut().push(progress),
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        assert!(output.files().is_empty());
+        // Drums and bass are the input times 1 and 2, each halved.
+        let mix = read(output.mix().ok_or("no mix file")?)?;
+        assert!(worst_error(&mix, &track, 1.5) < 1e-4);
+        assert_eq!(
+            names_in(directory.path())?,
+            ["My Song.flac", "My Song.mix.wav"]
+        );
+        // Only the two mixed stems were cleaned.
+        assert_eq!(cleanup_windows(&reports.into_inner()).last(), Some(&(4, 4)));
+        Ok(())
+    }
+
+    #[test]
+    fn mix_target_cleans_the_mix_and_keeps_the_stems_raw() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::HtdemucsFt;
+        let layout = model.layout();
+        let selected = StemSet::none().toggled(Stem::Other).toggled(Stem::Vocals);
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?
+            .with_output_kind(OutputKind::Mix(MixOutput::new(
+                MixStems::new(selected, layout)?,
+                true,
+                Some(Cleanup {
+                    enhancer: EnhancerId::ReverbHq,
+                    targets: CleanupTargets::Mix,
+                }),
+            )?));
+        let track = frames(20_000);
+        let reports = RefCell::new(Vec::new());
+        let pass = |stem| Pass {
+            emits: StemSelection::Only(stem),
+            load: || Ok(ScalingSeparator::new(layout.count())),
+        };
+        let mut stems = layout.iter();
+        let first = pass(stems.next().ok_or("layout without stems")?);
+
+        let end = separate_and_cleanup(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            first,
+            stems.map(pass).collect(),
+            create_outputs(&request, layout)?,
+            Some(halving_cleaner()),
+            &|progress| reports.borrow_mut().push(progress),
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        for ((_, path), gain) in output.files().iter().zip([1.0, 2.0, 3.0, 4.0]) {
+            assert!(
+                worst_error(&read(path)?, &track, gain) < 1e-4,
+                "{}",
+                path.display()
+            );
+        }
+        // Other and vocals are the input times 3 and 4; the mix is halved.
+        let mix = read(output.mix().ok_or("no mix file")?)?;
+        assert!(worst_error(&mix, &track, 3.5) < 1e-4);
+        assert_eq!(cleanup_windows(&reports.into_inner()).last(), Some(&(2, 2)));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_during_the_cleanup_leaves_no_files() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let layout = model.layout();
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?
+            .with_output_kind(OutputKind::Stems {
+                cleanup: Some(EnhancerId::ReverbHq),
+            });
+        let track = frames(40_000);
+        let cancel = CancelToken::new();
+
+        let end = separate_and_cleanup(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            Some(halving_cleaner()),
+            &|progress| {
+                if let Progress::Enhancing { done: 3, .. } = progress {
+                    cancel.cancel();
+                }
+            },
+            &cancel,
+        )?;
+
+        assert_eq!(end, JobEnd::Cancelled);
+        assert_eq!(names_in(directory.path())?, ["My Song.flac"]);
+        Ok(())
+    }
+
+    #[test]
+    fn expected_runs_count_the_cleanup_windows() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let layout = model.layout();
+        // A minute: 8 chunks of the separation, 6 windows of the cleanup.
+        let frames = NonZeroUsize::new(60 * 44_100).ok_or("empty")?;
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?;
+        let mix = MixStems::new(StemSet::none().toggled(Stem::Vocals), layout)?;
+        let cleanup = |targets| {
+            Some(Cleanup {
+                enhancer: EnhancerId::ReverbHq,
+                targets,
+            })
+        };
+        let runs =
+            |kind| runs_for(&request.clone().with_output_kind(kind), frames).map(NonZeroUsize::get);
+
+        assert_eq!(runs(OutputKind::STEMS), Some(11));
+        assert_eq!(
+            runs(OutputKind::Stems {
+                cleanup: Some(EnhancerId::ReverbHq)
+            }),
+            Some(11 + 4 * 6)
+        );
+        assert_eq!(
+            runs(OutputKind::Mix(MixOutput::new(
+                mix,
+                false,
+                cleanup(CleanupTargets::Stems),
+            )?)),
+            Some(11 + 6)
+        );
+        assert_eq!(
+            runs(OutputKind::Mix(MixOutput::new(
+                mix,
+                true,
+                cleanup(CleanupTargets::Mix),
+            )?)),
+            Some(11 + 6)
+        );
+        // The vocals and then the mix of them.
+        assert_eq!(
+            runs(OutputKind::Mix(MixOutput::new(
+                mix,
+                false,
+                cleanup(CleanupTargets::Both),
+            )?)),
+            Some(11 + 2 * 6)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn both_targets_clean_the_stems_and_then_the_mix() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let layout = model.layout();
+        let selected = StemSet::none().toggled(Stem::Drums).toggled(Stem::Bass);
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?
+            .with_output_kind(OutputKind::Mix(MixOutput::new(
+                MixStems::new(selected, layout)?,
+                false,
+                Some(Cleanup {
+                    enhancer: EnhancerId::ReverbHq,
+                    targets: CleanupTargets::Both,
+                }),
+            )?));
+        let track = frames(20_000);
+        let reports = RefCell::new(Vec::new());
+
+        let end = separate_and_cleanup(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            Some(halving_cleaner()),
+            &|progress| reports.borrow_mut().push(progress),
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        // Drums and bass, the input times 1 and 2, halved each, then the
+        // mix of them halved again.
+        let mix = read(output.mix().ok_or("no mix file")?)?;
+        assert!(worst_error(&mix, &track, 0.75) < 1e-4);
+        // Two windows for each of the two stems and for the mix.
+        assert_eq!(cleanup_windows(&reports.into_inner()).last(), Some(&(6, 6)));
+        assert_eq!(
+            names_in(directory.path())?,
+            ["My Song.flac", "My Song.mix.wav"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vocal_network_keeps_the_vocals_and_removes_them_elsewhere() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let model = ModelId::Htdemucs;
+        let layout = model.layout();
+        let request = request_in(directory.path(), model, OverwritePolicy::Refuse)?
+            .with_output_kind(OutputKind::Stems {
+                cleanup: Some(EnhancerId::VocalBleed),
+            });
+        let track = frames(20_000);
+
+        let end = separate_and_cleanup(
+            &track,
+            &plan_for(&track)?,
+            layout,
+            Pass {
+                emits: StemSelection::All,
+                load: loader(layout),
+            },
+            Vec::new(),
+            create_outputs(&request, layout)?,
+            Some(scaling_cleaner(0.25)),
+            &|_| {},
+            &CancelToken::new(),
+        )?;
+
+        let JobEnd::Completed(output) = end else {
+            return Err("job was cancelled".into());
+        };
+        // The network outputs a quarter of each stem as "the vocals". In the
+        // vocals, the input times 4, that quarter is what remains; from the
+        // other stems it is taken away, leaving three quarters.
+        for ((stem, path), gain) in output.files().iter().zip([0.75, 1.5, 2.25, 1.0]) {
+            let written = read(path)?;
+            assert!(worst_error(&written, &track, gain) < 1e-4, "{stem:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vocal_network_cannot_clean_a_mix_of_vocals_and_instruments() -> Result<(), Box<dyn Error>> {
+        let layout = StemLayout::FOUR;
+        let mixed = MixStems::new(
+            StemSet::none().toggled(Stem::Drums).toggled(Stem::Vocals),
+            layout,
+        )?;
+        let instruments = MixStems::new(StemSet::none().toggled(Stem::Drums), layout)?;
+        let cleanup = |targets| {
+            Some(Cleanup {
+                enhancer: EnhancerId::VocalBleed,
+                targets,
+            })
+        };
+
+        for targets in [CleanupTargets::Mix, CleanupTargets::Both] {
+            assert!(MixOutput::new(mixed, false, cleanup(targets)).is_err());
+            assert!(MixOutput::new(instruments, false, cleanup(targets)).is_ok());
+        }
+        // Its stems can be cleaned one by one, whatever the mix.
+        assert!(MixOutput::new(mixed, false, cleanup(CleanupTargets::Stems)).is_ok());
+        assert!(!MixOutput::can_clean_mix(
+            EnhancerId::VocalBleed,
+            mixed.set()
+        ));
+        assert!(MixOutput::can_clean_mix(EnhancerId::ReverbHq, mixed.set()));
         Ok(())
     }
 }

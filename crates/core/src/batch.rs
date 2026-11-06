@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    domain::{self, InputFile, InputFiles, ModelId, OutputChoice, OverwritePolicy},
+    domain::{self, EnhancerId, InputFile, InputFiles, ModelId, OutputChoice, OverwritePolicy},
     job::{OutputKind, SeparationRequest},
     separate::{CpuThreads, DevicePreference},
 };
@@ -24,6 +24,17 @@ use crate::{
 /// has all the cores or half of them; they get half, to leave the machine
 /// responsive.
 pub const PARALLEL_JOBS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
+
+/// How many files with a cleanup are split at the same time: one.
+///
+/// A cleanup session takes 2.3 GB (`vocal_bleed`) to 3.6 GB (`reverb_hq`)
+/// of the card's memory, against 1.4 GB for a separation one. Measured on
+/// the 6 GB target card with two copies of a 5:50 track, a mix of drums and
+/// bass cleaned stem by stem and as a mix: with `reverb_hq` two at once took
+/// 620 s against 154 s one after the other, the card full to 5.9 GB; with
+/// `vocal_bleed` 120 s against 142 s. One rule for both keeps a card with
+/// less memory from the fourfold slowdown.
+pub const PARALLEL_JOBS_WITH_CLEANUP: NonZeroUsize = NonZeroUsize::MIN;
 
 /// Two of the chosen files would produce stem files with the same names.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,7 +74,8 @@ impl Batch {
     /// `output` says.
     ///
     /// The jobs run [`PARALLEL_JOBS`] at a time, or fewer if there are fewer
-    /// files, and share the processor cores between them.
+    /// files, and share the processor cores between them. Jobs with a
+    /// cleanup run [`PARALLEL_JOBS_WITH_CLEANUP`] at a time.
     ///
     /// # Errors
     ///
@@ -80,7 +92,11 @@ impl Batch {
         overwrite: OverwritePolicy,
         output_kind: OutputKind,
     ) -> Result<Self, OutputClash> {
-        let parallel = PARALLEL_JOBS.min(inputs.count());
+        let limit = match output_kind.enhancer() {
+            None => PARALLEL_JOBS,
+            Some(_) => PARALLEL_JOBS_WITH_CLEANUP,
+        };
+        let parallel = limit.min(inputs.count());
         let threads = CpuThreads::share(parallel);
         let request = |input: &InputFile| {
             SeparationRequest::new(input.clone(), output, model, device, overwrite)
@@ -125,6 +141,12 @@ impl Batch {
         self.first.model()
     }
 
+    /// The cleanup network of the jobs, which all share their settings.
+    #[must_use]
+    pub fn enhancer(&self) -> Option<EnhancerId> {
+        self.first.output_kind().enhancer()
+    }
+
     /// How many jobs run at the same time.
     #[must_use]
     pub const fn parallel_jobs(&self) -> NonZeroUsize {
@@ -160,7 +182,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Auto,
             OverwritePolicy::Refuse,
-            OutputKind::Stems,
+            OutputKind::STEMS,
         )
     }
 

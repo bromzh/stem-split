@@ -11,12 +11,14 @@ use std::{
 
 use stem_split_core::job::Progress;
 
-/// What a stage counts its progress in. Only these two stages report how far
-/// they are: downloading in bytes, separating in model runs.
+/// What a stage counts its progress in. Only these stages report how far
+/// they are: downloading in bytes, separating in model runs, cleaning up in
+/// windows of the cleanup network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Measure {
     Download,
     Separation,
+    Enhancement,
 }
 
 /// How much of a stage was done at one moment.
@@ -148,12 +150,20 @@ impl Timing {
                 u64::try_from(total.get()).unwrap_or(u64::MAX),
                 now,
             ),
+            // Its windows take a different time than the separation's runs,
+            // so the cleanup is a stage of its own.
+            Progress::Enhancing { done, total, .. } => self.measure(
+                Measure::Enhancement,
+                u64::try_from(done).unwrap_or(u64::MAX),
+                u64::try_from(total.get()).unwrap_or(u64::MAX),
+                now,
+            ),
             // A graph is loaded before every pass. Between two passes the
             // separation goes on, and so does its estimate.
             Progress::LoadingModel => {
                 self.stage = self.stage.filter(|stage| match stage.measure {
                     Measure::Separation => true,
-                    Measure::Download => false,
+                    Measure::Download | Measure::Enhancement => false,
                 });
             }
             Progress::Decoding | Progress::Finalizing => self.stage = None,
@@ -396,6 +406,30 @@ mod tests {
             ByteCount::new(done),
             ByteCount::new(total),
         ))
+    }
+
+    #[test]
+    fn cleanup_is_estimated_apart_from_the_separation() {
+        let start = Instant::now();
+        let mut timing = Timing::starting_at(start);
+        timing.observe(separating(1, 3), start + SECOND);
+        timing.observe(separating(3, 3), start + 3 * SECOND);
+        timing.observe(Progress::LoadingModel, start + 4 * SECOND);
+        let enhancing = |done| Progress::Enhancing {
+            done,
+            total: NonZeroUsize::new(5).unwrap_or(NonZeroUsize::MIN),
+            device: ActiveDevice::Cpu,
+        };
+
+        timing.observe(enhancing(1), start + 10 * SECOND);
+        // One report of the new stage gives no speed yet.
+        assert_eq!(timing.remaining(start + 10 * SECOND), None);
+        timing.observe(enhancing(2), start + 14 * SECOND);
+
+        // 4 s a window, three windows to go.
+        assert_eq!(timing.remaining(start + 14 * SECOND), Some(12 * SECOND));
+        // The pace of the separation is not that of the cleanup.
+        assert_eq!(timing.pace(), None);
     }
 
     #[test]

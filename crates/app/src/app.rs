@@ -12,7 +12,7 @@ use stem_split_core::{batch::Batch, domain::OverwritePolicy, model::ModelStore};
 use crate::{
     dialogs,
     downloads::{Downloads, Polled},
-    form::Form,
+    form::{Form, Mode},
     settings::Settings,
     tracker::{End, Results, Tracker},
     view::{
@@ -58,6 +58,7 @@ enum Screen {
     /// Results of an earlier run are in the way.
     Confirming {
         form: Form,
+        mode: Mode,
         existing: Vec<PathBuf>,
     },
     /// Boxed: the batch carries much more than any other screen.
@@ -177,15 +178,21 @@ impl StemSplitApp {
                     None => Screen::Editing(form),
                 }
             }
-            Screen::Confirming { form, existing } => {
-                match view::confirming(ui, locale, &existing) {
-                    Some(ConfirmingAction::Replace) => {
-                        prepare(form, OverwritePolicy::Replace, ui.ctx())
-                    }
-                    Some(ConfirmingAction::Back) => Screen::Editing(form),
-                    None => Screen::Confirming { form, existing },
+            Screen::Confirming {
+                form,
+                mode,
+                existing,
+            } => match view::confirming(ui, locale, &existing) {
+                Some(ConfirmingAction::Replace) => {
+                    prepare(form, mode, OverwritePolicy::Replace, ui.ctx())
                 }
-            }
+                Some(ConfirmingAction::Back) => Screen::Editing(form),
+                None => Screen::Confirming {
+                    form,
+                    mode,
+                    existing,
+                },
+            },
             Screen::Running(run) => self.follow(ui, run),
             Screen::Done(finished) => show_finished(ui, locale, finished),
             Screen::Failed { form, failure } => {
@@ -220,6 +227,14 @@ impl StemSplitApp {
             EditingAction::OutputBesideInput => form.set_output_beside_input(),
             EditingAction::Model(model) => form.set_model(model, self.store()),
             EditingAction::Device(device) => form.set_device(device),
+            EditingAction::ToggleStem(stem) => form.toggle_stem(stem),
+            EditingAction::AllStems => form.select_all_stems(),
+            EditingAction::NoStems => form.select_no_stems(),
+            EditingAction::KeepStems(keep) => form.set_keep_stems(keep),
+            EditingAction::Cleanup(enabled) => form.set_cleanup(enabled, self.store()),
+            EditingAction::CleanupStems(stems) => form.set_cleanup_stems(stems),
+            EditingAction::CleanupMix(mix) => form.set_cleanup_mix(mix),
+            EditingAction::Enhancer(enhancer) => form.set_enhancer(enhancer, self.store()),
             EditingAction::Language(locale) => self.locale = locale,
             EditingAction::OpenDownloads => {
                 if let Some(downloads) = &mut self.downloads {
@@ -231,11 +246,11 @@ impl StemSplitApp {
                     downloads.clear(context);
                 }
             }
-            EditingAction::Start => {
+            EditingAction::Start(mode) => {
                 if self.clearing() {
                     return Screen::Editing(form);
                 }
-                return prepare(form, OverwritePolicy::Refuse, context);
+                return prepare(form, mode, OverwritePolicy::Refuse, context);
             }
         }
         Screen::Editing(form)
@@ -283,11 +298,16 @@ impl StemSplitApp {
     }
 }
 
-/// Starts the batch the form describes, unless its files clash or results
-/// of an earlier run are in the way and `overwrite` does not allow
-/// replacing them, in which case the user is asked first.
-fn prepare(mut form: Form, overwrite: OverwritePolicy, context: &egui::Context) -> Screen {
-    match form.batch(overwrite) {
+/// Starts the batch the form describes for `mode`, unless its files clash
+/// or results of an earlier run are in the way and `overwrite` does not
+/// allow replacing them, in which case the user is asked first.
+fn prepare(
+    mut form: Form,
+    mode: Mode,
+    overwrite: OverwritePolicy,
+    context: &egui::Context,
+) -> Screen {
+    match form.batch(mode, overwrite) {
         None => Screen::Editing(form),
         Some(Err(clash)) => {
             form.report_clash(clash);
@@ -301,7 +321,11 @@ fn prepare(mut form: Form, overwrite: OverwritePolicy, context: &egui::Context) 
             if existing.is_empty() {
                 launch(form, batch, context)
             } else {
-                Screen::Confirming { form, existing }
+                Screen::Confirming {
+                    form,
+                    mode,
+                    existing,
+                }
             }
         }
     }
@@ -463,6 +487,7 @@ mod tests {
         };
         let confirming = Screen::Confirming {
             form: Form::default(),
+            mode: Mode::SplitAndMix,
             existing: vec![directory.path().join("old.vocals.wav")],
         };
 

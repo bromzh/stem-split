@@ -5,9 +5,9 @@ mod registry;
 mod store;
 
 pub use self::{
-    registry::{GraphSpec, ModelSpec, StemSelection},
+    registry::{EnhancerSpec, FileSpec, GraphSpec, ModelSpec, Repository, StemSelection},
     store::{
-        CacheError, DownloadProgress, Ensured, LocalGraph, LocalModel, ModelStore, ModelStoreError,
-        Usage,
+        CacheError, DownloadProgress, Ensured, LocalEnhancer, LocalFiles, LocalGraph, LocalModel,
+        ModelStore, ModelStoreError, Usage,
     },
 };

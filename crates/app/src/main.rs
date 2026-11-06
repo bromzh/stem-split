@@ -49,8 +49,8 @@ fn run() -> eframe::Result {
                 width: ICON_SIZE,
                 height: ICON_SIZE,
             })
-            .with_inner_size([640.0, 400.0])
-            .with_min_inner_size([520.0, 320.0]),
+            .with_inner_size([640.0, 520.0])
+            .with_min_inner_size([520.0, 440.0]),
         ..Default::default()
     };
     eframe::run_native(

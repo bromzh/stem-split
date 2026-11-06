@@ -4,7 +4,7 @@ use std::io;
 
 use stem_split_core::{
     audio::{DecodeError, ResampleError, WriteError},
-    domain::{InputFileError, ModelId, OutputDirError},
+    domain::{EnhancerId, InputFileError, ModelId, OutputDirError, Stem},
     job::{JobError, Progress},
     model::{CacheError, ModelStoreError},
     separate::{ActiveDevice, DevicePreference, InferenceError},
@@ -30,6 +30,24 @@ pub(super) const fn text(text: Text) -> &'static str {
         Text::NothingDownloaded => "No models have been downloaded yet",
         Text::Delete => "Delete",
         Text::Split => "Split",
+        Text::SplitAndMix => "Split and mix",
+        Text::NoStemsForMix => "Tick at least one stem for the mix",
+        // The row of stems and the tick for cleaning them: the same word.
+        Text::Stems | Text::CleanupStems => "Stems",
+        Text::AllStems => "All",
+        Text::NoStems => "None",
+        Text::KeepStems => "Save stems",
+        Text::KeepStemsHint => "With \"Split and mix\", also save every stem to a file of its own",
+        Text::Cleanup => "Cleanup",
+        Text::CleanUpArtifacts => "Clean up artifacts",
+        Text::CleanupStemsHint => "Each stem is cleaned before it is saved or mixed",
+        Text::CleanupMix => "The mix",
+        Text::CleanupMixHint => "With \"Split and mix\", the finished mix is cleaned as well",
+        Text::CleanupMixUnavailable => {
+            "This network tells vocals from instruments, so it cannot clean a mix of both. \
+             Untick the vocals, or tick only them."
+        }
+        Text::CleanupNetwork => "Cleanup network",
         Text::Cancel => "Cancel",
         Text::Cancelling => "Cancelling…",
         Text::Back => "Back",
@@ -59,6 +77,24 @@ pub(super) fn model_label(model: ModelId) -> String {
         model.name(),
         model.layout().count()
     )
+}
+
+pub(super) const fn stem_label(stem: Stem) -> &'static str {
+    match stem {
+        Stem::Drums => "Drums",
+        Stem::Bass => "Bass",
+        Stem::Other => "Other",
+        Stem::Vocals => "Vocals",
+        Stem::Guitar => "Guitar",
+        Stem::Piano => "Piano",
+    }
+}
+
+pub(super) const fn enhancer_label(enhancer: EnhancerId) -> &'static str {
+    match enhancer {
+        EnhancerId::ReverbHq => "Reverb HQ — reverb and smeared tails",
+        EnhancerId::VocalBleed => "Vocal bleed — vocals and instruments leaked into each other",
+    }
 }
 
 pub(super) fn download_notice(megabytes: u64) -> String {
@@ -102,6 +138,11 @@ pub(super) fn row_status(progress: Progress) -> String {
             total,
             device,
         } => format!("Part {done} of {total} · {}", device_name(device)),
+        Progress::Enhancing {
+            done,
+            total,
+            device,
+        } => format!("Cleanup {done} of {total} · {}", device_name(device)),
         Progress::Finalizing => "Writing the files…".to_owned(),
     }
 }

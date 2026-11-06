@@ -234,6 +234,7 @@ impl Tracker {
                             runs,
                             pace,
                         },
+                    expected,
                     ..
                 }) = self.files.get_mut(index)
                 else {
@@ -242,7 +243,10 @@ impl Tracker {
                 timing.observe(progress, now);
                 *latest = Some(progress);
                 if let Progress::Separating { total, .. } = progress {
-                    *runs = Some(count(total.get()));
+                    // The separation counts its own runs only; the stated
+                    // length also covers the cleanup windows that follow.
+                    let separation = count(total.get());
+                    *runs = Some(expected.map_or(separation, |expected| expected.max(separation)));
                     *pace = timing.pace();
                 }
             }
@@ -466,7 +470,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Cpu,
             OverwritePolicy::Refuse,
-            OutputKind::Stems,
+            OutputKind::STEMS,
         )?;
         Ok(Tracker::new(&batch, now))
     }

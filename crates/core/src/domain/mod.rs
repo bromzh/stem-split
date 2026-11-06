@@ -6,6 +6,7 @@
 
 mod audio_format;
 mod digest;
+mod enhancer;
 mod frames;
 mod input;
 mod macros;
@@ -19,6 +20,7 @@ pub(crate) use self::input::comparable;
 pub use self::{
     audio_format::AudioFormat,
     digest::{DigestParseError, Sha256Digest},
+    enhancer::{CleanupTargets, EnhancerId},
     frames::{ChannelLengthMismatch, StereoFrames},
     input::{InputFile, InputFileError, InputFiles},
     model::ModelId,

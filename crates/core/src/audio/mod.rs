@@ -7,10 +7,12 @@
 mod decode;
 mod mix;
 mod resample;
+mod spill;
 mod wav;
 
 use std::time::Duration;
 
+pub(crate) use self::spill::Spill;
 pub use self::{
     decode::{DecodeError, decode, stated_length},
     mix::{MixError, mix_files},

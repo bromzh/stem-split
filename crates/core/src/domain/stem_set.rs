@@ -49,7 +49,15 @@ impl StemSet {
         self.iter_all().all(|stem| layout.position(stem).is_some())
     }
 
-    fn iter_all(self) -> impl Iterator<Item = Stem> {
+    /// The selected stems that `layout` produces. A selection made for one
+    /// model keeps the stems another one lacks, so that switching back
+    /// restores them; this is what applies to the current model.
+    pub fn within(self, layout: StemLayout) -> Self {
+        self.iter(layout).fold(Self::none(), Self::toggled)
+    }
+
+    /// Every selected stem, in the order of [`Stem::ALL`].
+    pub fn iter_all(self) -> impl Iterator<Item = Stem> {
         Stem::ALL
             .iter()
             .copied()
@@ -92,6 +100,23 @@ mod tests {
         let selected = StemSet::none().toggled(Stem::Vocals);
         assert!(selected.contains(Stem::Vocals));
         assert!(selected.toggled(Stem::Vocals).is_empty());
+    }
+
+    #[test]
+    fn within_drops_the_stems_a_layout_lacks() {
+        let set = StemSet::none().toggled(Stem::Piano).toggled(Stem::Vocals);
+
+        let four = set.within(StemLayout::FOUR);
+
+        assert!(four.contains(Stem::Vocals));
+        assert!(!four.contains(Stem::Piano));
+        assert_eq!(set.within(StemLayout::SIX), set);
+        assert!(
+            StemSet::none()
+                .toggled(Stem::Guitar)
+                .within(StemLayout::FOUR)
+                .is_empty()
+        );
     }
 
     #[test]

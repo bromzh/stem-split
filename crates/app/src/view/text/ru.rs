@@ -4,7 +4,7 @@ use std::io;
 
 use stem_split_core::{
     audio::{DecodeError, ResampleError, WriteError},
-    domain::{InputFileError, ModelId, OutputDirError},
+    domain::{EnhancerId, InputFileError, ModelId, OutputDirError, Stem},
     job::{JobError, Progress},
     model::{CacheError, ModelStoreError},
     separate::{ActiveDevice, DevicePreference, InferenceError},
@@ -31,6 +31,26 @@ pub(super) const fn text(text: Text) -> &'static str {
         Text::NothingDownloaded => "Модели ещё не скачивались",
         Text::Delete => "Удалить",
         Text::Split => "Разделить",
+        Text::SplitAndMix => "Разделить и свести",
+        Text::NoStemsForMix => "Отметьте хотя бы один стем для микса",
+        // The row of stems and the tick for cleaning them: the same word.
+        Text::Stems | Text::CleanupStems => "Стемы",
+        Text::AllStems => "Все",
+        Text::NoStems => "Ни одного",
+        Text::KeepStems => "Сохранить стемы",
+        Text::KeepStemsHint => "При «Разделить и свести» сохранить и каждый стем в отдельный файл",
+        Text::Cleanup => "Очистка",
+        Text::CleanUpArtifacts => "Убрать артефакты",
+        Text::CleanupStemsHint => {
+            "Каждый стем очищается до того, как сохранится или попадёт в микс"
+        }
+        Text::CleanupMix => "Микс",
+        Text::CleanupMixHint => "При «Разделить и свести» очищается ещё и готовый микс",
+        Text::CleanupMixUnavailable => {
+            "Эта сеть отличает голос от инструментов и не может очистить микс из того и другого. \
+             Снимите отметку с вокала или оставьте только его."
+        }
+        Text::CleanupNetwork => "Сеть для очистки",
         Text::Cancel => "Отмена",
         Text::Cancelling => "Отменяется…",
         Text::Back => "Назад",
@@ -78,6 +98,24 @@ pub(super) fn model_label(model: ModelId) -> String {
     )
 }
 
+pub(super) const fn stem_label(stem: Stem) -> &'static str {
+    match stem {
+        Stem::Drums => "Ударные",
+        Stem::Bass => "Бас",
+        Stem::Other => "Остальное",
+        Stem::Vocals => "Вокал",
+        Stem::Guitar => "Гитара",
+        Stem::Piano => "Пианино",
+    }
+}
+
+pub(super) const fn enhancer_label(enhancer: EnhancerId) -> &'static str {
+    match enhancer {
+        EnhancerId::ReverbHq => "Reverb HQ — реверберация и размытые хвосты",
+        EnhancerId::VocalBleed => "Просачивание — голос в инструментах и наоборот",
+    }
+}
+
 pub(super) fn download_notice(megabytes: u64) -> String {
     format!("Сначала будет скачана модель ({megabytes} МБ).")
 }
@@ -120,6 +158,11 @@ pub(super) fn row_status(progress: Progress) -> String {
             total,
             device,
         } => format!("Часть {done} из {total} · {}", device_name(device)),
+        Progress::Enhancing {
+            done,
+            total,
+            device,
+        } => format!("Очистка {done} из {total} · {}", device_name(device)),
         Progress::Finalizing => "Запись файлов…".to_owned(),
     }
 }

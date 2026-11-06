@@ -14,7 +14,7 @@ use std::{io, num::NonZeroUsize, path::Path, time::Duration};
 use stem_split_core::{
     batch::OutputClash,
     closed_enum,
-    domain::{ByteCount, InputFileError, ModelId, OutputDirError},
+    domain::{ByteCount, EnhancerId, InputFileError, ModelId, OutputDirError, Stem},
     job::Progress,
     separate::{ActiveDevice, DevicePreference},
 };
@@ -97,6 +97,21 @@ closed_enum! {
         NothingDownloaded,
         Delete,
         Split,
+        SplitAndMix,
+        NoStemsForMix,
+        Stems,
+        AllStems,
+        NoStems,
+        KeepStems,
+        KeepStemsHint,
+        Cleanup,
+        CleanUpArtifacts,
+        CleanupStems,
+        CleanupStemsHint,
+        CleanupMix,
+        CleanupMixHint,
+        CleanupMixUnavailable,
+        CleanupNetwork,
         Cancel,
         Cancelling,
         Back,
@@ -200,6 +215,22 @@ pub(crate) fn model_label(locale: Locale, model: ModelId) -> String {
     match locale {
         Locale::En => en::model_label(model),
         Locale::Ru => ru::model_label(model),
+    }
+}
+
+/// The name of a stem as the user knows it: `Vocals`, `Вокал`.
+pub(crate) const fn stem_label(locale: Locale, stem: Stem) -> &'static str {
+    match locale {
+        Locale::En => en::stem_label(stem),
+        Locale::Ru => ru::stem_label(stem),
+    }
+}
+
+/// One line describing a cleanup network.
+pub(crate) const fn enhancer_label(locale: Locale, enhancer: EnhancerId) -> &'static str {
+    match locale {
+        Locale::En => en::enhancer_label(enhancer),
+        Locale::Ru => ru::enhancer_label(enhancer),
     }
 }
 
@@ -712,7 +743,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Auto,
             stem_split_core::domain::OverwritePolicy::Refuse,
-            OutputKind::Stems,
+            OutputKind::STEMS,
         )
         .err()
         .ok_or("the files should clash")?;

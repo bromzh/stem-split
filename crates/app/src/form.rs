@@ -5,15 +5,27 @@ use std::path::{Path, PathBuf};
 use stem_split_core::{
     batch::{Batch, OutputClash},
     domain::{
-        ByteCount, InputFile, InputFileError, InputFiles, ModelId, OutputChoice, OutputDir,
-        OutputDirError, OverwritePolicy,
+        ByteCount, CleanupTargets, EnhancerId, InputFile, InputFileError, InputFiles, ModelId,
+        OutputChoice, OutputDir, OutputDirError, OverwritePolicy, Stem, StemSet,
     },
-    job::OutputKind,
+    job::{Cleanup, MixOutput, MixStems, OutputKind},
     model::ModelStore,
     separate::DevicePreference,
 };
 
-use crate::{settings::Settings, view::text::Locale};
+use crate::{
+    settings::{CleanupChoice, MixChoice, Settings},
+    view::text::Locale,
+};
+
+/// Which of the two buttons started the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// A file for every stem.
+    Split,
+    /// A mix of the ticked stems, and the stems too if they are kept.
+    SplitAndMix,
+}
 
 /// Why what the user last picked, or asked for, was not accepted.
 #[derive(Debug)]
@@ -28,26 +40,39 @@ pub(crate) enum Problem {
 /// The choices on the main screen. Every field holds a value that has
 /// already been checked; a pick that fails the check leaves the field as it
 /// was and is remembered in `problem` to be shown.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Form {
     inputs: Option<InputFiles>,
     output: OutputChoice,
     model: ModelId,
     device: DevicePreference,
+    mix: MixChoice,
+    cleanup: CleanupChoice,
     problem: Option<Problem>,
     /// Size of the model files that are not on disk yet, if any. Looked up
     /// when the model changes, not on every frame.
     download: Option<ByteCount>,
 }
 
+impl Default for Form {
+    /// The form of a first launch.
+    fn default() -> Self {
+        Self::with(&Settings::initial())
+    }
+}
+
 impl Form {
     /// A form with no file chosen and the remembered choices filled in.
     pub(crate) fn with(settings: &Settings) -> Self {
         Self {
+            inputs: None,
             output: settings.output.clone(),
             model: settings.model,
             device: settings.device,
-            ..Self::default()
+            mix: settings.mix,
+            cleanup: settings.cleanup,
+            problem: None,
+            download: None,
         }
     }
 
@@ -58,7 +83,27 @@ impl Form {
             model: self.model,
             device: self.device,
             output: self.output.clone(),
+            mix: self.mix,
+            cleanup: self.cleanup,
         }
+    }
+
+    /// The ticked stems the current model has.
+    pub(crate) fn mix_stems(&self) -> StemSet {
+        self.mix.stems.within(self.model.layout())
+    }
+
+    pub(crate) const fn keeps_stems(&self) -> bool {
+        self.mix.keep_stems
+    }
+
+    pub(crate) const fn cleanup(&self) -> CleanupChoice {
+        self.cleanup
+    }
+
+    /// Whether "Split and mix" has something to mix.
+    pub(crate) fn can_mix(&self) -> bool {
+        !self.mix_stems().is_empty()
     }
 
     pub(crate) const fn inputs(&self) -> Option<&InputFiles> {
@@ -124,6 +169,49 @@ impl Form {
         self.device = device;
     }
 
+    pub(crate) const fn toggle_stem(&mut self, stem: Stem) {
+        self.mix.stems = self.mix.stems.toggled(stem);
+    }
+
+    /// Ticks every stem of the current model.
+    pub(crate) fn select_all_stems(&mut self) {
+        self.mix.stems = StemSet::all(self.model.layout());
+    }
+
+    pub(crate) const fn select_no_stems(&mut self) {
+        self.mix.stems = StemSet::none();
+    }
+
+    pub(crate) const fn set_keep_stems(&mut self, keep: bool) {
+        self.mix.keep_stems = keep;
+    }
+
+    /// Turns the cleanup on or off; the download it needs changes with it.
+    pub(crate) fn set_cleanup(&mut self, enabled: bool, store: Option<&ModelStore>) {
+        self.cleanup.enabled = enabled;
+        self.refresh_download(store);
+    }
+
+    pub(crate) const fn set_cleanup_stems(&mut self, stems: bool) {
+        self.cleanup.stems = stems;
+    }
+
+    pub(crate) const fn set_cleanup_mix(&mut self, mix: bool) {
+        self.cleanup.mix = mix;
+    }
+
+    /// Whether the chosen network can clean a mix of the ticked stems. One
+    /// that tells vocals from instruments cannot clean a mix of both, and
+    /// the tick for the mix then counts for nothing.
+    pub(crate) fn can_clean_mix(&self) -> bool {
+        MixOutput::can_clean_mix(self.cleanup.enhancer, self.mix_stems())
+    }
+
+    pub(crate) fn set_enhancer(&mut self, enhancer: EnhancerId, store: Option<&ModelStore>) {
+        self.cleanup.enhancer = enhancer;
+        self.refresh_download(store);
+    }
+
     /// Selects `model` and looks up whether it still has to be downloaded.
     /// Without a store nothing is known, and no download is announced.
     pub(crate) fn set_model(&mut self, model: ModelId, store: Option<&ModelStore>) {
@@ -131,17 +219,45 @@ impl Form {
         self.refresh_download(store);
     }
 
-    /// Looks the current model up in `store` again, for instance after a job
-    /// has downloaded it.
+    /// Looks the current model and cleanup network up in `store` again, for
+    /// instance after a job has downloaded them.
     pub(crate) fn refresh_download(&mut self, store: Option<&ModelStore>) {
         self.download = store
-            .filter(|store| !store.is_cached(self.model))
-            .map(|_| self.model.spec().download_size());
+            .map(|store| store.missing_size(self.model, self.cleanup.enhancer()))
+            .filter(|&size| size != ByteCount::ZERO);
     }
 
-    /// The jobs these choices describe, once files have been chosen, or why
-    /// they cannot all be run together.
-    pub(crate) fn batch(&self, overwrite: OverwritePolicy) -> Option<Result<Batch, OutputClash>> {
+    /// What the jobs of `mode` produce. `None` for a mix without stems.
+    fn output_kind(&self, mode: Mode) -> Option<OutputKind> {
+        let enhancer = self.cleanup.enhancer();
+        Some(match mode {
+            Mode::Split => OutputKind::Stems {
+                cleanup: enhancer.filter(|_| self.cleanup.stems),
+            },
+            Mode::SplitAndMix => {
+                let targets = CleanupTargets::from_ticks(
+                    self.cleanup.stems,
+                    self.cleanup.mix && self.can_clean_mix(),
+                );
+                let cleanup = enhancer
+                    .zip(targets)
+                    .map(|(enhancer, targets)| Cleanup { enhancer, targets });
+                let stems = MixStems::new(self.mix_stems(), self.model.layout()).ok()?;
+                // The tick for the mix counts only where the network can
+                // clean it, so the mix is always valid here.
+                OutputKind::Mix(MixOutput::new(stems, self.mix.keep_stems, cleanup).ok()?)
+            }
+        })
+    }
+
+    /// The jobs these choices describe for `mode`, once files have been
+    /// chosen and, for a mix, a stem ticked; or why they cannot all be run
+    /// together.
+    pub(crate) fn batch(
+        &self,
+        mode: Mode,
+        overwrite: OverwritePolicy,
+    ) -> Option<Result<Batch, OutputClash>> {
         let inputs = self.inputs.as_ref()?;
         Some(Batch::new(
             inputs,
@@ -149,7 +265,7 @@ impl Form {
             self.model,
             self.device,
             overwrite,
-            OutputKind::Stems,
+            self.output_kind(mode)?,
         ))
     }
 
@@ -181,7 +297,7 @@ mod tests {
 
     fn requests(form: &Form) -> Result<Vec<SeparationRequest>, Box<dyn Error>> {
         let batch = form
-            .batch(OverwritePolicy::Refuse)
+            .batch(Mode::Split, OverwritePolicy::Refuse)
             .ok_or("no batch for chosen files")??;
         Ok(batch.requests().cloned().collect())
     }
@@ -195,6 +311,16 @@ mod tests {
             model: ModelId::HtdemucsFt,
             device: DevicePreference::Cpu,
             output: OutputChoice::Custom(OutputDir::new(directory.path())?),
+            mix: MixChoice {
+                stems: StemSet::none().toggled(Stem::Vocals),
+                keep_stems: true,
+            },
+            cleanup: CleanupChoice {
+                enabled: true,
+                stems: false,
+                mix: true,
+                enhancer: EnhancerId::ReverbHq,
+            },
         };
 
         let form = Form::with(&settings);
@@ -215,7 +341,7 @@ mod tests {
         assert_eq!(form.output(), &OutputChoice::BesideInput);
         assert_eq!(form.model(), ModelId::Htdemucs);
         assert_eq!(form.device(), DevicePreference::Auto);
-        assert!(form.batch(OverwritePolicy::Refuse).is_none());
+        assert!(form.batch(Mode::Split, OverwritePolicy::Refuse).is_none());
     }
 
     #[test]
@@ -294,7 +420,7 @@ mod tests {
         ]);
 
         let clash = form
-            .batch(OverwritePolicy::Refuse)
+            .batch(Mode::Split, OverwritePolicy::Refuse)
             .ok_or("no batch")?
             .err()
             .ok_or("the files should clash")?;
@@ -337,6 +463,167 @@ mod tests {
             form.problem(),
             Some(Problem::Output(OutputDirError::Inaccessible { .. }))
         ));
+        Ok(())
+    }
+
+    fn output_kind_of(form: &Form, mode: Mode) -> Result<OutputKind, Box<dyn Error>> {
+        let batch = form
+            .batch(mode, OverwritePolicy::Refuse)
+            .ok_or("no batch")??;
+        let request = batch.requests().next().ok_or("no job")?;
+        Ok(request.output_kind())
+    }
+
+    #[test]
+    fn split_and_mix_needs_a_ticked_stem_of_the_model() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        form.set_inputs(&[audio(directory.path(), "song.mp3")?]);
+        assert!(form.can_mix(), "every stem is ticked at first");
+
+        form.select_no_stems();
+        assert!(!form.can_mix());
+        assert!(
+            form.batch(Mode::SplitAndMix, OverwritePolicy::Refuse)
+                .is_none()
+        );
+        // Splitting does not need a ticked stem.
+        assert!(form.batch(Mode::Split, OverwritePolicy::Refuse).is_some());
+
+        // A stem the model does not have does not count.
+        form.toggle_stem(Stem::Piano);
+        assert!(!form.can_mix());
+        form.set_model(ModelId::Htdemucs6s, None);
+        assert!(form.can_mix());
+        Ok(())
+    }
+
+    #[test]
+    fn mix_takes_the_ticked_stems_and_the_cleanup() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        form.set_inputs(&[audio(directory.path(), "song.mp3")?]);
+        form.select_no_stems();
+        form.toggle_stem(Stem::Drums);
+        form.toggle_stem(Stem::Bass);
+        form.set_keep_stems(true);
+        form.set_cleanup(true, None);
+        form.set_cleanup_mix(true);
+
+        let OutputKind::Mix(mix) = output_kind_of(&form, Mode::SplitAndMix)? else {
+            return Err("not a mix".into());
+        };
+        assert_eq!(
+            mix.stems()
+                .iter(ModelId::Htdemucs.layout())
+                .collect::<Vec<_>>(),
+            [Stem::Drums, Stem::Bass]
+        );
+        assert!(mix.keeps_stems());
+        assert_eq!(
+            mix.cleanup(),
+            Some(Cleanup {
+                enhancer: EnhancerId::ReverbHq,
+                targets: CleanupTargets::Both,
+            })
+        );
+
+        form.set_cleanup_stems(false);
+        let OutputKind::Mix(mix) = output_kind_of(&form, Mode::SplitAndMix)? else {
+            return Err("not a mix".into());
+        };
+        assert_eq!(
+            mix.cleanup().map(|cleanup| cleanup.targets),
+            Some(CleanupTargets::Mix)
+        );
+
+        // With neither ticked there is nothing to clean.
+        form.set_cleanup_mix(false);
+        let OutputKind::Mix(mix) = output_kind_of(&form, Mode::SplitAndMix)? else {
+            return Err("not a mix".into());
+        };
+        assert_eq!(mix.cleanup(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn split_cleans_the_stems_only_when_they_are_ticked() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        form.set_inputs(&[audio(directory.path(), "song.mp3")?]);
+        assert_eq!(output_kind_of(&form, Mode::Split)?, OutputKind::STEMS);
+
+        form.set_cleanup(true, None);
+        form.set_cleanup_mix(true);
+        assert_eq!(
+            output_kind_of(&form, Mode::Split)?,
+            OutputKind::Stems {
+                cleanup: Some(EnhancerId::ReverbHq)
+            }
+        );
+
+        form.set_cleanup_stems(false);
+        assert_eq!(output_kind_of(&form, Mode::Split)?, OutputKind::STEMS);
+        Ok(())
+    }
+
+    #[test]
+    fn vocal_network_leaves_a_mix_of_vocals_and_instruments_alone() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut form = Form::default();
+        form.set_inputs(&[audio(directory.path(), "song.mp3")?]);
+        form.set_cleanup(true, None);
+        form.set_cleanup_mix(true);
+        form.set_enhancer(EnhancerId::VocalBleed, None);
+
+        // Every stem is ticked: vocals and instruments together.
+        assert!(!form.can_clean_mix());
+        let OutputKind::Mix(mix) = output_kind_of(&form, Mode::SplitAndMix)? else {
+            return Err("not a mix".into());
+        };
+        assert_eq!(
+            mix.cleanup().map(|cleanup| cleanup.targets),
+            Some(CleanupTargets::Stems)
+        );
+
+        // Without the vocals the mix can be cleaned of what leaked in.
+        form.toggle_stem(Stem::Vocals);
+        assert!(form.can_clean_mix());
+        let OutputKind::Mix(mix) = output_kind_of(&form, Mode::SplitAndMix)? else {
+            return Err("not a mix".into());
+        };
+        assert_eq!(
+            mix.cleanup().map(|cleanup| cleanup.targets),
+            Some(CleanupTargets::Both)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_all_ticks_the_stems_of_the_model() {
+        let mut form = Form::default();
+        form.select_no_stems();
+        form.set_model(ModelId::Htdemucs6s, None);
+
+        form.select_all_stems();
+
+        assert_eq!(form.mix_stems(), StemSet::all(ModelId::Htdemucs6s.layout()));
+    }
+
+    #[test]
+    fn cleanup_adds_its_network_to_the_download() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = ModelStore::new(directory.path());
+        let mut form = Form::default();
+        form.set_model(ModelId::Htdemucs, Some(&store));
+        let model = ModelId::Htdemucs.spec().download_size().get();
+
+        form.set_cleanup(true, Some(&store));
+
+        let network = EnhancerId::ReverbHq.spec().file().size().get();
+        assert_eq!(form.download().map(ByteCount::get), Some(model + network));
+        form.set_cleanup(false, Some(&store));
+        assert_eq!(form.download().map(ByteCount::get), Some(model));
         Ok(())
     }
 

@@ -196,14 +196,15 @@ impl Worker {
     }
 }
 
-/// Makes sure the model of `batch` is on disk.
+/// Makes sure the model of `batch`, and its cleanup network if it has one,
+/// are on disk.
 fn fetch(
     store: &ModelStore,
     batch: &Batch,
     on_progress: &mut dyn FnMut(DownloadProgress),
     cancel: &CancelToken,
 ) -> Result<Fetched, Failure> {
-    match store.ensure(batch.model(), on_progress, cancel) {
+    match store.ensure_files(batch.model(), batch.enhancer(), on_progress, cancel) {
         Ok(Ensured::Ready(_)) => Ok(Fetched::Ready),
         Ok(Ensured::Cancelled) => Ok(Fetched::Cancelled),
         Err(error) => Err(Failure::Job(error.into())),
@@ -313,7 +314,7 @@ mod tests {
             ModelId::Htdemucs,
             DevicePreference::Cpu,
             OverwritePolicy::Refuse,
-            OutputKind::Stems,
+            OutputKind::STEMS,
         )?)
     }
 

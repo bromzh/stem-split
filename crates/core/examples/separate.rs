@@ -4,6 +4,9 @@
 //! ```sh
 //! cargo run --release -p stem-split-core --example separate -- song.flac \
 //!     --model htdemucs --device auto --output stems --replace
+//! # a mix of drums and bass, its stems cleaned up before they are summed
+//! cargo run --release -p stem-split-core --example separate -- song.flac \
+//!     --mix drums,bass --cleanup reverb_hq --cleanup-target both
 //! ```
 
 use std::{cell::Cell, env, num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Instant};
@@ -11,10 +14,13 @@ use std::{cell::Cell, env, num::NonZeroUsize, path::PathBuf, process::ExitCode, 
 use stem_split_core::{
     CancelToken,
     domain::{
-        InputFile, InputFileError, ModelId, OutputChoice, OutputDir, OutputDirError,
-        OverwritePolicy,
+        CleanupTargets, EnhancerId, InputFile, InputFileError, ModelId, OutputChoice, OutputDir,
+        OutputDirError, OverwritePolicy, Stem, StemSet,
     },
-    job::{self, JobEnd, JobError, Progress, SeparationRequest},
+    job::{
+        self, Cleanup, JobEnd, JobError, MixOutput, MixStems, OutputKind, Progress,
+        SeparationRequest,
+    },
     model::{ModelStore, ModelStoreError},
     separate::{CpuThreads, DevicePreference},
 };
@@ -22,11 +28,19 @@ use stem_split_core::{
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error(
-        "usage: separate <input> [--model NAME] [--device auto|gpu|cpu] [--output DIR] [--replace] [--threads N]"
+        "usage: separate <input> [--model NAME] [--device auto|gpu|cpu] [--output DIR] [--replace] [--threads N] [--mix STEM,STEM...] [--keep-stems] [--cleanup NAME] [--cleanup-target stems|mix|both]"
     )]
     Usage,
     #[error("unknown model `{0}`")]
     UnknownModel(String),
+    #[error("unknown stem `{0}`")]
+    UnknownStem(String),
+    #[error("unknown cleanup network `{0}`")]
+    UnknownEnhancer(String),
+    #[error("the mix stems do not fit the model: {0}")]
+    Mix(#[from] job::MixStemsError),
+    #[error(transparent)]
+    MixCleanup(#[from] job::MixCleanupError),
     #[error("unknown device `{0}`")]
     UnknownDevice(String),
     #[error(transparent)]
@@ -65,6 +79,10 @@ fn parse(mut arguments: impl Iterator<Item = String>) -> Result<SeparationReques
     let mut output = OutputChoice::default();
     let mut overwrite = OverwritePolicy::default();
     let mut threads = CpuThreads::all();
+    let mut mix: Option<StemSet> = None;
+    let mut keep_stems = false;
+    let mut enhancer: Option<EnhancerId> = None;
+    let mut targets = CleanupTargets::Stems;
 
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
@@ -90,6 +108,38 @@ fn parse(mut arguments: impl Iterator<Item = String>) -> Result<SeparationReques
                 output = OutputChoice::Custom(OutputDir::new(directory)?);
             }
             "--replace" => overwrite = OverwritePolicy::Replace,
+            "--mix" => {
+                let list = arguments.next().ok_or(Error::Usage)?;
+                let mut stems = StemSet::none();
+                for name in list.split(',') {
+                    let stem = Stem::ALL
+                        .iter()
+                        .copied()
+                        .find(|stem| stem.file_tag() == name)
+                        .ok_or_else(|| Error::UnknownStem(name.to_owned()))?;
+                    stems = stems.toggled(stem);
+                }
+                mix = Some(stems);
+            }
+            "--keep-stems" => keep_stems = true,
+            "--cleanup" => {
+                let name = arguments.next().ok_or(Error::Usage)?;
+                enhancer = Some(
+                    EnhancerId::ALL
+                        .iter()
+                        .copied()
+                        .find(|candidate| candidate.name() == name)
+                        .ok_or(Error::UnknownEnhancer(name))?,
+                );
+            }
+            "--cleanup-target" => {
+                targets = match arguments.next().ok_or(Error::Usage)?.as_str() {
+                    "stems" => CleanupTargets::Stems,
+                    "mix" => CleanupTargets::Mix,
+                    "both" => CleanupTargets::Both,
+                    _ => return Err(Error::Usage),
+                };
+            }
             "--threads" => {
                 let count = arguments.next().ok_or(Error::Usage)?;
                 let count = count.parse::<NonZeroUsize>().map_err(|_| Error::Usage)?;
@@ -98,17 +148,34 @@ fn parse(mut arguments: impl Iterator<Item = String>) -> Result<SeparationReques
             _ => return Err(Error::Usage),
         }
     }
-    Ok(SeparationRequest::new(input, &output, model, device, overwrite).with_cpu_threads(threads))
+    let output_kind = match mix {
+        None => OutputKind::Stems { cleanup: enhancer },
+        Some(stems) => OutputKind::Mix(MixOutput::new(
+            MixStems::new(stems, model.layout())?,
+            keep_stems,
+            enhancer.map(|enhancer| Cleanup { enhancer, targets }),
+        )?),
+    };
+    Ok(
+        SeparationRequest::new(input, &output, model, device, overwrite)
+            .with_cpu_threads(threads)
+            .with_output_kind(output_kind),
+    )
 }
 
 fn run() -> Result<(), Error> {
     let request = parse(env::args().skip(1))?;
     let store = ModelStore::in_user_cache()?;
     println!("input: {}", request.input().path().display());
+    let enhancer = request.output_kind().enhancer();
     println!(
-        "model: {} ({})",
+        "model: {}{} ({})",
         request.model().name(),
-        if store.is_cached(request.model()) {
+        enhancer.map_or(String::new(), |enhancer| format!(
+            ", cleanup {}",
+            enhancer.name()
+        )),
+        if store.missing_size(request.model(), enhancer).get() == 0 {
             "cached"
         } else {
             "will be downloaded"
@@ -136,6 +203,14 @@ fn run() -> Result<(), Error> {
             "chunk {done}/{total} on {device:?}, {:.1} s elapsed",
             started.elapsed().as_secs_f64()
         ),
+        Progress::Enhancing {
+            done,
+            total,
+            device,
+        } => println!(
+            "cleanup window {done}/{total} on {device:?}, {:.1} s elapsed",
+            started.elapsed().as_secs_f64()
+        ),
         Progress::Finalizing => println!("finishing the files"),
     };
 
@@ -143,6 +218,9 @@ fn run() -> Result<(), Error> {
         JobEnd::Completed(output) => {
             for (stem, path) in output.files() {
                 println!("{stem:?}: {}", path.display());
+            }
+            if let Some(mix) = output.mix() {
+                println!("mix: {}", mix.display());
             }
             println!(
                 "done in {:.1} s, last device {:?}",

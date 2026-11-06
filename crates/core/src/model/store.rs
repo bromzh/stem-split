@@ -13,10 +13,11 @@ use ureq::{
     tls::{RootCerts, TlsConfig},
 };
 
-use super::registry::{BASE_URL, GraphSpec, ModelSpec, StemSelection};
+use super::registry::{FileSpec, GraphSpec, ModelSpec, StemSelection};
 use crate::{
     cancel::CancelToken,
-    domain::{ByteCount, ModelId, OverwritePolicy, Sha256Digest},
+    domain::{ByteCount, EnhancerId, ModelId, OverwritePolicy, Sha256Digest},
+    enhance::{MdxParams, NetworkOutput},
     partial::{PartialFile, PartialFileError},
 };
 
@@ -202,10 +203,55 @@ impl LocalModel {
     }
 }
 
+/// A cleanup network whose file is on the local disk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalEnhancer {
+    path: PathBuf,
+    params: MdxParams,
+    output: NetworkOutput,
+}
+
+impl LocalEnhancer {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn params(&self) -> &MdxParams {
+        &self.params
+    }
+
+    #[must_use]
+    pub const fn output(&self) -> NetworkOutput {
+        self.output
+    }
+}
+
+/// Everything a job runs, on the local disk: the separation model, and the
+/// cleanup network when the job cleans up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalFiles {
+    model: LocalModel,
+    enhancer: Option<LocalEnhancer>,
+}
+
+impl LocalFiles {
+    #[must_use]
+    pub const fn model(&self) -> &LocalModel {
+        &self.model
+    }
+
+    #[must_use]
+    pub const fn enhancer(&self) -> Option<&LocalEnhancer> {
+        self.enhancer.as_ref()
+    }
+}
+
 /// How [`ModelStore::ensure`] ended, short of an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ensured {
-    Ready(LocalModel),
+pub enum Ensured<T = LocalModel> {
+    Ready(T),
     /// The user cancelled while files were being downloaded. Files that had
     /// finished stay in the cache; the unfinished one is removed.
     Cancelled,
@@ -227,6 +273,16 @@ enum Transport {
     AllowPlainHttp,
 }
 
+/// Where files are downloaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// The repository the registry names for each file.
+    Registry,
+    /// One server for every file, under the path it has in its repository.
+    #[cfg(test)]
+    Fixed(String),
+}
+
 /// Model files on the local disk, downloaded on first use.
 ///
 /// A file appears in the store only after its size and SHA-256 digest have
@@ -235,14 +291,14 @@ enum Transport {
 #[derive(Debug, Clone)]
 pub struct ModelStore {
     directory: PathBuf,
-    base_url: String,
+    source: Source,
     agent: Agent,
 }
 
 impl ModelStore {
     /// A store that keeps its files in `directory`.
     pub fn new(directory: impl Into<PathBuf>) -> Self {
-        Self::with_source(directory.into(), BASE_URL, Transport::HttpsOnly)
+        Self::with_source(directory.into(), Source::Registry, Transport::HttpsOnly)
     }
 
     /// A store in the current user's cache directory.
@@ -257,7 +313,7 @@ impl ModelStore {
         Ok(Self::new(directories.cache_dir().join(MODELS_DIRECTORY)))
     }
 
-    fn with_source(directory: PathBuf, base_url: &str, transport: Transport) -> Self {
+    fn with_source(directory: PathBuf, source: Source, transport: Transport) -> Self {
         let https_only = match transport {
             Transport::HttpsOnly => true,
             #[cfg(test)]
@@ -279,9 +335,19 @@ impl ModelStore {
             .new_agent();
         Self {
             directory,
-            base_url: base_url.to_owned(),
+            source,
             agent,
         }
+    }
+
+    /// The address `file` is downloaded from.
+    fn url(&self, file: &FileSpec) -> String {
+        let base = match &self.source {
+            Source::Registry => file.repository().base_url(),
+            #[cfg(test)]
+            Source::Fixed(base) => base,
+        };
+        format!("{base}/{}", file.remote_path())
     }
 
     /// The directory the files are kept in.
@@ -294,7 +360,18 @@ impl ModelStore {
     /// [`ModelStore::ensure`] would not touch the network.
     #[must_use]
     pub fn is_cached(&self, model: ModelId) -> bool {
-        model.spec().graphs().all(|graph| self.has(graph))
+        model.spec().graphs().all(|graph| self.has(graph.file()))
+    }
+
+    /// How much [`ModelStore::ensure_files`] would download for `model` and
+    /// `enhancer`; zero when everything is in place.
+    #[must_use]
+    pub fn missing_size(&self, model: ModelId, enhancer: Option<EnhancerId>) -> ByteCount {
+        let total = files_of(model, enhancer)
+            .into_iter()
+            .filter(|file| !self.has(file))
+            .fold(0_u64, |total, file| total.saturating_add(file.size().get()));
+        ByteCount::new(total)
     }
 
     /// How much room the files in the directory take: the models, files of
@@ -397,17 +474,49 @@ impl ModelStore {
         on_progress: &mut dyn FnMut(DownloadProgress),
         cancel: &CancelToken,
     ) -> Result<Ensured, ModelStoreError> {
-        let spec = model.spec();
-        let graphs: Vec<&GraphSpec> = spec.graphs().collect();
-        match self.fetch_missing(&graphs, on_progress, cancel)? {
-            Fetch::Complete => Ok(Ensured::Ready(self.locate(spec))),
+        Ok(match self.ensure_files(model, None, on_progress, cancel)? {
+            Ensured::Ready(files) => Ensured::Ready(files.model),
+            Ensured::Cancelled => Ensured::Cancelled,
+        })
+    }
+
+    /// Makes sure every file of `model`, and of `enhancer` if there is one,
+    /// is in the store, downloading the missing ones. Progress counts all of
+    /// them together, as one download.
+    ///
+    /// `on_progress` is called after each block received from the network;
+    /// it is not called at all when nothing has to be downloaded. `cancel`
+    /// is checked between blocks.
+    ///
+    /// # Errors
+    ///
+    /// The same as for [`ModelStore::ensure`].
+    pub fn ensure_files(
+        &self,
+        model: ModelId,
+        enhancer: Option<EnhancerId>,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &CancelToken,
+    ) -> Result<Ensured<LocalFiles>, ModelStoreError> {
+        match self.fetch_missing(&files_of(model, enhancer), on_progress, cancel)? {
+            Fetch::Complete => Ok(Ensured::Ready(LocalFiles {
+                model: self.locate(model.spec()),
+                enhancer: enhancer.map(|enhancer| {
+                    let spec = enhancer.spec();
+                    LocalEnhancer {
+                        path: self.path_of(spec.file()),
+                        params: spec.params(),
+                        output: spec.output(),
+                    }
+                }),
+            })),
             Fetch::Cancelled => Ok(Ensured::Cancelled),
         }
     }
 
     fn locate(&self, spec: &ModelSpec) -> LocalModel {
         let local = |graph: &GraphSpec| LocalGraph {
-            path: self.path_of(graph),
+            path: self.path_of(graph.file()),
             emits: graph.emits(),
         };
         LocalModel {
@@ -416,22 +525,22 @@ impl ModelStore {
         }
     }
 
-    fn path_of(&self, graph: &GraphSpec) -> PathBuf {
+    fn path_of(&self, graph: &FileSpec) -> PathBuf {
         self.directory.join(graph.cache_file_name())
     }
 
-    fn has(&self, graph: &GraphSpec) -> bool {
+    fn has(&self, graph: &FileSpec) -> bool {
         fs::metadata(self.path_of(graph))
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == graph.size().get())
     }
 
     fn fetch_missing(
         &self,
-        graphs: &[&GraphSpec],
+        graphs: &[&FileSpec],
         on_progress: &mut dyn FnMut(DownloadProgress),
         cancel: &CancelToken,
     ) -> Result<Fetch, ModelStoreError> {
-        let missing: Vec<&GraphSpec> = graphs
+        let missing: Vec<&FileSpec> = graphs
             .iter()
             .copied()
             .filter(|graph| !self.has(graph))
@@ -467,11 +576,11 @@ impl ModelStore {
     /// visible under its final name.
     fn download(
         &self,
-        graph: &GraphSpec,
+        graph: &FileSpec,
         on_block: &mut dyn FnMut(u64),
         cancel: &CancelToken,
     ) -> Result<Fetch, ModelStoreError> {
-        let url = format!("{}/{}", self.base_url, graph.remote_file_name());
+        let url = self.url(graph);
         let target = self.path_of(graph);
         let expected = graph.size().get();
 
@@ -548,6 +657,16 @@ impl ModelStore {
     }
 }
 
+/// The files of `model` and of `enhancer`, in the order they are fetched.
+fn files_of(model: ModelId, enhancer: Option<EnhancerId>) -> Vec<&'static FileSpec> {
+    model
+        .spec()
+        .graphs()
+        .map(GraphSpec::file)
+        .chain(enhancer.map(|enhancer| enhancer.spec().file()))
+        .collect()
+}
+
 /// Reads the next block into `buffer`, retrying reads interrupted by a
 /// signal. An empty block means the end of the stream.
 fn read_block<'a>(reader: &mut impl Read, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
@@ -581,6 +700,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::model::Repository;
 
     /// What the test server answers for a path.
     #[derive(Debug, Clone)]
@@ -629,7 +749,7 @@ mod tests {
         fn store(&self, directory: &Path) -> ModelStore {
             ModelStore::with_source(
                 directory.to_path_buf(),
-                &self.base_url,
+                Source::Fixed(self.base_url.clone()),
                 Transport::AllowPlainHttp,
             )
         }
@@ -661,18 +781,19 @@ mod tests {
         stream.flush()
     }
 
-    /// A graph spec that describes `content` exactly.
-    fn spec_for(name: &'static str, content: &[u8]) -> GraphSpec {
-        GraphSpec::new(
+    /// A file spec that describes `content` exactly.
+    fn spec_for(name: &'static str, content: &[u8]) -> FileSpec {
+        FileSpec::new(
+            Repository::DemucsOnnx,
+            "",
             name,
             ByteCount::new(u64::try_from(content.len()).unwrap_or(u64::MAX)),
             Sha256Digest::new(Sha256::digest(content).into()),
-            StemSelection::All,
         )
     }
 
-    fn route(graph: &GraphSpec) -> String {
-        format!("/{}", graph.remote_file_name())
+    fn route(graph: &FileSpec) -> String {
+        format!("/{}", graph.remote_path())
     }
 
     /// Deterministic filler that is not all one byte.
@@ -942,7 +1063,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = ModelStore::with_source(
             directory.path().to_path_buf(),
-            &server.base_url,
+            Source::Fixed(server.base_url.clone()),
             Transport::HttpsOnly,
         );
 

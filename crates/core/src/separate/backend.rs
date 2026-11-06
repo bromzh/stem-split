@@ -4,8 +4,6 @@
 //! constants below: the host supplies the waveform and its spectrogram, and
 //! adds the inverse transform of the spectral output to the time-domain one.
 
-mod providers;
-
 use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -21,6 +19,7 @@ use super::{
 use crate::{
     closed_enum,
     domain::{Stem, StemLayout},
+    providers::DeviceSession,
 };
 
 /// Input: normalized waveform, `[1, 2, SEGMENT_FRAMES]`.
@@ -116,13 +115,6 @@ impl From<ort::Error> for InferenceError {
     }
 }
 
-/// Whether a CPU session may take over when the GPU misbehaves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Fallback {
-    ToCpu,
-    Unavailable,
-}
-
 /// How many threads a CPU session may use; at least one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuThreads(NonZeroUsize);
@@ -162,12 +154,7 @@ impl CpuThreads {
 /// One model graph loaded into ONNX Runtime.
 #[derive(Debug)]
 pub struct OrtSeparator {
-    session: Session,
-    device: ActiveDevice,
-    fallback: Fallback,
-    graph: PathBuf,
-    /// For a CPU session, including one that replaces a failed GPU.
-    threads: CpuThreads,
+    runtime: DeviceSession,
     stems: NonZeroUsize,
     stft: Stft,
     /// Model input `MIX`: left channel, then right.
@@ -196,41 +183,11 @@ impl OrtSeparator {
         preference: DevicePreference,
         threads: CpuThreads,
     ) -> Result<Self, InferenceError> {
-        let on_cpu = || {
-            providers::cpu_session(graph, threads).map_err(|source| InferenceError::Load {
-                path: graph.to_path_buf(),
-                source: Box::new(source),
-            })
-        };
-        let (session, device, fallback) = match preference {
-            DevicePreference::Cpu => (on_cpu()?, ActiveDevice::Cpu, Fallback::Unavailable),
-            DevicePreference::Gpu => match providers::gpu_session(graph) {
-                Some(Ok(session)) => (session, ActiveDevice::DirectMl, Fallback::Unavailable),
-                Some(Err(source)) => {
-                    return Err(InferenceError::GpuUnavailable {
-                        path: graph.to_path_buf(),
-                        source: Box::new(source),
-                    });
-                }
-                None => return Err(InferenceError::GpuUnsupported),
-            },
-            DevicePreference::Auto => match providers::gpu_session(graph) {
-                Some(Ok(session)) => (session, ActiveDevice::DirectMl, Fallback::ToCpu),
-                Some(Err(error)) => {
-                    log::warn!("GPU session could not be created, using the CPU: {error}");
-                    (on_cpu()?, ActiveDevice::Cpu, Fallback::Unavailable)
-                }
-                None => (on_cpu()?, ActiveDevice::Cpu, Fallback::Unavailable),
-            },
-        };
-        check_contract(&session, graph)?;
+        let runtime = DeviceSession::open(graph, preference, threads)?;
+        check_contract(runtime.session(), graph)?;
 
         Ok(Self {
-            session,
-            device,
-            fallback,
-            graph: graph.to_path_buf(),
-            threads,
+            runtime,
             stems: layout.count(),
             stft: Stft::new(),
             mix: Vec::with_capacity(CHANNELS * SEGMENT_FRAMES),
@@ -246,14 +203,14 @@ impl OrtSeparator {
             Ok(stems)
         } else {
             Err(InferenceError::Implausible {
-                device: self.device,
+                device: self.runtime.device(),
             })
         }
     }
 
     fn infer(&mut self, segment: &Segment) -> Result<ChunkStems, InferenceError> {
         let Self {
-            session,
+            runtime,
             stems,
             stft,
             mix,
@@ -284,7 +241,9 @@ impl OrtSeparator {
             [1, 4, BINS_DIM, STFT_FRAMES_DIM],
             spectrogram.as_slice(),
         ))?;
-        let outputs = session.run(ort::inputs![MIX => mix_tensor, MAG => spectrogram_tensor])?;
+        let outputs = runtime
+            .session_mut()
+            .run(ort::inputs![MIX => mix_tensor, MAG => spectrogram_tensor])?;
 
         let stem_dim = i64::try_from(stems.get()).unwrap_or(i64::MAX);
         let (shape, wav) = outputs
@@ -338,33 +297,17 @@ impl OrtSeparator {
 
 impl Separator for OrtSeparator {
     fn separate(&mut self, segment: &Segment) -> Result<ChunkStems, InferenceError> {
-        let error = match self.attempt(segment) {
-            Ok(stems) => return Ok(stems),
-            Err(error) => error,
-        };
-        match (self.device, self.fallback) {
-            (ActiveDevice::DirectMl, Fallback::ToCpu) => {
-                log::warn!("the GPU failed, continuing on the CPU: {error}");
-                self.session =
-                    providers::cpu_session(&self.graph, self.threads).map_err(|source| {
-                        InferenceError::Load {
-                            path: self.graph.clone(),
-                            source: Box::new(source),
-                        }
-                    })?;
-                self.device = ActiveDevice::Cpu;
-                self.fallback = Fallback::Unavailable;
+        match self.attempt(segment) {
+            Ok(stems) => Ok(stems),
+            Err(error) => {
+                self.runtime.fall_back(error)?;
                 self.attempt(segment)
             }
-            (
-                ActiveDevice::DirectMl | ActiveDevice::Cpu,
-                Fallback::ToCpu | Fallback::Unavailable,
-            ) => Err(error),
         }
     }
 
     fn device(&self) -> ActiveDevice {
-        self.device
+        self.runtime.device()
     }
 }
 
@@ -570,7 +513,7 @@ mod tests {
 
     /// Runs the reference export, whose graph contains the transforms.
     fn run_reference(graph: &Path, segment: &Segment) -> Result<ChunkStems, Box<dyn Error>> {
-        let mut session = providers::cpu_session(graph, CpuThreads::all())?;
+        let mut session = crate::providers::cpu_session(graph, CpuThreads::all())?;
         let mix: Vec<f32> = segment
             .left()
             .iter()

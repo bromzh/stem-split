@@ -6,11 +6,13 @@
 pub mod audio;
 pub mod batch;
 pub mod domain;
+pub mod enhance;
 pub mod job;
 pub mod model;
 pub mod separate;
 
 mod cancel;
 mod partial;
+mod providers;
 
 pub use cancel::CancelToken;

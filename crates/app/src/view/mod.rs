@@ -11,7 +11,7 @@ use std::{
 
 use eframe::egui;
 use stem_split_core::{
-    domain::{ByteCount, ModelId, OutputChoice},
+    domain::{ByteCount, EnhancerId, ModelId, OutputChoice, Stem, StemSet},
     job::Progress,
     model::Usage,
     separate::DevicePreference,
@@ -20,7 +20,7 @@ use stem_split_core::{
 use self::text::{Locale, Message, Text};
 use crate::{
     downloads::Downloads,
-    form::{Form, Problem},
+    form::{Form, Mode, Problem},
     tracker::{Outcome, Overview, Results, RowStatus},
     worker::Failure,
 };
@@ -64,10 +64,18 @@ pub(crate) enum EditingAction {
     OutputBesideInput,
     Model(ModelId),
     Device(DevicePreference),
+    ToggleStem(Stem),
+    AllStems,
+    NoStems,
+    KeepStems(bool),
+    Cleanup(bool),
+    CleanupStems(bool),
+    CleanupMix(bool),
+    Enhancer(EnhancerId),
     Language(Locale),
     OpenDownloads,
     ClearDownloads,
-    Start,
+    Start(Mode),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +335,135 @@ fn downloads_buttons(
     action
 }
 
+/// The stems of the current model to put in a mix, ticks for all or none of
+/// them, and whether the stems are saved next to the mix.
+fn stems_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    _downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
+    let mut action = None;
+    ui.label(Text::Stems.get(locale));
+    ui.vertical(|ui| {
+        let layout = form.model().layout();
+        let selected = form.mix_stems();
+        ui.horizontal_wrapped(|ui| {
+            for stem in layout.iter() {
+                let mut ticked = selected.contains(stem);
+                if ui
+                    .checkbox(&mut ticked, text::stem_label(locale, stem))
+                    .clicked()
+                {
+                    action = Some(EditingAction::ToggleStem(stem));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            // "All" ticked again unticks everything, as a master checkbox
+            // does; "None" only ever clears.
+            let mut all = selected == StemSet::all(layout);
+            if ui.checkbox(&mut all, Text::AllStems.get(locale)).clicked() {
+                action = Some(if all {
+                    EditingAction::AllStems
+                } else {
+                    EditingAction::NoStems
+                });
+            }
+            let mut none = selected.is_empty();
+            if ui.checkbox(&mut none, Text::NoStems.get(locale)).clicked() {
+                action = Some(EditingAction::NoStems);
+            }
+            ui.separator();
+            let mut keep = form.keeps_stems();
+            if ui
+                .checkbox(&mut keep, Text::KeepStems.get(locale))
+                .on_hover_text(Text::KeepStemsHint.get(locale))
+                .clicked()
+            {
+                action = Some(EditingAction::KeepStems(keep));
+            }
+        });
+    });
+    action
+}
+
+/// Whether the results are cleaned up, whether the stems, the mix or both,
+/// and by which network.
+fn cleanup_row(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    _downloads: Option<&Downloads>,
+) -> Option<EditingAction> {
+    let mut action = None;
+    let heading = ui.label(Text::Cleanup.get(locale));
+    ui.vertical(|ui| {
+        let cleanup = form.cleanup();
+        let mut enabled = cleanup.enabled;
+        if ui
+            .checkbox(&mut enabled, Text::CleanUpArtifacts.get(locale))
+            .clicked()
+        {
+            action = Some(EditingAction::Cleanup(enabled));
+        }
+        ui.add_enabled_ui(cleanup.enabled, |ui| {
+            ui.horizontal(|ui| {
+                let mut stems = cleanup.stems;
+                if ui
+                    .checkbox(&mut stems, Text::CleanupStems.get(locale))
+                    .on_hover_text(Text::CleanupStemsHint.get(locale))
+                    .clicked()
+                {
+                    action = Some(EditingAction::CleanupStems(stems));
+                }
+                // A network that tells vocals from instruments cannot clean a
+                // mix of both; the tick stays as it was, but counts for nothing.
+                let possible = form.can_clean_mix();
+                let mut mix = cleanup.mix && possible;
+                let response = ui
+                    .add_enabled(
+                        possible,
+                        egui::Checkbox::new(&mut mix, Text::CleanupMix.get(locale)),
+                    )
+                    .on_hover_text(Text::CleanupMixHint.get(locale))
+                    .on_disabled_hover_text(Text::CleanupMixUnavailable.get(locale));
+                if response.clicked() {
+                    action = Some(EditingAction::CleanupMix(mix));
+                }
+            });
+            // A list of one would offer no choice; its only network is
+            // named instead.
+            if EnhancerId::ALL.len() > 1 {
+                egui::ComboBox::from_id_salt("enhancer")
+                    .width(COMBO_WIDTH)
+                    // A label wider than the list is cut short instead of
+                    // pushing the list past the edge of the window.
+                    .wrap_mode(egui::TextWrapMode::Truncate)
+                    .selected_text(text::enhancer_label(locale, cleanup.enhancer))
+                    .show_ui(ui, |ui| {
+                        for &enhancer in EnhancerId::ALL {
+                            let label = text::enhancer_label(locale, enhancer);
+                            if ui
+                                .selectable_label(enhancer == cleanup.enhancer, label)
+                                .clicked()
+                            {
+                                action = Some(EditingAction::Enhancer(enhancer));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(Text::CleanupNetwork.get(locale))
+                    .labelled_by(heading.id);
+            } else {
+                ui.weak(text::enhancer_label(locale, cleanup.enhancer))
+                    .on_hover_text(Text::CleanupNetwork.get(locale));
+            }
+        });
+    });
+    action
+}
+
 fn device_row(
     ui: &mut egui::Ui,
     locale: Locale,
@@ -409,7 +546,14 @@ pub(crate) fn editing(
         .num_columns(2)
         .spacing([COLUMN_SPACING, ROW_SPACING])
         .show(ui, |ui| {
-            for row in [file_row, output_row, model_row, device_row] {
+            for row in [
+                file_row,
+                output_row,
+                model_row,
+                stems_row,
+                cleanup_row,
+                device_row,
+            ] {
                 // At most one widget is clicked in a frame, so a later row
                 // never overwrites an earlier one's action.
                 action = row(ui, locale, form, downloads).or(action);
@@ -423,15 +567,25 @@ pub(crate) fn editing(
     }
 
     ui.add_space(SECTION_SPACING);
-    let start = egui::Button::new(Text::Split.get(locale));
     // A job must not start while the models it needs are being deleted.
     let clearing = downloads.is_some_and(Downloads::is_clearing);
-    if ui
-        .add_enabled(form.inputs().is_some() && !clearing, start)
-        .clicked()
-    {
-        action = Some(EditingAction::Start);
-    }
+    let ready = form.inputs().is_some() && !clearing;
+    ui.horizontal(|ui| {
+        let split = egui::Button::new(Text::Split.get(locale));
+        if ui.add_enabled(ready, split).clicked() {
+            action = Some(EditingAction::Start(Mode::Split));
+        }
+        let mix = egui::Button::new(Text::SplitAndMix.get(locale));
+        let mix = ui.add_enabled(ready && form.can_mix(), mix);
+        let mix = if form.can_mix() {
+            mix
+        } else {
+            mix.on_disabled_hover_text(Text::NoStemsForMix.get(locale))
+        };
+        if mix.clicked() {
+            action = Some(EditingAction::Start(Mode::SplitAndMix));
+        }
+    });
     // Whatever height is left goes to a layout that fills from the bottom
     // and aligns to the right: its only widget lands in that corner.
     let corner = egui::Layout::bottom_up(egui::Align::Max);
@@ -512,7 +666,9 @@ fn fraction(progress: Progress) -> Option<f32> {
             let total = download.total().get().max(1);
             Some(download.downloaded().get() as f32 / total as f32)
         }
-        Progress::Separating { done, total, .. } => Some(done as f32 / total.get() as f32),
+        Progress::Separating { done, total, .. } | Progress::Enhancing { done, total, .. } => {
+            Some(done as f32 / total.get() as f32)
+        }
         Progress::Finalizing => Some(1.0),
         Progress::Decoding | Progress::LoadingModel => None,
     }
@@ -681,9 +837,10 @@ pub(crate) fn done(
                     Outcome::Completed { output, took } => {
                         ui.weak(text::finished_summary(locale, *took, output.device()));
                         let names: Vec<String> = output
-                            .files()
-                            .iter()
-                            .map(|(_, path)| text::file_name(path))
+                            .mix()
+                            .into_iter()
+                            .chain(output.files().iter().map(|(_, path)| path.as_path()))
+                            .map(text::file_name)
                             .collect();
                         let names = egui::RichText::new(names.join(", ")).small().weak();
                         ui.add(egui::Label::new(names).wrap());
