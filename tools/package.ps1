@@ -49,7 +49,7 @@ function Find-RuntimeFolder {
 
 Push-Location $root
 try {
-    cargo build --release -p stem-split
+    cargo build --locked --release -p stem-split
     if ($LASTEXITCODE -ne 0) {
         throw "The build failed."
     }
