@@ -1,6 +1,6 @@
 # stem-split
 
-Настольное приложение на Rust и egui для разделения аудио на стемы. Инференс — ONNX Runtime (`ort`) на моделях HTDemucs, GPU через DirectML с откатом на CPU.
+Настольное приложение на Rust и egui для разделения аудио на стемы. Инференс — ONNX Runtime (`ort`) на моделях HTDemucs: DirectML на Windows, CoreML на macOS, с откатом на CPU.
 
 Перед работой с кодом прочитай:
 
@@ -34,6 +34,8 @@ cargo test --workspace
 ```
 
 Пакеты в `spikes/` в workspace не входят: те же команды запускаются в каталоге пакета.
+
+Упаковка релиза: `tools/package.ps1` на Windows, `bash tools/package-macos.sh` на Apple Silicon. macOS-пакет — DMG с `.app` (один исполняемый файл), локальной ad-hoc подписью и инструкцией по Gatekeeper; это не нотариализованная сборка.
 
 Тесты, которым нужны сеть, видеокарта или файлы моделей, помечены `#[ignore]` и запускаются вручную с `-- --ignored`. Полный сценарий без окна — пример `separate` в `crates/core/examples`.
 

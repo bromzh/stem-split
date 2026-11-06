@@ -149,7 +149,7 @@ mod tests {
             assert!(blend.sums.len() <= SEGMENT_FRAMES / 4);
         }
         assert_eq!(released, track);
-        assert!(blend.sums.is_empty());
+        assert_eq!(blend.sums, Vec::<[f32; 2]>::new());
         Ok(())
     }
 
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn taking_past_the_held_frames_returns_only_what_exists() {
         let mut blend = OverlapAdd::new();
-        assert!(blend.take_until(1000).is_empty());
-        assert!(blend.take_until(0).is_empty());
+        assert_eq!(blend.take_until(1000), Vec::<[f32; 2]>::new());
+        assert_eq!(blend.take_until(0), Vec::<[f32; 2]>::new());
     }
 }

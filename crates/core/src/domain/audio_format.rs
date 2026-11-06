@@ -97,7 +97,7 @@ mod tests {
         let unique: HashSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len());
         for extension in all {
-            assert!(!extension.is_empty());
+            assert_ne!(extension, "");
             assert!(
                 extension
                     .bytes()

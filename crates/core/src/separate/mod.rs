@@ -85,8 +85,9 @@ impl ChunkStems {
     #[must_use]
     pub fn stem(&self, index: usize) -> Option<(&[f32], &[f32])> {
         self.samples
-            .chunks_exact(CHANNELS * SEGMENT_FRAMES)
-            .nth(index)?
+            .as_chunks::<{ CHANNELS * SEGMENT_FRAMES }>()
+            .0
+            .get(index)?
             .split_at_checked(SEGMENT_FRAMES)
     }
 
