@@ -170,8 +170,8 @@ pub(super) fn clear_question(megabytes: u64) -> String {
     )
 }
 
-pub(super) fn media_status(progress: stem_split_media::Progress) -> String {
-    use stem_split_media::Progress;
+pub(super) fn media_status(progress: stem_split_core::media_fetching::Progress) -> String {
+    use stem_split_core::media_fetching::Progress;
     match progress {
         Progress::InstallingDownloader => "Скачивание yt-dlp…".to_owned(),
         Progress::InstallingFfmpeg => "Скачивание FFmpeg…".to_owned(),
@@ -535,10 +535,10 @@ fn inference_error(error: &InferenceError) -> Message {
     }
 }
 
-pub(super) const fn tool_name(tool: stem_split_media::Tool) -> &'static str {
+pub(super) const fn tool_name(tool: stem_split_core::media_fetching::Tool) -> &'static str {
     match tool {
-        stem_split_media::Tool::Downloader => "yt-dlp",
-        stem_split_media::Tool::Ffmpeg => "FFmpeg",
+        stem_split_core::media_fetching::Tool::Downloader => "yt-dlp",
+        stem_split_core::media_fetching::Tool::Ffmpeg => "FFmpeg",
     }
 }
 

@@ -1847,7 +1847,7 @@ mod tests {
 
     /// A small cleanup window, so that the tests run quickly: 16 304 frames
     /// a window.
-    const TEST_CLEANUP: MdxParams = MdxParams::new(64, 16, 32, 1024, 1.0);
+    const TEST_CLEANUP: MdxParams = crate::enhance::testing::params();
 
     /// A cleaner whose network halves what it is given.
     fn halving_cleaner<'a>() -> Cleaner<'a> {

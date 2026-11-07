@@ -98,7 +98,7 @@ pub(crate) enum EditingAction {
     ClearDownloads,
     Start(Mode),
     Download,
-    SaveFormat(stem_split_media::SaveFormat),
+    SaveFormat(stem_split_core::media_fetching::SaveFormat),
     OutputFormat(stem_split_core::domain::OutputFormat),
 }
 
@@ -398,7 +398,7 @@ fn output_row(
                     .width(110.0)
                     .selected_text(text::save_format(locale, format))
                     .show_ui(ui, |ui| {
-                        for &choice in stem_split_media::SaveFormat::ALL {
+                        for &choice in stem_split_core::media_fetching::SaveFormat::ALL {
                             ui.selectable_value(
                                 &mut format,
                                 choice,
@@ -824,13 +824,13 @@ pub(crate) fn editing(
 fn media_title(
     ui: &mut egui::Ui,
     locale: Locale,
-    info: &stem_split_media::MediaInfo,
+    info: &stem_split_core::media_fetching::MediaInfo,
     toggle: Option<crate::playlist::Panel>,
 ) -> Option<EditingAction> {
     let mut action = None;
     let count = match info {
-        stem_split_media::MediaInfo::Single(_) => None,
-        stem_split_media::MediaInfo::Playlist { .. } => Some(format!(
+        stem_split_core::media_fetching::MediaInfo::Single(_) => None,
+        stem_split_core::media_fetching::MediaInfo::Playlist { .. } => Some(format!(
             "({})",
             text::playlist_count(locale, info.items().count())
         )),
@@ -887,7 +887,7 @@ fn media_title(
 fn playlist_panel(
     ui: &mut egui::Ui,
     locale: Locale,
-    info: &stem_split_media::MediaInfo,
+    info: &stem_split_core::media_fetching::MediaInfo,
     choices: &crate::playlist::Choices,
 ) -> Option<EditingAction> {
     let mut action = None;
@@ -1363,15 +1363,15 @@ pub(crate) fn running(
     clippy::cast_precision_loss,
     reason = "download progress is displayed with f32 precision"
 )]
-fn media_fraction(progress: stem_split_media::Progress) -> Option<f32> {
+fn media_fraction(progress: stem_split_core::media_fetching::Progress) -> Option<f32> {
     match progress {
-        stem_split_media::Progress::Downloading { downloaded, total } => {
+        stem_split_core::media_fetching::Progress::Downloading { downloaded, total } => {
             total.map(|total| (downloaded as f32 / total.get() as f32).clamp(0.0, 1.0))
         }
-        stem_split_media::Progress::InstallingDownloader
-        | stem_split_media::Progress::InstallingFfmpeg
-        | stem_split_media::Progress::Inspecting
-        | stem_split_media::Progress::Converting => None,
+        stem_split_core::media_fetching::Progress::InstallingDownloader
+        | stem_split_core::media_fetching::Progress::InstallingFfmpeg
+        | stem_split_core::media_fetching::Progress::Inspecting
+        | stem_split_core::media_fetching::Progress::Converting => None,
     }
 }
 
@@ -1497,7 +1497,10 @@ pub(crate) enum SettingsAction {
     PickCache,
     DefaultCache,
     Parallel(std::num::NonZeroUsize),
-    Tool(stem_split_media::Tool, stem_split_media::tools::Action),
+    Tool(
+        stem_split_core::media_fetching::Tool,
+        stem_split_core::media_fetching::tools::Action,
+    ),
     Cancel,
 }
 
@@ -1508,7 +1511,7 @@ pub(crate) fn settings(
     tools: &crate::tools::Tools,
     downloads: Option<&Downloads>,
 ) -> Option<SettingsAction> {
-    use stem_split_media::{Tool, tools::Action};
+    use stem_split_core::media_fetching::{Tool, tools::Action};
     let mut action = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading(Text::Settings.get(locale));
@@ -1719,7 +1722,7 @@ mod tests {
     #[test]
     fn playlist_side_panel_adds_width_without_height() -> Result<(), io::Error> {
         use crate::{playlist::Panel, preview::State};
-        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        use stem_split_core::media_fetching::{MediaInfo, MediaItem, MediaUrl};
         let directory = tempfile::tempdir()?;
         let url = MediaUrl::new("https://example.org/list").map_err(io::Error::other)?;
         for &locale in Locale::ALL {
@@ -1778,7 +1781,7 @@ mod tests {
     #[test]
     fn metadata_and_long_playlists_keep_the_form_height() -> Result<(), io::Error> {
         use crate::preview::State;
-        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        use stem_split_core::media_fetching::{MediaInfo, MediaItem, MediaUrl};
 
         let url = MediaUrl::new("https://example.org/list").map_err(io::Error::other)?;
         for &locale in Locale::ALL {

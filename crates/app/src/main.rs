@@ -6,17 +6,17 @@
 
 mod app;
 mod dialogs;
-mod downloads;
+pub(crate) use stem_split_core::downloads;
 mod form;
 mod logging;
 mod playlist;
-mod preview;
+pub(crate) use stem_split_core::preview;
 mod settings;
-mod timing;
-mod tools;
-mod tracker;
+pub(crate) use stem_split_core::timing;
+pub(crate) use stem_split_core::tools;
+pub(crate) use stem_split_core::tracker;
 mod view;
-mod worker;
+pub(crate) use stem_split_core::worker;
 
 use std::{env, path::PathBuf, process::ExitCode};
 
@@ -36,6 +36,12 @@ pub(crate) const APP_ID: &str = "stem-split";
 /// The picture drawn by `assets/make_icon.py`, as raw RGBA.
 const ICON: &[u8] = include_bytes!("../assets/icon-64.rgba");
 const ICON_SIZE: u32 = 64;
+
+/// Connects headless workers to egui's event loop.
+pub(crate) fn wake(context: &egui::Context) -> stem_split_core::Wake {
+    let context = context.clone();
+    stem_split_core::Wake::new(move |delay| context.request_repaint_after(delay))
+}
 
 fn run() -> eframe::Result {
     // Files passed on the command line, as when files are opened with the

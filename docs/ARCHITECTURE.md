@@ -23,9 +23,9 @@ Out of scope: playback, a mixer with individual volume controls, model training,
 | An ONNX export with STFT and iSTFT outside the graph | The only tested export that works with DirectML; exports embedding STFT failed on the GPU |
 | DirectML acceleration with CPU fallback | Works with any DirectX 12 GPU, needs no CUDA installation, and is ten times faster than the CPU on the target machine |
 | Disable DirectML graph fusion | With fusion enabled, DirectML silently returns incorrect values; see section 11 |
-| Three crates: core, media downloads, and application | The core depends on neither egui nor download tools; `media` uses core domain types, and `app` connects both workflows |
+| Seven crates: audio, inference, separation, enhancement, media-fetching, core, and app | Audio and model families have independent APIs; core owns headless orchestration; only app depends on GUI libraries |
 | eframe's glow/OpenGL renderer instead of default wgpu | For this form-based interface, the measured release executable is 6.8 MB instead of 13.6 MB, allocated memory is 120–180 MB instead of 490 MB, and startup is 0.6–0.8 s instead of 1.1 s |
-| Worker threads and channels; a separate Tokio runtime only for URL downloads | Inference stays synchronous. The asynchronous `yt-dlp` API, tool installation, and subprocess control stay in `media`, off the UI thread |
+| Worker threads and channels; a separate Tokio runtime only for URL downloads | Inference stays synchronous. The asynchronous `yt-dlp` API, tool installation, and subprocess control stay in `media-fetching`, off the UI thread |
 | Accumulate the mix in memory and write it last | Works for both single-graph and per-stem-graph models, using memory comparable to the input |
 | Cleanup is a separate post-separation stage using UVR MDX-Net networks | Uses the same `ort` and DirectML stack, with STFT performed by the application |
 | Raw stems awaiting cleanup spill to files beside the results and are removed by `Drop` | Six stems of a five-minute track would occupy about 640 MB in memory; files are cleaned up automatically on failure or cancellation |
@@ -89,44 +89,41 @@ Demucs code is MIT. Its repository has no separate weight-license statement, and
 ## 5. Project structure
 
 ```text
-Cargo.toml                    # Workspace, shared lints and dependency versions
+Cargo.toml                    # Seven workspace crates, shared versions and lints
 crates/
-  core/                       # stem-split-core library; no GUI dependencies
-    src/
-      lib.rs
-      domain/                 # Invariant-bearing types: Stem, ModelId, InputFile, etc.
-      audio/                  # Decode, resample, and WAV output
-      model/                  # Registry, downloads, and cache
-      separate/               # Chunk planning, STFT, overlap-add, and ort backend
-      enhance/                # MDX-Net cleanup: windows, STFT, Enhancer, and ort
-      providers.rs            # Shared CPU/GPU sessions and fallback
-      job.rs                  # Complete request-to-files workflow
-      batch.rs                # Output conflicts and file concurrency
-      partial.rs              # Publish a file only after it is complete
-    examples/                 # Manual validation on real files
-  app/                        # stem-split executable
-    src/
-      main.rs
-      app.rs                  # eframe::App and screen state machine
-      worker.rs               # Batch threads and event channel
-      preview.rs              # Debounced metadata requests and cancellation
-      playlist.rs             # Transient entry selection and panel state
-      tools.rs                # Background media-tool management for Settings
-      tracker.rs              # File states, clocks, and estimates
-      downloads.rs            # Cache size, location, and background deletion
-      view/                   # Screens; text contains strings and locales
-  media/                      # stem-split-media: URL validation and yt-dlp/FFmpeg
-                              # installation, playlist downloads, and cancellation
-    src/metadata.rs           # Metadata-only inspection and validated media items
+  audio/                      # Audio/domain contracts, cancellation, codecs,
+                              # resampling, frame sinks and atomic/staged output
+    src/ffmpeg.rs             # Optional FFmpeg installer, conversion and encoder
+    src/process.rs            # Owned cancellable external-process runner
+  inference/                  # ONNX Runtime sessions, device fallback, tensor API,
+                              # execution errors and shared model-file descriptors
+    build.rs                  # DirectML.dll placement for tests and examples
+  separation/                 # HTDemucs identities/catalog, STFT, chunk planning,
+                              # overlap-add and separation backend
+  enhancement/                # MDX-Net identities/catalog, STFT, windowing,
+                              # compensation, prediction polarity and backend
+  media-fetching/             # HTTP(S) URLs, metadata, playlists, yt-dlp
+                              # installation and source-download workflows
+  core/                       # Job/batch orchestration, verified model cache,
+                              # workers, preview, tools, tracking and timing
+    examples/                 # Headless separate and audio_roundtrip examples
+  app/                        # stem-split executable: screens, form, playlist UI,
+                              # native dialogs, translations and settings storage
 spikes/                       # Standalone experiments outside the workspace
 docs/
 ```
 
-Dependency direction: `app` depends on `core` and `media`; `media` depends on core domain and cancellation types. There are no reverse dependencies. Within `core`, `domain` is independent, and `job` is the only module combining `audio`, `model`, `separate`, and `enhance`.
+Dependency direction is acyclic: `app -> core`; `core -> audio, inference, separation, enhancement, media-fetching`; `separation/enhancement -> audio, inference`; `inference -> audio`; and `media-fetching -> audio`. Lower layers never depend on core or UI. Core intentionally re-exports domain and family APIs for its callers. The `closed_enum!` macro and `CancelToken` are owned by audio and remain exported by core.
 
-The core is complete: `domain`, `audio` (including `mix` for summing files and `spill` for raw stems), `model`, `separate`, `enhance`, `providers`, `job`, `batch`, `cancel`, and `partial`. The application includes `main.rs`, `app.rs`, `form.rs`, `settings.rs`, `worker.rs`, `tracker.rs`, `downloads.rs`, `preview.rs`, `playlist.rs`, `timing.rs`, `dialogs.rs`, `logging.rs`, and `view::text`. The icon and its generator are in `crates/app/assets`; release packaging scripts are in `tools/`.
+Audio owns generic filesystem/audio values, atomic publication, `DecodedAudio`, `ModelAudio` and `FrameSink`. The resampler remains the only production constructor of `ModelAudio`. HTDemucs `ModelId` and graph metadata belong to separation; MDX-Net `EnhancerId`, cleanup parameters and metadata belong to enhancement. Each identity's `spec()` implementation therefore remains in its owning crate. Shared `FileSpec`, repositories, device/thread choices, `InferenceError` and `StftError` belong to inference. Each family retains its own STFT algorithm.
 
-The core's `build.rs` copies `DirectML.dll` beside test and example executables; see section 15.
+Only inference depends directly on ORT and its platform features. Its `DeviceSession` accepts named borrowed float `TensorInput` values and returns borrowed `TensorOutputs`; raw ORT sessions stay private. Outputs retain runtime ownership until dropped, avoiding additional audio-sized copies. Model input/output contract checks, plausibility guards and retry policies remain in the family backends.
+
+FFmpeg installation, conversion and MP3 encoding live behind audio's optional `ffmpeg` feature, enabled by core and media-fetching. Its existing Tokio/yt-dlp installer dependencies are optional; audio without this feature has no downloader, HTTP client or ONNX dependency. Media-fetching owns yt-dlp installation and delegates FFmpeg operations to audio, mapping typed tool failures at the boundary. No new third-party dependency was introduced by this split.
+
+Core owns background workers, metadata debounce/cancellation, tool/cache operations, runtime commands/configuration, tracking and estimates. `Wake::notify` and `Wake::notify_after` supply thread-safe immediate/delayed event-loop hints through a callback; the default is silent for headless polling. App adapts it to egui repaint requests. `CacheLocation`, `Mode` and `UrlAction` are core types; their UI persistence and translations stay in app. No library depends on egui, eframe or rfd.
+
+The `test-support` features expose only deterministic fake separators/enhancers and collecting sinks needed by cross-crate tests. They are enabled through dev dependencies and are absent from ordinary builds. Core's headless examples remain at their existing command paths. Inference's build script places `DirectML.dll` beside test/example executables; release packaging remains unchanged.
 
 ## 6. Data flow
 
@@ -150,7 +147,7 @@ A multi-file run is a `core::batch::Batch`: one job per file sharing the model, 
 
 ## 7. Types and invariants
 
-This section identifies errors caught by the compiler. Signatures are illustrative. Domain types through `Sha256Digest`, except those explicitly introduced in later stages, are implemented in `core::domain`.
+This section identifies errors caught by the compiler. Signatures are illustrative. Domain types through `Sha256Digest`, except those explicitly introduced in later stages, are owned by audio and the model-family crates, then re-exported by `core::domain`.
 
 Iterable enums (`Stem`, `ModelId`, `AudioFormat`, `DevicePreference`, and application `Locale` and `Text`) use the core's exported `closed_enum!` macro. It generates both the enum and `ALL`, so iteration cannot fall behind the variants.
 
@@ -290,11 +287,11 @@ Times include decoding, graph loading (about two seconds per graph), and file ou
 - Failure or cancellation removes partial files and reserved names.
 - WAV limits each file to 4 GiB. `WavWriter` enforces this because `hound` does not.
 
-`AudioEncoder`, `EncodeError` and the normal `Encoded::{Ready, Cancelled}` outcome are core boundary types. `job::run_with_encoder` accepts the encoder; the WAV-only `job::run` remains usable without media dependencies. `media::FfmpegEncoder` installs in the shared model cache and implements MP3 encoding with cancellable owned subprocesses. The batch worker prepares it once and shares it across the two concurrent file jobs. `tempfile` is now a normal core dependency for encoded staging, in addition to its existing test use.
+`AudioEncoder`, `EncodeError` and the normal `Encoded::{Ready, Cancelled}` outcome are audio boundary types re-exported by core. `job::run_with_encoder` accepts the encoder; the WAV-only `job::run` remains usable without media dependencies. `audio::ffmpeg::FfmpegEncoder` installs in the shared model cache and implements MP3 encoding with cancellable owned subprocesses. The batch worker prepares it once and shares it across the two concurrent file jobs. `tempfile` is an audio dependency for encoded staging and a core dev dependency for regression tests.
 
 ## 10. Model store
 
-- `model::registry` contains static repository/path, size, SHA-256, emitted-stem, and cleanup `MdxParams`/`NetworkOutput` descriptions. `Repository::DemucsOnnx` and `Repository::UvrResources` each point to a pinned revision.
+- `separation::model` and `enhancement::model` own static repository/path, size, SHA-256, emitted-stem, and cleanup `MdxParams`/`NetworkOutput` descriptions; core assembles their public catalog. `Repository::DemucsOnnx` and `Repository::UvrResources` each point to a pinned revision.
 - `ModelStore::ensure_files` downloads the separation model and cleanup network together with combined progress. `missing_size` reports the required download to the form. The backend describes the shared graph input/output contract.
 - `directories` supplies the per-user cache location: `%LOCALAPPDATA%\stem-split\cache\models` on Windows.
 - Cache filenames include a digest prefix, such as `htdemucs-abaac48bc8fd55fa.onnx`. A later registry revision cannot mistake an older file with the same graph name for new content.
@@ -312,7 +309,7 @@ Times include decoding, graph loading (about two seconds per graph), and file ou
 - `DevicePreference { Auto, Gpu, Cpu }` is the user's choice, initially `Auto`.
 - `ActiveDevice` reports the actual device to the UI; the original Windows set is `DirectMl` and `Cpu`.
 - Auto tries DirectML on Windows or CoreML on macOS, then falls back to CPU on failure and logs the reason.
-- Only `providers.rs` builds the provider list: DirectML under `#[cfg(windows)]`, CoreML under `#[cfg(target_os = "macos")]`, and CPU elsewhere.
+- Only `inference::session` builds the provider list: DirectML under `#[cfg(windows)]`, CoreML under `#[cfg(target_os = "macos")]`, and CPU elsewhere.
 
 CoreML uses `ComputeUnits::All` (CPU, GPU, and Neural Engine) and `MLProgram` (Core ML 5, macOS 12+). Registration uses `error_on_failure`, so session-creation failures explicitly select the CPU. Some operators may still run on the CPU. A GPU label identifies the provider, not an exclusively GPU graph. This document has no CoreML speed measurements or CPU comparisons yet.
 
@@ -354,7 +351,7 @@ Cleanup batches default to two jobs through `batch::PARALLEL_JOBS_WITH_CLEANUP =
 - Closing the window requests cancellation and waits up to ten seconds for partial-file cleanup. Jobs react within one model run. A stalled download may take longer, in which case the worker is left behind.
 - `catch_unwind` converts a dependency panic in a file job to `Failure::Crashed`; the rest of the batch continues.
 - Cancellation stops running jobs and prevents waiting ones from starting; completed files remain.
-- Workers open their own model store from the saved `CacheLocation`, shared with metadata inspection and source downloads. `app::downloads` has a UI-side store for immediate metadata checks at startup, after jobs, and after deletion, rather than every frame.
+- Workers open their own model store from the saved `CacheLocation`, shared with metadata inspection and source downloads. `core::downloads` has a UI-side store for immediate metadata checks at startup, after jobs, and after deletion, rather than every frame.
 - Cache deletion runs on its own thread and reports through a channel. Missing completion is treated as a crash and shown as an error.
 - Core warnings and dependency panic reports go to stderr and `%LOCALAPPDATA%\stem-split\data\stem-split.log`, recreated each launch. Release builds have no console, so the file is their only log output.
 - Failure to create a window is reported through a native message box.
@@ -386,9 +383,9 @@ Each screen owns only its valid data: no progress bar without work, no Split but
 
 A gear button beside the language selector opens a dedicated settings page while retaining the form and playlist choices. The page scrolls on small windows. It shows cached yt-dlp/FFmpeg installation status and offers Download, Update, and Delete separately for each tool. The cache path and automatic first-use installation behavior remain visible. Errors use muted red foregrounds in both light and dark themes.
 
-`app::tools::Tools` owns one cancellable worker at a time, with typed errors, a completion channel and a joined thread. Status scanning, cache usage measurement, installation, updates and deletion run off the UI thread. Opening Settings cancels metadata inspection and waits asynchronously for its worker to finish before scanning or enabling tool actions. While tool management runs, navigation back and other tool actions are disabled; cancellation and bounded shutdown remain available. The settings page cannot overlap batch execution or cache deletion. Returning transfers the worker's measured cache usage to the main form without filesystem I/O.
+`core::tools::Tools` owns one cancellable worker at a time, with typed errors, a completion channel and a joined thread. Status scanning, cache usage measurement, installation, updates and deletion run off the UI thread. Opening Settings cancels metadata inspection and waits asynchronously for its worker to finish before scanning or enabling tool actions. While tool management runs, navigation back and other tool actions are disabled; cancellation and bounded shutdown remain available. The settings page cannot overlap batch execution or cache deletion. Returning transfers the worker's measured cache usage to the main form without filesystem I/O.
 
-`media::Tool` is an iterable closed enum. `media::tools::manage` shares executable paths and installation logic with automatic downloads. Updates stage a fresh binary privately before replacing the installed file; failure or cancellation leaves the previous binary intact. Deletion targets only the chosen executable and tolerates an already missing file. No model files are removed. The app now uses the existing workspace `thiserror` dependency for typed tool-worker errors.
+`media_fetching::Tool` is an iterable closed enum. `media_fetching::tools::manage` shares executable paths and installation logic with automatic downloads. Updates stage a fresh binary privately before replacing the installed file; failure or cancellation leaves the previous binary intact. Deletion targets only the chosen executable and tolerates an already missing file. No model files are removed. Core uses the existing workspace `thiserror` dependency for typed worker errors.
 
 The settings page also opens the shared models/cache folder, chooses an existing folder through the native picker, and restores the platform default. `CacheLocation::{UserCache, Custom(OutputDir)}` is stored with the form settings and passed explicitly to metadata, media-download and batch workers. There is no process-wide environment override. Choosing a folder immediately refreshes model availability; tool presence and total usage are then scanned off the UI thread. Opening a not-yet-created default folder creates it on the worker before launching the file manager. Switching folders never copies, moves or deletes existing cached files or prepared inputs; their RAII owners retain their original paths. A saved custom folder that is no longer valid falls back to the platform default on startup.
 
@@ -402,9 +399,9 @@ Files and URL are separate tabs. Local selections are retained independently of 
 
 A clear button beside the URL empties it and restores text focus; its tooltip and accessible name are localized. Source and destination cells share dimensions across tabs, with a common minimum label-column width, so common settings do not jump. `form::StartBlock` is the source of actionable disabled-state explanations: missing files, empty or invalid URL, missing folder, no mix stems, or cache deletion. Shared explanations are not duplicated.
 
-`media::download` runs in a worker with its own single-thread Tokio runtime. `yt_dlp::client::deps::LibraryInstaller` installs platform yt-dlp and FFmpeg executables if absent. Completed executables are published directly in `ModelStore::directory()`. Temporary installation files have RAII owners in that cache. Existing `usage` and `clear` count and remove the tools as ordinary files alongside models, without recursively deleting unrelated directories.
+`media_fetching::download` runs in a worker with its own single-thread Tokio runtime. `yt_dlp::client::deps::LibraryInstaller` installs platform yt-dlp in media-fetching and FFmpeg in audio when absent. Completed executables are published directly in `ModelStore::directory()`. Temporary installation files have RAII owners in that cache. Existing `usage` and `clear` count and remove the tools as ordinary files alongside models, without recursively deleting unrelated directories.
 
-`media::process` owns cancellable/reaped child processes and reads streaming progress. User yt-dlp configuration is ignored and its separate disk cache disabled. Metadata uses `--skip-download --flat-playlist --yes-playlist --dump-single-json`. `MediaInfo` is a single item or an ordered nonempty playlist with validated HTTP(S) URLs. Selection creates an exact nonempty snapshot; the download worker never re-expands the parent playlist.
+`audio::process` owns cancellable/reaped child processes; `media_fetching::process` provides yt-dlp arguments and streamed download progress and reads streaming progress. User yt-dlp configuration is ignored and its separate disk cache disabled. Metadata uses `--skip-download --flat-playlist --yes-playlist --dump-single-json`. `MediaInfo` is a single item or an ordered nonempty playlist with validated HTTP(S) URLs. Selection creates an exact nonempty snapshot; the download worker never re-expands the parent playlist.
 
 The best source audio is downloaded with `bestaudio/best`. `SaveFormat::{Original, Wav, Mp3}` either preserves codec/container bytes or encodes a float WAV / 320 kbit/s MP3 in private staging before publication with a safe title, unique suffix and chosen extension. A live or unavailable entry fails independently; `DownloadEvent::{Progress, Finished}` includes the selected item's index. The loop reports failures and continues with later items. Shared setup failures are attached to each affected item rather than replacing the entire playlist with one error screen.
 
@@ -414,7 +411,7 @@ The best source audio is downloaded with `bestaudio/best`. `SaveFormat::{Origina
 
 Added dependencies: `yt-dlp` 2.10 for binary installation; `tokio` for its async API and subprocess I/O/cancellation; `url` for HTTP(S) validation; `serde` and `serde_json` for minimal metadata; `tempfile` for RAII intermediates; and `thiserror` for typed errors. `yt-dlp` disables defaults and enables `rustls` and `cache-memory`; published 2.10.0 otherwise fails to compile because a `utils` import is conditional. No persistent library cache is created. The dependency is GPL-3.0-only, distinct from the project's own MIT sources.
 
-`app::preview` owns the metadata state machine: Empty, Pending, Loading, Ready, Failed. Edits restart a 500 ms monotonic debounce and cancel the previous request. A worker installs only yt-dlp if necessary and calls `media::inspect`; no media or FFmpeg is downloaded. At most one preview worker runs at a time; cancelled workers are reaped before another starts. Results are accepted only while the matching URL is loading, so stale responses cannot replace new input. Work is paused off the URL tab and during cache deletion. Shutdown cancels the worker and waits with the normal bounded patience.
+`core::preview` owns the metadata state machine: Empty, Pending, Loading, Ready, Failed. Edits restart a 500 ms monotonic debounce and cancel the previous request. A worker installs only yt-dlp if necessary and calls `media_fetching::inspect`; no media or FFmpeg is downloaded. At most one preview worker runs at a time; cancelled workers are reaped before another starts. Results are accepted only while the matching URL is loading, so stale responses cannot replace new input. Work is paused off the URL tab and during cache deletion. Shutdown cancels the worker and waits with the normal bounded patience.
 
 Metadata has a 24-point reserved area below the URL, measured before requests begin. A title is truncated with a full tooltip; successfully inspected playlists show their total count and a right-aligned Playlist toggle in the same row. Loading/error/title/button states retain the same height, including long titles and large playlists. Shared source-cell sizing preserves expanded-tab alignment. Cache deletion is disabled while metadata work owns a tool; cache usage is measured by that worker and passed back without UI-thread I/O. Download/start cancels preview work; independent staging makes concurrent tool publication safe. The folder cell remains 60 points high. A source-format combo is directly beside its URL destination Browse button. The result-format combo is on the right of the lower action buttons; both labels/tooltips are localized. Missing or unknown stored format keys fall back to Original/WAV.
 
@@ -463,7 +460,7 @@ A file can show `0:08 · ~0:12 left`; a batch can show `All files: elapsed 0:13 
 - Results round per-file duration to the nearest second, for example `Finished in 0:13 on the graphics card.` Multi-file totals are shown separately.
 - Batch estimates simulate two scheduling lanes. Running files occupy their lanes for their measured remaining time. Waiting files cost average startup plus subsequent runs at measured pace. Startup is the average from file start to its first run. Header lengths determine expected runs; missing lengths use the observed average. Files are scheduled in order into the first free lane, and the latest lane completion is the batch estimate.
 - This keeps fixed file startup separate from model work and does not split one long file across two lanes. On four files, two 106-second tracks and two short ones, estimates at 7, 10, and 14 seconds were 14, 11, and 7 seconds, compared with actual 13, 10, and 6.
-- Arithmetic is isolated in `app::timing`, with time passed in for tests rather than sleeping. Running screens repaint every 200 ms so clocks advance without worker events.
+- Arithmetic is isolated in `core::timing`, with time passed in for tests rather than sleeping. Running screens repaint every 200 ms so clocks advance without worker events.
 
 Original form sketch:
 
@@ -552,20 +549,20 @@ Domain errors `InputFileError`, `OutputDirError`, `OutputClash`, `ChannelLengthM
 | `sys-locale` | 0.3 | System language on first launch | app |
 | `winresource` | 0.1 | Executable icon and version metadata; build only | app |
 | `rfd` | 0.17 | Native dialogs | app |
-| `open` | 5 | Open the output directory | app |
-| `ort` | `=2.0.0-rc.13` | ONNX Runtime 1.28; `std`, `download-binaries`, `copy-dylibs`, `tls-rustls`, `api-27`; Windows `directml`, macOS `coreml` | core |
-| `ort-sys` | `=2.0.0-rc.13` | Direct Windows dependency to run its build script before the core build script; unused in source | core, Windows |
-| `realfft` | 3.5 | Forward and inverse STFT | core |
-| `symphonia` | 0.6 | Decode MP3, FLAC, WAV/PCM, OGG/Vorbis, ISOMP4/AAC/ALAC and metadata | core |
-| `rubato` | 5 | Synchronous FFT `Fft` resampling, 4096-frame blocks | core |
-| `hound` | 3.5 | WAV output | core |
+| `open` | 5 | Open the output directory | core, app |
+| `ort` | `=2.0.0-rc.13` | ONNX Runtime 1.28; `std`, `download-binaries`, `copy-dylibs`, `tls-rustls`, `api-27`; Windows `directml`, macOS `coreml` | inference |
+| `ort-sys` | `=2.0.0-rc.13` | Direct Windows dependency to run its build script before the inference build script; unused in source | inference, Windows |
+| `realfft` | 3.5 | Forward and inverse STFT | separation, enhancement, inference error contracts |
+| `symphonia` | 0.6 | Decode MP3, FLAC, WAV/PCM, OGG/Vorbis, ISOMP4/AAC/ALAC and metadata | audio |
+| `rubato` | 5 | Synchronous FFT `Fft` resampling, 4096-frame blocks | audio |
+| `hound` | 3.5 | WAV output | audio |
 | `ureq` | 3 | Blocking HTTPS; `rustls` and `platform-verifier`, no compression | core |
 | `sha2` | 0.11 | Model integrity verification | core |
-| `hex-literal` | 1 | Compile-time checked registry digests | core |
+| `hex-literal` | 1 | Compile-time checked registry digests | separation, enhancement |
 | `directories` | 6 | Model cache and log paths | core, app |
-| `thiserror` | 2 | Typed errors | core, app |
-| `tempfile` | 3 | Encoded output staging and temporary test files/directories | core |
-| `log` | 0.4 | Skipped corrupt packets, GPU fallback, app warnings to stderr | core, app |
+| `thiserror` | 2 | Typed errors | library crates |
+| `tempfile` | 3 | Encoded output staging and temporary test files/directories | audio/media-fetching; library tests |
+| `log` | 0.4 | Skipped corrupt packets, GPU fallback, app warnings to stderr | audio, inference, media-fetching, core, app |
 
 Media-crate dependencies and executable installation are described in section 13. `ort` remains a release candidate and is pinned exactly. Its `ndarray` and `tracing` features are disabled: tensors use slices and ONNX Runtime messages go to stderr.
 
@@ -582,7 +579,7 @@ Media-crate dependencies and executable installation are described in section 13
 
 The script uses redistributables from the newest installed Visual Studio or Build Tools: the runtime must be at least as recent as the compiler. A static application runtime is incompatible with the prebuilt ONNX Runtime. Release builds have no console and embed the icon/version.
 
-Windows 10's system `DirectML.dll` is version 1.0 and cannot initialize the provider; Auto would silently use CPU. `copy-dylibs` places the current library beside the application under `target/<profile>/`. Without symlink privileges it stops there; the core build script copies the library into `deps/` and `examples/` for tests and examples.
+Windows 10's system `DirectML.dll` is version 1.0 and cannot initialize the provider; Auto would silently use CPU. `copy-dylibs` places the current library beside the application under `target/<profile>/`. Without symlink privileges it stops there; the inference build script copies the library into `deps/` and `examples/` for tests and examples.
 
 ### macOS distribution
 
@@ -594,7 +591,7 @@ The verified ad-hoc signature does not provide Developer ID or notarization. Gat
 
 ### Versions and publication
 
-The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. The current release version is 2.0.0.
+The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. The published release is 2.0.0; the current local refactoring version is 2.0.1.
 
 `rust-toolchain.toml` pins Rust 1.96.1 with rustfmt and Clippy. `.github/workflows/release.yml` runs version checks, formatting, Clippy, and tests for a `v<version>` tag on `windows-2022` and ARM64 `macos-15`, then packages with `--locked`. Both builds must succeed before uploading to an existing release or creating one. Manual dispatch also requires a tag. DMG format and ad-hoc signing are retained.
 
@@ -637,7 +634,13 @@ Cleanup runs after separation and before publication, so cancellation/errors lea
 | Mix | Final stem files and an in-memory mix | Mix only |
 | Both | As for Stems | Stems, then clean their summed mix again |
 
-`Progress::Enhancing` counts windows across every cleaned stem/mix. `job::expected_runs` includes these windows. `app::timing` tracks cleanup at its own pace; batch estimates approximate cleanup using the separation pace.
+`Progress::Enhancing` counts windows across every cleaned stem/mix. `job::expected_runs` includes these windows. `core::timing` tracks cleanup at its own pace; batch estimates approximate cleanup using the separation pace.
+
+## Refactoring validation (2026-11-08)
+
+The seven-crate workspace retains all 311 pre-refactoring tests and adds one CPU identity-graph test for the borrowed tensor adapter (312 passing tests, five external-resource tests ignored by default). The adapter test constructs its tiny ONNX fixture locally and checks names, values, shapes and typed errors without external weights. Background tool tests also verify callback notification delivery.
+
+Formatting, strict workspace Clippy, headless example builds and rustdoc with warnings denied pass on Windows. Audio without its FFmpeg feature and media-fetching each compile independently. Cargo metadata checks confirm all seven dependency boundaries, exclusive direct ORT ownership by inference and exclusive GUI ownership by app. The cached-FFmpeg integration test passes manually after moving to audio. Windows release packaging succeeds with the local DirectML and Visual C++ libraries. Native macOS packaging, live UI interaction and real-model/GPU validation were not rerun for this refactoring; the existing macOS release workflow remains available.
 
 ## 17. Risks and open questions
 

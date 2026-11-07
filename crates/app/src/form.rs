@@ -41,21 +41,7 @@ impl Source {
     }
 }
 
-/// Whether URL preparation should stop at the saved audio or keep going.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UrlAction {
-    Download,
-    Separate(Mode),
-}
-
-/// Which of the two buttons started the work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// A file for every stem.
-    Split,
-    /// A mix of the ticked stems, and the stems too if they are kept.
-    SplitAndMix,
-}
+pub(crate) use stem_split_core::request::{Mode, UrlAction};
 
 /// The actionable reason a start button is unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,14 +75,14 @@ pub(crate) struct Form {
     cache_location: crate::settings::CacheLocation,
     parallel_tracks: std::num::NonZeroUsize,
     source: Source,
-    save_format: stem_split_media::SaveFormat,
+    save_format: stem_split_core::media_fetching::SaveFormat,
     output_format: stem_split_core::domain::OutputFormat,
     url: String,
     preview: crate::preview::Preview,
     playlist: Option<crate::playlist::Choices>,
     inputs: Option<InputFiles>,
     url_inputs: Option<InputFiles>,
-    downloaded_audio: Vec<stem_split_media::DownloadedAudio>,
+    downloaded_audio: Vec<stem_split_core::media_fetching::DownloadedAudio>,
     download_failures: Vec<crate::tracker::FileResult>,
     output: OutputChoice,
     url_folder: Option<OutputDir>,
@@ -226,13 +212,13 @@ impl Form {
         self.source = source;
     }
 
-    pub(crate) const fn save_format(&self) -> stem_split_media::SaveFormat {
+    pub(crate) const fn save_format(&self) -> stem_split_core::media_fetching::SaveFormat {
         self.save_format
     }
     pub(crate) const fn output_format(&self) -> stem_split_core::domain::OutputFormat {
         self.output_format
     }
-    pub(crate) fn set_save_format(&mut self, format: stem_split_media::SaveFormat) {
+    pub(crate) fn set_save_format(&mut self, format: stem_split_core::media_fetching::SaveFormat) {
         if self.save_format != format {
             self.invalidate_url_inputs();
             self.save_format = format;
@@ -264,8 +250,12 @@ impl Form {
 
     pub(crate) fn poll_preview(&mut self, context: &eframe::egui::Context, enabled: bool) {
         self.preview.poll(
-            context,
-            enabled && self.source == Source::Url,
+            &crate::wake(context),
+            if enabled && self.source == Source::Url {
+                crate::preview::Access::Active
+            } else {
+                crate::preview::Access::Paused
+            },
             std::time::Instant::now(),
             &self.cache_location,
         );
@@ -274,7 +264,9 @@ impl Form {
 
     fn sync_playlist(&mut self) {
         match self.preview() {
-            crate::preview::State::Ready(stem_split_media::MediaInfo::Playlist { .. }) => {
+            crate::preview::State::Ready(
+                stem_split_core::media_fetching::MediaInfo::Playlist { .. },
+            ) => {
                 if self.playlist.is_none() {
                     self.playlist = Some(crate::playlist::Choices::default());
                 }
@@ -283,7 +275,8 @@ impl Form {
             | crate::preview::State::Pending { .. }
             | crate::preview::State::Loading(_)
             | crate::preview::State::Failed(_)
-            | crate::preview::State::Ready(stem_split_media::MediaInfo::Single(_)) => {
+            | crate::preview::State::Ready(stem_split_core::media_fetching::MediaInfo::Single(_)) =>
+            {
                 self.playlist = None;
             }
         }
@@ -291,16 +284,21 @@ impl Form {
 
     pub(crate) fn playlist(
         &self,
-    ) -> Option<(&stem_split_media::MediaInfo, &crate::playlist::Choices)> {
+    ) -> Option<(
+        &stem_split_core::media_fetching::MediaInfo,
+        &crate::playlist::Choices,
+    )> {
         match self.preview() {
-            crate::preview::State::Ready(info @ stem_split_media::MediaInfo::Playlist { .. }) => {
-                Some((info, self.playlist.as_ref()?))
-            }
+            crate::preview::State::Ready(
+                info @ stem_split_core::media_fetching::MediaInfo::Playlist { .. },
+            ) => Some((info, self.playlist.as_ref()?)),
             crate::preview::State::Empty
             | crate::preview::State::Pending { .. }
             | crate::preview::State::Loading(_)
             | crate::preview::State::Failed(_)
-            | crate::preview::State::Ready(stem_split_media::MediaInfo::Single(_)) => None,
+            | crate::preview::State::Ready(stem_split_core::media_fetching::MediaInfo::Single(_)) => {
+                None
+            }
         }
     }
 
@@ -362,7 +360,9 @@ impl Form {
         self.url_folder.as_ref()
     }
 
-    pub(crate) fn url_request(&self) -> Option<(stem_split_media::MediaInfo, OutputDir)> {
+    pub(crate) fn url_request(
+        &self,
+    ) -> Option<(stem_split_core::media_fetching::MediaInfo, OutputDir)> {
         let crate::preview::State::Ready(info) = self.preview() else {
             return None;
         };
@@ -384,7 +384,7 @@ impl Form {
                 if self.url.trim().is_empty() {
                     return Some(StartBlock::NoUrl);
                 }
-                if stem_split_media::MediaUrl::new(&self.url).is_err() {
+                if stem_split_core::media_fetching::MediaUrl::new(&self.url).is_err() {
                     return Some(StartBlock::InvalidUrl);
                 }
                 if self.url_folder.is_none() {
@@ -423,7 +423,7 @@ impl Form {
 
     pub(crate) fn set_downloads(
         &mut self,
-        audio: Vec<stem_split_media::DownloadedAudio>,
+        audio: Vec<stem_split_core::media_fetching::DownloadedAudio>,
         failures: Vec<crate::tracker::FileResult>,
     ) {
         self.url_inputs = InputFiles::new(audio.iter().map(|item| item.input().clone()));
@@ -435,7 +435,7 @@ impl Form {
     pub(crate) fn download_sources(&self) -> impl Iterator<Item = &Path> {
         self.downloaded_audio
             .iter()
-            .map(stem_split_media::DownloadedAudio::source)
+            .map(stem_split_core::media_fetching::DownloadedAudio::source)
     }
 
     pub(crate) fn remember_download_failures(&mut self, failures: Vec<crate::tracker::FileResult>) {
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn playlist_selection_controls_downloads_and_large_list_review() -> Result<(), Box<dyn Error>> {
         use crate::{playlist::Panel, preview::State};
-        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        use stem_split_core::media_fetching::{MediaInfo, MediaItem, MediaUrl};
         let directory = tempfile::tempdir()?;
         for count in [4, 5, 6] {
             let url = MediaUrl::new("https://example.org/list")?;
@@ -750,12 +750,12 @@ mod tests {
             form.start_block(Mode::Split),
             Some(StartBlock::LoadingMetadata)
         );
-        let url = stem_split_media::MediaUrl::new(form.url()).map_err(std::io::Error::other)?;
+        let url = stem_split_core::media_fetching::MediaUrl::new(form.url())
+            .map_err(std::io::Error::other)?;
         form.show_preview(crate::preview::State::Ready(
-            stem_split_media::MediaInfo::Single(stem_split_media::MediaItem::new(
-                "Track".to_owned(),
-                url,
-            )),
+            stem_split_core::media_fetching::MediaInfo::Single(
+                stem_split_core::media_fetching::MediaItem::new("Track".to_owned(), url),
+            ),
         ));
         assert_eq!(form.start_block(Mode::Split), None);
         form.set_url("not a link".to_owned());
@@ -834,7 +834,7 @@ mod tests {
         let settings = Settings {
             cache_location: crate::settings::CacheLocation::UserCache,
             parallel_tracks: std::num::NonZeroUsize::MIN.saturating_add(3),
-            save_format: stem_split_media::SaveFormat::Mp3,
+            save_format: stem_split_core::media_fetching::SaveFormat::Mp3,
             output_format: stem_split_core::domain::OutputFormat::Mp3,
             source: Source::Files,
             url_folder: None,

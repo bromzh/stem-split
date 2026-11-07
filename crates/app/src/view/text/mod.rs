@@ -180,7 +180,10 @@ impl Text {
     }
 }
 
-pub(crate) fn media_status(locale: Locale, progress: stem_split_media::Progress) -> String {
+pub(crate) fn media_status(
+    locale: Locale,
+    progress: stem_split_core::media_fetching::Progress,
+) -> String {
     match locale {
         Locale::En => en::media_status(progress),
         Locale::Ru => ru::media_status(progress),
@@ -382,12 +385,12 @@ pub(crate) const fn output_format(
 
 pub(crate) const fn save_format(
     locale: Locale,
-    format: stem_split_media::SaveFormat,
+    format: stem_split_core::media_fetching::SaveFormat,
 ) -> &'static str {
     match format {
-        stem_split_media::SaveFormat::Original => Text::OriginalFormat.get(locale),
-        stem_split_media::SaveFormat::Wav => Text::Wav.get(locale),
-        stem_split_media::SaveFormat::Mp3 => Text::Mp3.get(locale),
+        stem_split_core::media_fetching::SaveFormat::Original => Text::OriginalFormat.get(locale),
+        stem_split_core::media_fetching::SaveFormat::Wav => Text::Wav.get(locale),
+        stem_split_core::media_fetching::SaveFormat::Mp3 => Text::Mp3.get(locale),
     }
 }
 
@@ -516,7 +519,10 @@ pub(crate) fn failure(locale: Locale, failure: &Failure) -> Message {
     }
 }
 
-pub(crate) const fn tool_name(locale: Locale, tool: stem_split_media::Tool) -> &'static str {
+pub(crate) const fn tool_name(
+    locale: Locale,
+    tool: stem_split_core::media_fetching::Tool,
+) -> &'static str {
     match locale {
         Locale::En => en::tool_name(tool),
         Locale::Ru => ru::tool_name(tool),

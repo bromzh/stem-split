@@ -6,3 +6,5 @@
 
 # Local implementation notes; public milestones live in CHANGELOG.md.
 /docs/PLAN.md
+.groma/
+backlog/

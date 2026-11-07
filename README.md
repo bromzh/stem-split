@@ -128,7 +128,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The workspace has three crates: `crates/core`, the separation pipeline without a GUI; `crates/media`, URL audio downloads and tool installation; and `crates/app`, the egui window. Standalone experiments in `spikes/` are excluded from the application workspace.
+The workspace has seven crates: `audio` for codecs and audio contracts; `inference` for shared ONNX execution; `separation` for HTDemucs; `enhancement` for MDX-Net; `media-fetching` for URL metadata, playlists and downloads; `core` for headless orchestration and workers; and `app` for the egui interface. Only `inference` directly depends on ONNX Runtime, and only `app` depends on GUI libraries. Standalone experiments in `spikes/` are excluded from the application workspace.
 
 See [docs/GUIDELINES.md](docs/GUIDELINES.md). The essential rules are:
 

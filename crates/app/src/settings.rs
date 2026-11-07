@@ -111,26 +111,7 @@ impl CleanupChoice {
     }
 }
 
-/// The shared location for models, tools and temporary media files.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum CacheLocation {
-    #[default]
-    UserCache,
-    Custom(OutputDir),
-}
-
-impl CacheLocation {
-    pub(crate) fn store(
-        &self,
-    ) -> Result<stem_split_core::model::ModelStore, stem_split_core::model::ModelStoreError> {
-        match self {
-            Self::UserCache => stem_split_core::model::ModelStore::in_user_cache(),
-            Self::Custom(directory) => {
-                Ok(stem_split_core::model::ModelStore::new(directory.path()))
-            }
-        }
-    }
-}
+pub(crate) use stem_split_core::config::CacheLocation;
 
 /// What the application remembers: the language and how to split, but not
 /// which file.
@@ -139,7 +120,7 @@ pub(crate) struct Settings {
     pub(crate) locale: Locale,
     pub(crate) cache_location: CacheLocation,
     pub(crate) parallel_tracks: NonZeroUsize,
-    pub(crate) save_format: stem_split_media::SaveFormat,
+    pub(crate) save_format: stem_split_core::media_fetching::SaveFormat,
     pub(crate) output_format: OutputFormat,
     pub(crate) model: ModelId,
     pub(crate) device: DevicePreference,
@@ -204,7 +185,7 @@ impl Settings {
             locale: Locale::of_system(),
             cache_location: CacheLocation::UserCache,
             parallel_tracks: stem_split_core::batch::PARALLEL_JOBS,
-            save_format: stem_split_media::SaveFormat::Original,
+            save_format: stem_split_core::media_fetching::SaveFormat::Original,
             output_format: OutputFormat::Wav,
             model: ModelId::default(),
             device: DevicePreference::default(),
@@ -236,7 +217,7 @@ impl Settings {
                 .filter(|value| value.get() <= 8)
                 .unwrap_or(initial.parallel_tracks),
             save_format: read(SAVE_FORMAT)
-                .and_then(|key| stem_split_media::SaveFormat::from_key(&key))
+                .and_then(|key| stem_split_core::media_fetching::SaveFormat::from_key(&key))
                 .unwrap_or_default(),
             output_format: read(RESULT_FORMAT)
                 .and_then(|key| OutputFormat::from_key(&key))
@@ -500,7 +481,7 @@ mod tests {
         let settings = Settings {
             cache_location: CacheLocation::Custom(OutputDir::new(directory.path())?),
             parallel_tracks: std::num::NonZeroUsize::MIN.saturating_add(3),
-            save_format: stem_split_media::SaveFormat::Mp3,
+            save_format: stem_split_core::media_fetching::SaveFormat::Mp3,
             output_format: stem_split_core::domain::OutputFormat::Mp3,
             source: Source::Url,
             url_folder: Some(OutputDir::new(directory.path())?),
@@ -525,7 +506,7 @@ mod tests {
         settings.save(&mut storage);
 
         assert_eq!(Settings::load(&storage), settings);
-        for &source in stem_split_media::SaveFormat::ALL {
+        for &source in stem_split_core::media_fetching::SaveFormat::ALL {
             for &result in OutputFormat::ALL {
                 let mut choices = settings.clone();
                 choices.save_format = source;
@@ -538,7 +519,7 @@ mod tests {
         storage.set_string(RESULT_FORMAT, "unsupported".to_owned());
         assert_eq!(
             Settings::load(&storage).save_format,
-            stem_split_media::SaveFormat::Original
+            stem_split_core::media_fetching::SaveFormat::Original
         );
         assert_eq!(Settings::load(&storage).output_format, OutputFormat::Wav);
         Ok(())

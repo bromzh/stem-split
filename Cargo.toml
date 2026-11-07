@@ -1,18 +1,23 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/app", "crates/media"]
+members = ["crates/audio", "crates/inference", "crates/separation", "crates/enhancement", "crates/media-fetching", "crates/core", "crates/app"]
 # Standalone experiments with their own dependencies and lock files.
 exclude = ["spikes"]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
+stem-split-audio = { path = "crates/audio" }
+stem-split-inference = { path = "crates/inference" }
+stem-split-separation = { path = "crates/separation" }
+stem-split-enhancement = { path = "crates/enhancement" }
+
 stem-split-core = { path = "crates/core" }
-stem-split-media = { path = "crates/media" }
+stem-split-media-fetching = { path = "crates/media-fetching" }
 yt-dlp = { version = "2.10", default-features = false, features = ["rustls", "cache-memory"] }
 tokio = { version = "1", default-features = false, features = ["rt", "time", "process", "io-util", "macros"] }
 url = "2"
@@ -36,7 +41,7 @@ log = "0.4"
 # Still a release candidate, so the version is pinned exactly. ONNX Runtime is
 # downloaded at build time and linked statically; `copy-dylibs` places the
 # DirectML library next to the binaries. The `directml` feature is added for
-# Windows in crates/core/Cargo.toml.
+# Windows in crates/inference/Cargo.toml.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "api-27",
     "copy-dylibs",
@@ -45,7 +50,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "tls-rustls",
 ] }
 # Not used from code. Depending on it directly makes Cargo run its build
-# script, which downloads DirectML.dll, before the build script of the core
+# script, which downloads DirectML.dll, before the build script of inference
 # crate, which copies that file next to test and example binaries.
 open = "5"
 ort-sys = { version = "=2.0.0-rc.13", default-features = false }

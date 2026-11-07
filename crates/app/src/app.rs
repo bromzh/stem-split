@@ -315,7 +315,7 @@ impl StemSplitApp {
             tools.start(
                 store.directory().to_path_buf(),
                 crate::tools::Operation::Scan,
-                ui.ctx(),
+                &crate::wake(ui.ctx()),
             );
         }
         let action = view::settings(ui, self.locale, &form, &tools, self.downloads.as_ref());
@@ -337,7 +337,7 @@ impl StemSplitApp {
                     tools.start(
                         store.directory().to_path_buf(),
                         crate::tools::Operation::Manage(tool, action),
-                        ui.ctx(),
+                        &crate::wake(ui.ctx()),
                     );
                 }
             }
@@ -346,7 +346,7 @@ impl StemSplitApp {
                     tools.start(
                         store.directory().to_path_buf(),
                         crate::tools::Operation::OpenFolder,
-                        ui.ctx(),
+                        &crate::wake(ui.ctx()),
                     );
                 }
             }
@@ -472,7 +472,7 @@ impl StemSplitApp {
                 }
                 form.cancel_preview();
                 if let Some(downloads) = &mut self.downloads {
-                    downloads.clear(context);
+                    downloads.clear(&crate::wake(context));
                 }
             }
             EditingAction::Start(mode) => {
@@ -563,7 +563,7 @@ impl StemSplitApp {
 
 fn source_done(
     mut form: Form,
-    input: Vec<stem_split_media::DownloadedAudio>,
+    input: Vec<stem_split_core::media_fetching::DownloadedAudio>,
     results: Results,
 ) -> Screen {
     form.set_downloads(input, Vec::new());
@@ -620,7 +620,7 @@ fn prepare_url(mut form: Form, action: UrlAction, context: &egui::Context) -> Sc
         folder,
         form.save_format(),
         action,
-        context.clone(),
+        crate::wake(context),
         form.cache_location().clone(),
     ) {
         Ok(worker) => Screen::Running(Box::new(Run {
@@ -697,7 +697,7 @@ fn launch(form: Form, batch: Batch, context: &egui::Context) -> Screen {
     if form.source() == Source::Url {
         tracker.name_sources(form.download_sources());
     }
-    match Worker::start(batch, context.clone(), form.cache_location().clone()) {
+    match Worker::start(batch, crate::wake(context), form.cache_location().clone()) {
         Ok(worker) => Screen::Running(Box::new(Run {
             form,
             worker,
@@ -831,7 +831,7 @@ mod tests {
     fn every_url_start_reviews_a_large_playlist_before_starting_a_worker()
     -> Result<(), Box<dyn Error>> {
         use crate::{playlist::Panel, preview::State};
-        use stem_split_media::{MediaInfo, MediaItem, MediaUrl};
+        use stem_split_core::media_fetching::{MediaInfo, MediaItem, MediaUrl};
         let directory = tempfile::tempdir()?;
         let context = egui::Context::default();
         for action in [

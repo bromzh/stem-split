@@ -4321,7 +4321,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stem-split"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "directories",
  "eframe",
@@ -4329,45 +4329,93 @@ dependencies = [
  "open",
  "rfd",
  "stem-split-core",
- "stem-split-media",
  "sys-locale",
  "tempfile",
- "thiserror 2.0.21",
  "winresource",
 ]
 
 [[package]]
-name = "stem-split-core"
-version = "2.0.0"
+name = "stem-split-audio"
+version = "2.0.1"
 dependencies = [
- "directories",
- "hex-literal",
  "hound",
  "log",
- "ort",
- "ort-sys",
- "realfft",
  "rubato",
- "sha2",
  "symphonia",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "yt-dlp",
+]
+
+[[package]]
+name = "stem-split-core"
+version = "2.0.1"
+dependencies = [
+ "directories",
+ "log",
+ "open",
+ "sha2",
+ "stem-split-audio",
+ "stem-split-enhancement",
+ "stem-split-inference",
+ "stem-split-media-fetching",
+ "stem-split-separation",
  "tempfile",
  "thiserror 2.0.21",
  "ureq",
 ]
 
 [[package]]
-name = "stem-split-media"
-version = "2.0.0"
+name = "stem-split-enhancement"
+version = "2.0.1"
+dependencies = [
+ "hex-literal",
+ "realfft",
+ "stem-split-audio",
+ "stem-split-inference",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "stem-split-inference"
+version = "2.0.1"
+dependencies = [
+ "log",
+ "ort",
+ "ort-sys",
+ "realfft",
+ "stem-split-audio",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "stem-split-media-fetching"
+version = "2.0.1"
 dependencies = [
  "log",
  "serde",
  "serde_json",
- "stem-split-core",
+ "stem-split-audio",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "url",
  "yt-dlp",
+]
+
+[[package]]
+name = "stem-split-separation"
+version = "2.0.1"
+dependencies = [
+ "hex-literal",
+ "realfft",
+ "stem-split-audio",
+ "stem-split-inference",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

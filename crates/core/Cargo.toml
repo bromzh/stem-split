@@ -1,31 +1,32 @@
 [package]
 name = "stem-split-core"
-description = "Audio stem separation pipeline; no GUI dependencies."
+description = "Headless job orchestration, model cache and background services."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+stem-split-audio = { workspace = true, features = ["ffmpeg"] }
+stem-split-inference.workspace = true
+stem-split-separation.workspace = true
+stem-split-enhancement.workspace = true
+stem-split-media-fetching.workspace = true
 directories.workspace = true
-hex-literal.workspace = true
-hound.workspace = true
-log.workspace = true
-ort.workspace = true
-realfft.workspace = true
-rubato.workspace = true
 sha2.workspace = true
-symphonia.workspace = true
 thiserror.workspace = true
-tempfile.workspace = true
 ureq.workspace = true
+log.workspace = true
+open.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-ort = { workspace = true, features = ["directml"] }
-ort-sys.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+stem-split-audio = { workspace = true, features = ["test-support"] }
+stem-split-separation = { workspace = true, features = ["test-support"] }
+stem-split-enhancement = { workspace = true, features = ["test-support"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-ort = { workspace = true, features = ["coreml"] }
+[features]
+test-support = []
 
 [lints]
 workspace = true
