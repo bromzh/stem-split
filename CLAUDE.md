@@ -6,7 +6,7 @@ Before working on code, read:
 
 - [docs/GUIDELINES.md](docs/GUIDELINES.md): mandatory coding rules;
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): structure, types, algorithm, and design decisions;
-- [docs/PLAN.md](docs/PLAN.md): staged plan, current status, and completed-stage results.
+- [CHANGELOG.md](CHANGELOG.md): dated feature history and major milestones.
 
 ## Strict rules
 
@@ -55,4 +55,4 @@ Comparison against the Python implementation of Demucs was explicitly excluded f
 
 ## Documentation
 
-Update `docs/ARCHITECTURE.md` in the same change whenever decisions, structure, or dependencies change. When completing a stage, mark it complete in `docs/PLAN.md` and record its results there.
+Update `docs/ARCHITECTURE.md` in the same change whenever decisions, structure, or dependencies change. Record significant features and milestones in `CHANGELOG.md`, with their implementation dates.

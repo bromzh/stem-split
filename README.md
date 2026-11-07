@@ -2,7 +2,7 @@
 
 A simple desktop application for splitting audio into stems: vocals, drums, bass, and other instruments. Written in Rust with an egui interface. Neural-network inference runs locally; audio files are not uploaded.
 
-> **Status:** the original plan is complete. The application packages as a Windows ZIP and an Apple Silicon macOS DMG. See [docs/PLAN.md](docs/PLAN.md) for progress and validation results.
+> **Status:** the application packages as a Windows ZIP and an Apple Silicon macOS DMG. See [CHANGELOG.md](CHANGELOG.md) for dated features and major milestones.
 
 ## Features
 
@@ -118,7 +118,7 @@ Pushing a `v<version>` tag also runs both platform builds in GitHub Actions. Aft
 
 ## Development
 
-Bump the version once per local set of changes, then keep it until that set has been committed and successfully pushed. Further local tasks and commits without a push do not cause another bump. After pushing the previous set, features increment the minor version and reset the patch version; fixes increment the patch version. The workspace version lives in the root `Cargo.toml` and is synchronized with `Cargo.lock`. Documentation-only changes do not bump it. The current local version is 1.2.0.
+Bump the version once per local set of changes, then keep it until that set has been committed and successfully pushed. Further local tasks and commits without a push do not cause another bump. After pushing the previous set, features increment the minor version and reset the patch version; fixes increment the patch version. The workspace version lives in the root `Cargo.toml` and is synchronized with `Cargo.lock`. Documentation-only changes do not bump it.
 
 Before committing, all checks must pass without warnings:
 
@@ -138,21 +138,9 @@ See [docs/GUIDELINES.md](docs/GUIDELINES.md). The essential rules are:
 
 These rules are enforced by lints in [Cargo.toml](Cargo.toml).
 
-## Plan
+## Changelog
 
-The detailed plan and acceptance criteria are in [docs/PLAN.md](docs/PLAN.md).
-
-0. Validate HTDemucs ONNX inference through `ort` and DirectML on the target machine. **Complete.**
-1. Workspace skeleton, two initial crates, and domain types. **Complete.**
-2. Audio decoding, resampling, and WAV output. **Complete.**
-3. Model registry, downloads, and cache. **Complete.**
-4. Complete separation pipeline with progress and cancellation. **Complete.**
-5. Interface. **Complete.**
-6. Polish and release packaging. **Complete.**
-7. Mix selected stems. **Complete.**
-8. Reverb HQ artifact cleanup. **Complete.**
-9. Second cleanup network and target checkboxes. **Complete.**
-10. Preview URL metadata and download recordings or playlists through yt-dlp. **Implemented locally in 1.2.0.**
+See [CHANGELOG.md](CHANGELOG.md) for the feature history and major milestones, with dates from Git.
 
 ## Licenses
 

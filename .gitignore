@@ -3,3 +3,6 @@
 /models
 /spikes/*/target
 .DS_Store
+
+# Local implementation notes; public milestones live in CHANGELOG.md.
+/docs/PLAN.md

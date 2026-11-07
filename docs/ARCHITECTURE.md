@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the application. Dependency versions and the state of third-party projects were checked on 2026-10-12. Model selection and DirectML configuration were confirmed by stage 0 measurements; see [PLAN.md](PLAN.md).
+This document describes the application. Dependency versions and the state of third-party projects were checked on 2026-10-12. Model selection and DirectML configuration were confirmed by stage 0 measurements, summarized in sections 8 and 11. Dated feature milestones are recorded in [CHANGELOG.md](../CHANGELOG.md).
 
 ## 1. Purpose and scope
 
