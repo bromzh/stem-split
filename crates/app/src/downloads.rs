@@ -66,6 +66,16 @@ impl Downloads {
         }
     }
 
+    pub(crate) fn unmeasured(store: ModelStore) -> Self {
+        Self {
+            store,
+            state: State::Idle {
+                usage: None,
+                problem: None,
+            },
+        }
+    }
+
     pub(crate) const fn store(&self) -> &ModelStore {
         &self.store
     }

@@ -155,6 +155,20 @@ impl Batch {
         self.first.output_format()
     }
 
+    /// Overrides concurrency and shares CPU threads among the actual jobs.
+    #[must_use]
+    pub fn with_parallel_jobs(mut self, limit: NonZeroUsize) -> Self {
+        self.parallel = limit.min(self.count());
+        let threads = CpuThreads::share(self.parallel);
+        self.first = self.first.with_cpu_threads(threads);
+        self.rest = self
+            .rest
+            .into_iter()
+            .map(|request| request.with_cpu_threads(threads))
+            .collect();
+        self
+    }
+
     /// How many jobs run at the same time.
     #[must_use]
     pub const fn parallel_jobs(&self) -> NonZeroUsize {
@@ -265,6 +279,40 @@ mod tests {
         }
         for request in several.requests() {
             assert_eq!(request.cpu_threads(), CpuThreads::share(PARALLEL_JOBS));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_concurrency_is_capped_by_track_count_and_updates_cpu_shares()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let inputs = InputFiles::new([
+            audio(directory.path(), "a.mp3")?,
+            audio(directory.path(), "b.mp3")?,
+            audio(directory.path(), "c.mp3")?,
+        ])
+        .ok_or("no inputs")?;
+        for limit in [1, 3, 8] {
+            let limit = NonZeroUsize::new(limit).ok_or("zero limit")?;
+            for enhancer in crate::domain::EnhancerId::ALL {
+                let configured = Batch::new(
+                    &inputs,
+                    &OutputChoice::BesideInput,
+                    ModelId::Htdemucs,
+                    DevicePreference::Auto,
+                    OverwritePolicy::Refuse,
+                    OutputKind::Stems {
+                        cleanup: Some(*enhancer),
+                    },
+                )?
+                .with_parallel_jobs(limit);
+                let expected = limit.min(inputs.count());
+                assert_eq!(configured.parallel_jobs(), expected);
+                for request in configured.requests() {
+                    assert_eq!(request.cpu_threads(), CpuThreads::share(expected));
+                }
+            }
         }
         Ok(())
     }

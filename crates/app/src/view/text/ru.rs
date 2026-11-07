@@ -15,6 +15,24 @@ use crate::{downloads::DownloadsProblem, worker::Failure};
 
 pub(super) const fn text(text: Text) -> &'static str {
     match text {
+        Text::CacheFolder => "Папка моделей и кэша",
+        Text::CacheFolderHint => {
+            "Новые загрузки сохраняются сюда. Существующие файлы остаются в прежней папке."
+        }
+        Text::DefaultCache => "Папка по умолчанию",
+        Text::Settings => "Настройки",
+        Text::ParallelTracks => "Параллельные треки",
+        Text::ParallelTracksHint => {
+            "Больше треков требуют больше оперативной и видеопамяти. Применяется к разделению и очистке."
+        }
+        Text::MediaTools => "Инструменты загрузки",
+        Text::ToolsHint => "Инструменты также загружаются автоматически при необходимости.",
+        Text::ToolInstalled => "Установлен",
+        Text::ToolMissing => "Не установлен",
+        Text::ToolUpdate => "Обновить",
+        Text::ToolBusy => "Выполняется операция…",
+        Text::ToolFailed => "Не удалось выполнить операцию в настройках",
+        Text::ToolUnavailable => "Кэш загрузок недоступен",
         Text::WindowTitle => "stem-split",
         Text::FileTab => "Файлы",
         Text::UrlTab => "Ссылка",
@@ -514,6 +532,13 @@ fn inference_error(error: &InferenceError) -> Message {
         | InferenceError::Stft(_) => {
             Message::with_detail("Модель дала сбой при разделении файла.", error)
         }
+    }
+}
+
+pub(super) const fn tool_name(tool: stem_split_media::Tool) -> &'static str {
+    match tool {
+        stem_split_media::Tool::Downloader => "yt-dlp",
+        stem_split_media::Tool::Ffmpeg => "FFmpeg",
     }
 }
 

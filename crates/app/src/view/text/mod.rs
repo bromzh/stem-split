@@ -82,6 +82,20 @@ closed_enum! {
     /// A user-visible string without parameters.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Text {
+        CacheFolder,
+        CacheFolderHint,
+        DefaultCache,
+        Settings,
+        ParallelTracks,
+        ParallelTracksHint,
+        MediaTools,
+        ToolsHint,
+        ToolInstalled,
+        ToolMissing,
+        ToolUpdate,
+        ToolBusy,
+        ToolFailed,
+        ToolUnavailable,
         WindowTitle,
         FileTab,
         UrlTab,
@@ -499,6 +513,13 @@ pub(crate) fn failure(locale: Locale, failure: &Failure) -> Message {
     match locale {
         Locale::En => en::failure(failure),
         Locale::Ru => ru::failure(failure),
+    }
+}
+
+pub(crate) const fn tool_name(locale: Locale, tool: stem_split_media::Tool) -> &'static str {
+    match locale {
+        Locale::En => en::tool_name(tool),
+        Locale::Ru => ru::tool_name(tool),
     }
 }
 

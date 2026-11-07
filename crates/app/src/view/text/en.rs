@@ -15,6 +15,24 @@ use crate::{downloads::DownloadsProblem, worker::Failure};
 
 pub(super) const fn text(text: Text) -> &'static str {
     match text {
+        Text::CacheFolder => "Models and cache folder",
+        Text::CacheFolderHint => {
+            "New downloads use this folder. Existing files remain in the previous folder."
+        }
+        Text::DefaultCache => "Use default folder",
+        Text::Settings => "Settings",
+        Text::ParallelTracks => "Parallel tracks",
+        Text::ParallelTracksHint => {
+            "More tracks require more RAM and GPU memory. Applies to separation and cleanup."
+        }
+        Text::MediaTools => "Download tools",
+        Text::ToolsHint => "Tools are also downloaded automatically when needed.",
+        Text::ToolInstalled => "Installed",
+        Text::ToolMissing => "Not installed",
+        Text::ToolUpdate => "Update",
+        Text::ToolBusy => "Working…",
+        Text::ToolFailed => "Could not complete the settings operation",
+        Text::ToolUnavailable => "The download cache is unavailable",
         Text::WindowTitle => "stem-split",
         Text::FileTab => "Files",
         Text::UrlTab => "URL",
@@ -491,5 +509,12 @@ fn inference_error(error: &InferenceError) -> Message {
         | InferenceError::Stft(_) => {
             Message::with_detail("The model failed while splitting the file.", error)
         }
+    }
+}
+
+pub(super) const fn tool_name(tool: stem_split_media::Tool) -> &'static str {
+    match tool {
+        stem_split_media::Tool::Downloader => "yt-dlp",
+        stem_split_media::Tool::Ffmpeg => "FFmpeg",
     }
 }

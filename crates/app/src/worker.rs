@@ -105,6 +105,7 @@ impl Worker {
         format: stem_split_media::SaveFormat,
         action: UrlAction,
         repaint: egui::Context,
+        cache: crate::settings::CacheLocation,
     ) -> io::Result<Self> {
         let (sender, messages) = mpsc::channel();
         let cancel = CancelToken::new();
@@ -118,7 +119,7 @@ impl Worker {
                     }
                     repaint.request_repaint();
                 };
-                match ModelStore::in_user_cache() {
+                match cache.store() {
                     Ok(store) => {
                         let result = stem_split_media::download(
                             &info,
@@ -181,7 +182,11 @@ impl Worker {
 
     /// Starts `batch`. `repaint` is asked to redraw the window whenever
     /// there is news, since an idle window does not redraw.
-    pub(crate) fn start(batch: Batch, repaint: egui::Context) -> io::Result<Self> {
+    pub(crate) fn start(
+        batch: Batch,
+        repaint: egui::Context,
+        cache: crate::settings::CacheLocation,
+    ) -> io::Result<Self> {
         let (sender, messages) = mpsc::channel();
         let cancel = CancelToken::new();
         let token = cancel.clone();
@@ -203,7 +208,7 @@ impl Worker {
                         report(Event::Expected(index, runs));
                     }
                 }
-                match ModelStore::in_user_cache() {
+                match cache.store() {
                     Ok(store) => run_encoded_batch(&batch, &store, &report, &token),
                     Err(error) => report(Event::FetchFailed(Failure::Job(error.into()))),
                 }
@@ -491,6 +496,37 @@ mod tests {
             .collect();
         indices.sort_unstable();
         indices
+    }
+
+    #[test]
+    fn batch_worker_uses_the_configured_cache_without_default_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let cache_path = directory.path().join("cache");
+        fs::create_dir(&cache_path)?;
+        let location = crate::settings::CacheLocation::Custom(OutputDir::new(&cache_path)?);
+        // Simulate a cache becoming unavailable after it was selected.
+        fs::remove_dir(&cache_path)?;
+        fs::write(&cache_path, b"not a directory")?;
+        let worker = Worker::start(
+            batch_of(directory.path(), 1)?,
+            egui::Context::default(),
+            location,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !worker.thread.is_finished() {
+            if Instant::now() >= deadline {
+                worker.cancel();
+                return Err("worker did not finish".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let polled = worker.poll();
+        assert_eq!(polled.channel, Channel::Ended);
+        assert!(polled.events.iter().any(|event| matches!(event,
+            Event::FetchFailed(Failure::Job(JobError::Model(stem_split_core::model::ModelStoreError::CreateDirectory { path, .. }))) if path == &cache_path)));
+        worker.stop(Duration::from_secs(1));
+        Ok(())
     }
 
     #[test]

@@ -73,6 +73,7 @@ const MIN_LIST_HEIGHT: f32 = 60.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EditingAction {
+    Settings,
     SeparationPanel(SeparationPanel),
     PlaylistPanel(crate::playlist::Panel),
     PlaylistItem(usize),
@@ -1021,7 +1022,19 @@ fn editing_contents(
         }
         action = ui
             .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                language_menu(ui, locale)
+                let language = language_menu(ui, locale);
+                let button = ui.add_enabled(
+                    !downloads.is_some_and(Downloads::is_clearing),
+                    egui::Button::new(egui::RichText::new("\u{2699}").size(GLOBE_SIZE).weak())
+                        .frame(false),
+                );
+                let button = name_picture(button, Text::Settings.get(locale))
+                    .on_hover_text(Text::Settings.get(locale));
+                if button.clicked() {
+                    Some(EditingAction::Settings)
+                } else {
+                    language
+                }
             })
             .inner
             .or(action.take());
@@ -1477,6 +1490,165 @@ pub(crate) fn failed(
     action
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsAction {
+    Back,
+    OpenCache,
+    PickCache,
+    DefaultCache,
+    Parallel(std::num::NonZeroUsize),
+    Tool(stem_split_media::Tool, stem_split_media::tools::Action),
+    Cancel,
+}
+
+pub(crate) fn settings(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    form: &Form,
+    tools: &crate::tools::Tools,
+    downloads: Option<&Downloads>,
+) -> Option<SettingsAction> {
+    use stem_split_media::{Tool, tools::Action};
+    let mut action = None;
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading(Text::Settings.get(locale));
+        ui.add_space(SECTION_SPACING);
+        ui.horizontal(|ui| {
+            ui.label(Text::ParallelTracks.get(locale));
+            let mut tracks = form.parallel_tracks().get();
+            if ui
+                .add(egui::DragValue::new(&mut tracks).range(1..=8))
+                .changed()
+                && let Some(tracks) = std::num::NonZeroUsize::new(tracks)
+            {
+                action = Some(SettingsAction::Parallel(tracks));
+            }
+        });
+        ui.weak(Text::ParallelTracksHint.get(locale));
+        ui.add_space(SECTION_SPACING);
+        ui.separator();
+        ui.heading(Text::MediaTools.get(locale));
+        ui.weak(Text::ToolsHint.get(locale));
+        ui.add_space(ROW_SPACING);
+        let available =
+            downloads.is_some_and(|downloads| !downloads.is_clearing()) && !tools.busy();
+        for &tool in Tool::ALL {
+            ui.push_id(tool.name(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(text::tool_name(locale, tool));
+                    let installed = tools
+                        .installed()
+                        .is_some_and(|installed| installed.contains(tool));
+                    let status = if installed {
+                        Text::ToolInstalled
+                    } else {
+                        Text::ToolMissing
+                    };
+                    ui.weak(status.get(locale));
+                    ui.add_enabled_ui(available && tools.installed().is_some(), |ui| {
+                        if installed {
+                            if ui.button(Text::ToolUpdate.get(locale)).clicked() {
+                                action = Some(SettingsAction::Tool(tool, Action::Update));
+                            }
+                            if ui.button(Text::Delete.get(locale)).clicked() {
+                                action = Some(SettingsAction::Tool(tool, Action::Remove));
+                            }
+                        } else if ui.button(Text::Download.get(locale)).clicked() {
+                            action = Some(SettingsAction::Tool(tool, Action::Install));
+                        }
+                    });
+                });
+            });
+        }
+        action = cache_controls(
+            ui,
+            locale,
+            form.cache_location(),
+            downloads,
+            if tools.busy() || form.preview_busy() {
+                CacheAccess::Busy
+            } else {
+                CacheAccess::Available
+            },
+        )
+        .or(action);
+        if tools.busy() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(Text::ToolBusy.get(locale));
+                if ui.button(Text::Cancel.get(locale)).clicked() {
+                    action = Some(SettingsAction::Cancel);
+                }
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(problem) = tools.problem() {
+            ui.colored_label(ui.visuals().error_fg_color, Text::ToolFailed.get(locale));
+            ui.weak(problem.to_string());
+        }
+        ui.add_space(SECTION_SPACING);
+        if ui
+            .add_enabled(!tools.busy(), egui::Button::new(Text::Back.get(locale)))
+            .clicked()
+        {
+            action = Some(SettingsAction::Back);
+        }
+    });
+    action
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheAccess {
+    Available,
+    Busy,
+}
+
+fn cache_controls(
+    ui: &mut egui::Ui,
+    locale: Locale,
+    location: &crate::settings::CacheLocation,
+    downloads: Option<&Downloads>,
+    access: CacheAccess,
+) -> Option<SettingsAction> {
+    let mut action = None;
+    ui.add_space(SECTION_SPACING);
+    ui.separator();
+    ui.heading(Text::CacheFolder.get(locale));
+    if let Some(downloads) = downloads {
+        show_folder(ui, downloads.directory());
+    } else {
+        ui.weak(Text::ToolUnavailable.get(locale));
+    }
+    ui.weak(Text::CacheFolderHint.get(locale));
+    ui.add_enabled_ui(access == CacheAccess::Available, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    downloads.is_some(),
+                    egui::Button::new(Text::OpenFolder.get(locale)),
+                )
+                .clicked()
+            {
+                action = Some(SettingsAction::OpenCache);
+            }
+            if ui.button(Text::Browse.get(locale)).clicked() {
+                action = Some(SettingsAction::PickCache);
+            }
+            if ui
+                .add_enabled(
+                    matches!(location, crate::settings::CacheLocation::Custom(_)),
+                    egui::Button::new(Text::DefaultCache.get(locale)),
+                )
+                .clicked()
+            {
+                action = Some(SettingsAction::DefaultCache);
+            }
+        });
+    });
+    action
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -1484,6 +1656,65 @@ mod tests {
     use stem_split_core::separate::ActiveDevice;
 
     use super::*;
+
+    #[test]
+    fn settings_controls_fit_in_both_languages() -> Result<(), io::Error> {
+        for &locale in Locale::ALL {
+            let context = egui::Context::default();
+            for _ in 0..3 {
+                let output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(640.0, 540.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            settings(
+                                ui,
+                                locale,
+                                &Form::default(),
+                                &crate::tools::Tools::default(),
+                                None,
+                            );
+                        });
+                    },
+                );
+                for label in [
+                    Text::Settings,
+                    Text::ParallelTracks,
+                    Text::ParallelTracksHint,
+                    Text::MediaTools,
+                    Text::CacheFolder,
+                    Text::Back,
+                ] {
+                    let visible = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text)
+                                if text.galley.job.text == label.get(locale) =>
+                            {
+                                Some((
+                                    shape.clip_rect,
+                                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| io::Error::other("settings control missing"))?;
+                    assert!(
+                        visible.0.expand(0.5).contains_rect(visible.1),
+                        "{locale:?}: {label:?} is clipped"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn playlist_side_panel_adds_width_without_height() -> Result<(), io::Error> {

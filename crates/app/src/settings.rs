@@ -1,11 +1,17 @@
 //! Choices remembered between launches.
 
+use std::num::NonZeroUsize;
+
 use stem_split_core::{
     domain::{EnhancerId, ModelId, OutputChoice, OutputDir, OutputFormat, Stem, StemSet},
     separate::DevicePreference,
 };
 
 use crate::{form::Source, view::text::Locale};
+
+const CACHE_FOLDER: &str = "cache_folder";
+
+const PARALLEL_TRACKS: &str = "parallel_tracks";
 
 const SAVE_FORMAT: &str = "save_format";
 const RESULT_FORMAT: &str = "result_format";
@@ -105,11 +111,34 @@ impl CleanupChoice {
     }
 }
 
+/// The shared location for models, tools and temporary media files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum CacheLocation {
+    #[default]
+    UserCache,
+    Custom(OutputDir),
+}
+
+impl CacheLocation {
+    pub(crate) fn store(
+        &self,
+    ) -> Result<stem_split_core::model::ModelStore, stem_split_core::model::ModelStoreError> {
+        match self {
+            Self::UserCache => stem_split_core::model::ModelStore::in_user_cache(),
+            Self::Custom(directory) => {
+                Ok(stem_split_core::model::ModelStore::new(directory.path()))
+            }
+        }
+    }
+}
+
 /// What the application remembers: the language and how to split, but not
 /// which file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub(crate) locale: Locale,
+    pub(crate) cache_location: CacheLocation,
+    pub(crate) parallel_tracks: NonZeroUsize,
     pub(crate) save_format: stem_split_media::SaveFormat,
     pub(crate) output_format: OutputFormat,
     pub(crate) model: ModelId,
@@ -173,6 +202,8 @@ impl Settings {
     pub(crate) fn initial() -> Self {
         Self {
             locale: Locale::of_system(),
+            cache_location: CacheLocation::UserCache,
+            parallel_tracks: stem_split_core::batch::PARALLEL_JOBS,
             save_format: stem_split_media::SaveFormat::Original,
             output_format: OutputFormat::Wav,
             model: ModelId::default(),
@@ -197,6 +228,13 @@ impl Settings {
         let read = |key| storage.get_string(key);
         let legacy = read(SOURCE_TAB).is_none();
         Self {
+            cache_location: read(CACHE_FOLDER)
+                .and_then(|path| OutputDir::new(path).ok())
+                .map_or(CacheLocation::UserCache, CacheLocation::Custom),
+            parallel_tracks: read(PARALLEL_TRACKS)
+                .and_then(|value| value.parse::<NonZeroUsize>().ok())
+                .filter(|value| value.get() <= 8)
+                .unwrap_or(initial.parallel_tracks),
             save_format: read(SAVE_FORMAT)
                 .and_then(|key| stem_split_media::SaveFormat::from_key(&key))
                 .unwrap_or_default(),
@@ -265,6 +303,17 @@ impl Settings {
     }
 
     pub(crate) fn save(&self, storage: &mut dyn eframe::Storage) {
+        match &self.cache_location {
+            CacheLocation::UserCache => storage.remove_string(CACHE_FOLDER),
+            CacheLocation::Custom(directory) => {
+                if let Some(path) = directory.path().to_str() {
+                    storage.set_string(CACHE_FOLDER, path.to_owned());
+                } else {
+                    storage.remove_string(CACHE_FOLDER);
+                }
+            }
+        }
+        storage.set_string(PARALLEL_TRACKS, self.parallel_tracks.to_string());
         storage.set_string(SAVE_FORMAT, self.save_format.key().to_owned());
         storage.set_string(RESULT_FORMAT, self.output_format.extension().to_owned());
         storage.set_string(SEPARATION_PANEL, self.separation_panel.key().to_owned());
@@ -396,9 +445,61 @@ mod tests {
     }
 
     #[test]
+    fn cache_folder_roundtrips_resets_and_rejects_missing_directories() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let custom = directory.path().join("cache");
+        std::fs::create_dir(&custom)?;
+        let mut settings = Settings::initial();
+        settings.cache_location = CacheLocation::Custom(OutputDir::new(&custom)?);
+        let mut storage = MemoryStorage::default();
+        settings.save(&mut storage);
+        let loaded = Settings::load(&storage);
+        assert_eq!(loaded.cache_location, settings.cache_location);
+        assert_eq!(loaded.cache_location.store()?.directory(), custom);
+        settings.cache_location = CacheLocation::UserCache;
+        settings.save(&mut storage);
+        assert!(storage.get_string(CACHE_FOLDER).is_none());
+        assert_eq!(
+            Settings::load(&storage).cache_location,
+            CacheLocation::UserCache
+        );
+        storage.set_string(CACHE_FOLDER, custom.display().to_string());
+        std::fs::remove_dir(&custom)?;
+        assert_eq!(
+            Settings::load(&storage).cache_location,
+            CacheLocation::UserCache
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_tracks_reject_invalid_saved_values() -> Result<(), std::io::Error> {
+        for value in ["0", "-1", "9", "invalid", "999999999999999999999999"] {
+            let storage = storage_with(&[(PARALLEL_TRACKS, value)]);
+            assert_eq!(
+                Settings::load(&storage).parallel_tracks,
+                stem_split_core::batch::PARALLEL_JOBS
+            );
+        }
+        for value in ["1", "8"] {
+            let storage = storage_with(&[(PARALLEL_TRACKS, value)]);
+            assert_eq!(
+                Settings::load(&storage).parallel_tracks,
+                value
+                    .parse::<NonZeroUsize>()
+                    .map_err(std::io::Error::other)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn saved_settings_are_read_back() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let settings = Settings {
+            cache_location: CacheLocation::Custom(OutputDir::new(directory.path())?),
+            parallel_tracks: std::num::NonZeroUsize::MIN.saturating_add(3),
             save_format: stem_split_media::SaveFormat::Mp3,
             output_format: stem_split_core::domain::OutputFormat::Mp3,
             source: Source::Url,

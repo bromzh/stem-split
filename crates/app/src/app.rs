@@ -55,6 +55,10 @@ struct Finished {
 #[derive(Debug)]
 enum Screen {
     Editing(Form),
+    Settings {
+        form: Form,
+        tools: crate::tools::Tools,
+    },
     /// Results of an earlier run are in the way.
     Confirming {
         form: Form,
@@ -89,7 +93,10 @@ impl Screen {
     /// The user's choices, which every screen carries along.
     const fn form(&self) -> &Form {
         match self {
-            Self::Editing(form) | Self::Confirming { form, .. } | Self::Failed { form, .. } => form,
+            Self::Settings { form, .. }
+            | Self::Editing(form)
+            | Self::Confirming { form, .. }
+            | Self::Failed { form, .. } => form,
             Self::Running(run) => &run.form,
             Self::Done(finished) => &finished.form,
         }
@@ -97,7 +104,10 @@ impl Screen {
 
     const fn form_mut(&mut self) -> &mut Form {
         match self {
-            Self::Editing(form) | Self::Confirming { form, .. } | Self::Failed { form, .. } => form,
+            Self::Settings { form, .. }
+            | Self::Editing(form)
+            | Self::Confirming { form, .. }
+            | Self::Failed { form, .. } => form,
             Self::Running(run) => &mut run.form,
             Self::Done(finished) => &mut finished.form,
         }
@@ -108,7 +118,7 @@ impl Screen {
             Self::Editing(_) | Self::Confirming { .. } | Self::Done(_) | Self::Failed { .. } => {
                 Drop::Accepted
             }
-            Self::Running(_) => Drop::Ignored,
+            Self::Running(_) | Self::Settings { .. } => Drop::Ignored,
         }
     }
 
@@ -119,6 +129,7 @@ impl Screen {
             Self::Editing(form) | Self::Confirming { form, .. } | Self::Failed { form, .. } => form,
             Self::Done(finished) => finished.form,
             Self::Running(run) => return Self::Running(run),
+            Self::Settings { form, tools } => return Self::Settings { form, tools },
         };
         form.set_inputs(paths);
         Self::Editing(form)
@@ -149,7 +160,7 @@ impl StemSplitApp {
     /// `inputs` are files to start with, as when the application is
     /// launched by opening files with it.
     pub(crate) fn new(settings: &Settings, inputs: &[PathBuf]) -> Self {
-        let downloads = match ModelStore::in_user_cache() {
+        let downloads = match settings.cache_location.store() {
             Ok(store) => Some(Downloads::new(store)),
             Err(error) => {
                 log::warn!("the model cache is not available: {error}");
@@ -221,6 +232,7 @@ impl StemSplitApp {
     fn step(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, screen: Screen) -> Screen {
         let locale = self.locale;
         match screen {
+            Screen::Settings { form, tools } => self.show_settings(ui, frame, form, tools),
             Screen::Editing(mut form) => {
                 form.poll_preview(ui.ctx(), !self.clearing());
                 if let Some(usage) = form.take_preview_usage()
@@ -262,6 +274,114 @@ impl StemSplitApp {
         }
     }
 
+    fn change_cache(
+        &mut self,
+        form: &mut Form,
+        tools: &mut crate::tools::Tools,
+        location: crate::settings::CacheLocation,
+    ) {
+        self.downloads = match location.store() {
+            Ok(store) => Some(Downloads::unmeasured(store)),
+            Err(error) => {
+                log::warn!("cache unavailable: {error}");
+                None
+            }
+        };
+        form.set_cache_location(location);
+        form.refresh_download(self.store());
+        *tools = crate::tools::Tools::default();
+    }
+
+    fn show_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        mut form: Form,
+        mut tools: crate::tools::Tools,
+    ) -> Screen {
+        form.poll_preview(ui.ctx(), false);
+        if let Some(usage) = form.take_preview_usage()
+            && let Some(downloads) = &mut self.downloads
+        {
+            downloads.record_usage(usage);
+        }
+        tools.poll();
+        if !form.preview_busy()
+            && tools.installed().is_none()
+            && !tools.busy()
+            && tools.problem().is_none()
+            && let Some(store) = self.store()
+        {
+            tools.start(
+                store.directory().to_path_buf(),
+                crate::tools::Operation::Scan,
+                ui.ctx(),
+            );
+        }
+        let action = view::settings(ui, self.locale, &form, &tools, self.downloads.as_ref());
+        match action {
+            Some(view::SettingsAction::Back) if !tools.busy() => {
+                if let Some(usage) = tools.usage()
+                    && let Some(downloads) = &mut self.downloads
+                {
+                    downloads.record_usage(usage);
+                }
+                self.window_sizing = WindowSizing::Opening;
+                return Screen::Editing(form);
+            }
+            Some(view::SettingsAction::Parallel(tracks)) => {
+                form.set_parallel_tracks(tracks);
+            }
+            Some(view::SettingsAction::Tool(tool, action)) if !self.clearing() => {
+                if let Some(store) = self.store() {
+                    tools.start(
+                        store.directory().to_path_buf(),
+                        crate::tools::Operation::Manage(tool, action),
+                        ui.ctx(),
+                    );
+                }
+            }
+            Some(view::SettingsAction::OpenCache) if !tools.busy() => {
+                if let Some(store) = self.store() {
+                    tools.start(
+                        store.directory().to_path_buf(),
+                        crate::tools::Operation::OpenFolder,
+                        ui.ctx(),
+                    );
+                }
+            }
+            Some(view::SettingsAction::PickCache) if !tools.busy() && !form.preview_busy() => {
+                if let Some(path) = dialogs::pick_folder(frame) {
+                    match stem_split_core::domain::OutputDir::new(path) {
+                        Ok(directory) => self.change_cache(
+                            &mut form,
+                            &mut tools,
+                            crate::settings::CacheLocation::Custom(directory),
+                        ),
+                        Err(error) => log::warn!("invalid cache folder: {error}"),
+                    }
+                }
+            }
+            Some(view::SettingsAction::DefaultCache) if !tools.busy() && !form.preview_busy() => {
+                self.change_cache(
+                    &mut form,
+                    &mut tools,
+                    crate::settings::CacheLocation::UserCache,
+                );
+            }
+            Some(view::SettingsAction::Cancel) => tools.cancel(),
+            Some(
+                view::SettingsAction::Back
+                | view::SettingsAction::Tool(_, _)
+                | view::SettingsAction::OpenCache
+                | view::SettingsAction::PickCache
+                | view::SettingsAction::DefaultCache,
+            )
+            | None => {}
+        }
+        Screen::Settings { form, tools }
+    }
+
     /// Applies something the user did on the main form.
     fn edit(
         &mut self,
@@ -271,6 +391,14 @@ impl StemSplitApp {
         frame: &eframe::Frame,
     ) -> Screen {
         match action {
+            EditingAction::Settings => {
+                if self.clearing() {
+                    return Screen::Editing(form);
+                }
+                form.cancel_preview();
+                let tools = crate::tools::Tools::default();
+                return Screen::Settings { form, tools };
+            }
             EditingAction::PlaylistPanel(panel) => {
                 form.set_playlist_panel(panel);
                 self.window_sizing = WindowSizing::PlaylistPanel;
@@ -487,7 +615,14 @@ fn prepare_url(mut form: Form, action: UrlAction, context: &egui::Context) -> Sc
     }
     form.cancel_preview();
     let tracker = Tracker::for_url(form.model(), &url, folder.path(), Instant::now());
-    match Worker::start_url(url, folder, form.save_format(), action, context.clone()) {
+    match Worker::start_url(
+        url,
+        folder,
+        form.save_format(),
+        action,
+        context.clone(),
+        form.cache_location().clone(),
+    ) {
         Ok(worker) => Screen::Running(Box::new(Run {
             form,
             worker,
@@ -562,7 +697,7 @@ fn launch(form: Form, batch: Batch, context: &egui::Context) -> Screen {
     if form.source() == Source::Url {
         tracker.name_sources(form.download_sources());
     }
-    match Worker::start(batch, context.clone()) {
+    match Worker::start(batch, context.clone(), form.cache_location().clone()) {
         Ok(worker) => Screen::Running(Box::new(Run {
             form,
             worker,
@@ -598,6 +733,12 @@ fn dragging(context: &egui::Context) -> Dragging {
 
 impl eframe::App for StemSplitApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let error_color = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(195, 116, 116)
+        } else {
+            egui::Color32::from_rgb(161, 77, 77)
+        };
+        ui.visuals_mut().error_fg_color = error_color;
         if let Some(downloads) = &mut self.downloads {
             match downloads.poll() {
                 // The model chosen on the form may have gone with the rest.
@@ -632,6 +773,7 @@ impl eframe::App for StemSplitApp {
         match mem::take(&mut self.screen) {
             // Give the jobs the chance to remove their unfinished files.
             Screen::Running(run) => run.worker.stop(EXIT_PATIENCE),
+            Screen::Settings { mut tools, .. } => tools.stop(EXIT_PATIENCE),
             Screen::Editing(_)
             | Screen::Confirming { .. }
             | Screen::Done(_)
@@ -647,6 +789,43 @@ mod tests {
     use stem_split_core::domain::InputFile;
 
     use super::*;
+
+    #[test]
+    fn switching_cache_updates_the_form_and_preserves_previous_files() -> Result<(), Box<dyn Error>>
+    {
+        use crate::settings::CacheLocation;
+        use stem_split_core::domain::OutputDir;
+        let directory = tempfile::tempdir()?;
+        let previous = directory.path().join("previous");
+        let next = directory.path().join("next");
+        fs::create_dir(&previous)?;
+        fs::create_dir(&next)?;
+        let previous_file = previous.join("model.onnx");
+        fs::write(&previous_file, b"model")?;
+        let mut settings = Settings::initial();
+        settings.cache_location = CacheLocation::Custom(OutputDir::new(&previous)?);
+        let mut application = StemSplitApp::new(&settings, &[]);
+        assert_eq!(
+            application.store().map(ModelStore::directory),
+            Some(previous.as_path())
+        );
+        let mut form = Form::with(&settings);
+        let mut tools = crate::tools::Tools::default();
+        application.change_cache(
+            &mut form,
+            &mut tools,
+            CacheLocation::Custom(OutputDir::new(&next)?),
+        );
+        assert_eq!(
+            application.store().map(ModelStore::directory),
+            Some(next.as_path())
+        );
+        assert_eq!(form.cache_location().store()?.directory(), next);
+        assert_eq!(fs::read(previous_file)?, b"model");
+        assert!(fs::read_dir(&next)?.next().is_none());
+        assert!(!tools.busy());
+        Ok(())
+    }
 
     #[test]
     fn every_url_start_reviews_a_large_playlist_before_starting_a_worker()

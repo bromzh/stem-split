@@ -111,6 +111,7 @@ crates/
       worker.rs               # Batch threads and event channel
       preview.rs              # Debounced metadata requests and cancellation
       playlist.rs             # Transient entry selection and panel state
+      tools.rs                # Background media-tool management for Settings
       tracker.rs              # File states, clocks, and estimates
       downloads.rs            # Cache size, location, and background deletion
       view/                   # Screens; text contains strings and locales
@@ -145,7 +146,7 @@ The core's `build.rs` copies `DirectML.dll` beside test and example executables;
  JobEnd / JobError <-------------------  completion
 ```
 
-A multi-file run is a `core::batch::Batch`: one job per file sharing the model, device, and output settings. Its leading thread downloads the model once, then starts two file jobs at a time, each on its own thread. The next starts as soon as a slot becomes free. Events share one channel and include the file's index.
+A multi-file run is a `core::batch::Batch`: one job per file sharing the model, device, and output settings. Its leading thread downloads the model once, then starts the configured number of file jobs at a time (two by default), each on its own thread. The next starts as soon as a slot becomes free. Events share one channel and include the file's index.
 
 ## 7. Types and invariants
 
@@ -328,7 +329,7 @@ The graph's dynamic `batch` dimension need not be fixed; graph fusion is disable
 
 A single CPU job receives all logical cores, about 10% faster than default on the target machine. For two concurrent jobs, `CpuThreads::share` splits them in half. Throughput remains similar, 79–81 seconds for two tracks versus 97 seconds sequentially, without oversubscribing the machine.
 
-`batch::PARALLEL_JOBS` is 2. Target-machine measurements for a 106-second `htdemucs_6s` track:
+`batch::PARALLEL_JOBS` supplies the default of 2; Settings can override it for each new batch. Target-machine measurements for a 106-second `htdemucs_6s` track:
 
 | Concurrent files | GPU | CPU |
 |---|---|---|
@@ -339,7 +340,7 @@ A single CPU job receives all logical cores, about 10% faster than default on th
 
 The GPU benefits because one job can read files, load graphs, or compute STFT on the CPU while another waits for the GPU. Three files barely improve on two and leave less VRAM for larger models.
 
-Cleanup batches now use two jobs through `batch::PARALLEL_JOBS_WITH_CLEANUP = PARALLEL_JOBS`, as explicitly requested by the owner. The earlier serial policy was based on historical measurements: cleanup sessions occupy 2.3–3.6 GB. For two 5:50 tracks with both stem and mix cleanup, Reverb HQ took 620 s concurrently versus 154 s sequentially and used 5.9 GB VRAM. The vocal network took 120 s concurrently versus 142 s sequentially.
+Cleanup batches default to two jobs through `batch::PARALLEL_JOBS_WITH_CLEANUP = PARALLEL_JOBS`; the saved parallel-track choice overrides this default too. The earlier serial policy was based on historical measurements: cleanup sessions occupy 2.3–3.6 GB. For two 5:50 tracks with both stem and mix cleanup, Reverb HQ took 620 s concurrently versus 154 s sequentially and used 5.9 GB VRAM. The vocal network took 120 s concurrently versus 142 s sequentially.
 
 ## 12. Threads, progress, and cancellation
 
@@ -353,7 +354,7 @@ Cleanup batches now use two jobs through `batch::PARALLEL_JOBS_WITH_CLEANUP = PA
 - Closing the window requests cancellation and waits up to ten seconds for partial-file cleanup. Jobs react within one model run. A stalled download may take longer, in which case the worker is left behind.
 - `catch_unwind` converts a dependency panic in a file job to `Failure::Crashed`; the rest of the batch continues.
 - Cancellation stops running jobs and prevents waiting ones from starting; completed files remain.
-- Workers open their own model store. `app::downloads` has a UI-side store for immediate metadata checks at startup, after jobs, and after deletion, rather than every frame.
+- Workers open their own model store from the saved `CacheLocation`, shared with metadata inspection and source downloads. `app::downloads` has a UI-side store for immediate metadata checks at startup, after jobs, and after deletion, rather than every frame.
 - Cache deletion runs on its own thread and reports through a channel. Missing completion is treated as a crash and shown as an error.
 - Core warnings and dependency panic reports go to stderr and `%LOCALAPPDATA%\stem-split\data\stem-split.log`, recreated each launch. Release builds have no console, so the file is their only log output.
 - Failure to create a window is reported through a native message box.
@@ -365,6 +366,7 @@ One window uses a screen state machine:
 ```rust
 enum Screen {
     Editing(Form),
+    Settings { form: Form, tools: Tools },
     Confirming { form: Form, existing: Vec<PathBuf> },
     Running(Box<Run>), // Form, workers, file tracking, and cancellation state.
     Done(Finished),   // Form, per-file results, and total time.
@@ -379,6 +381,20 @@ Each screen owns only its valid data: no progress bar without work, no Split but
 - Split requires selected local files or a valid URL and destination. Existing results trigger a combined overwrite-confirmation screen.
 - Files may be supplied as command-line arguments.
 - Combo boxes have accessible names associated with their labels.
+
+### Settings / local 1.3.0
+
+A gear button beside the language selector opens a dedicated settings page while retaining the form and playlist choices. The page scrolls on small windows. It shows cached yt-dlp/FFmpeg installation status and offers Download, Update, and Delete separately for each tool. The cache path and automatic first-use installation behavior remain visible. Errors use muted red foregrounds in both light and dark themes.
+
+`app::tools::Tools` owns one cancellable worker at a time, with typed errors, a completion channel and a joined thread. Status scanning, cache usage measurement, installation, updates and deletion run off the UI thread. Opening Settings cancels metadata inspection and waits asynchronously for its worker to finish before scanning or enabling tool actions. While tool management runs, navigation back and other tool actions are disabled; cancellation and bounded shutdown remain available. The settings page cannot overlap batch execution or cache deletion. Returning transfers the worker's measured cache usage to the main form without filesystem I/O.
+
+`media::Tool` is an iterable closed enum. `media::tools::manage` shares executable paths and installation logic with automatic downloads. Updates stage a fresh binary privately before replacing the installed file; failure or cancellation leaves the previous binary intact. Deletion targets only the chosen executable and tolerates an already missing file. No model files are removed. The app now uses the existing workspace `thiserror` dependency for typed tool-worker errors.
+
+The settings page also opens the shared models/cache folder, chooses an existing folder through the native picker, and restores the platform default. `CacheLocation::{UserCache, Custom(OutputDir)}` is stored with the form settings and passed explicitly to metadata, media-download and batch workers. There is no process-wide environment override. Choosing a folder immediately refreshes model availability; tool presence and total usage are then scanned off the UI thread. Opening a not-yet-created default folder creates it on the worker before launching the file manager. Switching folders never copies, moves or deletes existing cached files or prepared inputs; their RAII owners retain their original paths. A saved custom folder that is no longer valid falls back to the platform default on startup.
+
+The installed `yt-dlp` Rust crate 2.10.0 does not offer release-tag/version selection: `LibraryInstaller` accepts custom repositories and executable names but both yt-dlp and FFmpeg fetchers resolve the latest release. `Option<String>` in the installer is a filename override, not a version. Explicit version selection would require a separate release-resolution/download implementation; it is not exposed in Settings through this dependency.
+
+Parallel track count is saved as a positive integer, with a UI/persistence range of 1-8 and default 2. Missing, zero, out-of-range or malformed saved values fall back to 2. `Batch::with_parallel_jobs` caps concurrency by the actual track count and recalculates every request's CPU thread share. It applies equally to local and downloaded tracks, separation and cleanup. The UI explains the extra RAM/VRAM cost; URL downloads remain sequential.
 
 ### URL audio / local 1.2.0
 
@@ -578,7 +594,7 @@ The verified ad-hoc signature does not provide Developer ID or notarization. Gat
 
 ### Versions and publication
 
-The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. Current local URL/UI work is version 1.2.0.
+The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. Current local settings/UI work is version 1.3.0.
 
 `rust-toolchain.toml` pins Rust 1.96.1 with rustfmt and Clippy. `.github/workflows/release.yml` runs version checks, formatting, Clippy, and tests for a `v<version>` tag on `windows-2022` and ARM64 `macos-15`, then packages with `--locked`. Both builds must succeed before uploading to an existing release or creating one. Manual dispatch also requires a tag. DMG format and ad-hoc signing are retained.
 

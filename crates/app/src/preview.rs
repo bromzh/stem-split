@@ -7,10 +7,7 @@ use std::{
 };
 
 use eframe::egui;
-use stem_split_core::{
-    CancelToken,
-    model::{ModelStore, Usage},
-};
+use stem_split_core::{CancelToken, model::Usage};
 use stem_split_media::{Inspected, MediaInfo, MediaUrl};
 
 use crate::worker::Failure;
@@ -82,7 +79,13 @@ impl Preview {
         }
     }
 
-    pub(crate) fn poll(&mut self, context: &egui::Context, enabled: bool, now: Instant) {
+    pub(crate) fn poll(
+        &mut self,
+        context: &egui::Context,
+        enabled: bool,
+        now: Instant,
+        cache: &crate::settings::CacheLocation,
+    ) {
         if !enabled {
             self.cancel();
         }
@@ -109,7 +112,7 @@ impl Preview {
             let remaining = DEBOUNCE.saturating_sub(now.saturating_duration_since(*changed));
             if remaining.is_zero() {
                 let url = url.clone();
-                self.state = match Request::start(url.clone(), context.clone()) {
+                self.state = match Request::start(url.clone(), context.clone(), cache.clone()) {
                     Ok(request) => {
                         self.request = Some(request);
                         State::Loading(url)
@@ -161,7 +164,11 @@ impl Drop for Preview {
 }
 
 impl Request {
-    fn start(url: MediaUrl, context: egui::Context) -> std::io::Result<Self> {
+    fn start(
+        url: MediaUrl,
+        context: egui::Context,
+        cache: crate::settings::CacheLocation,
+    ) -> std::io::Result<Self> {
         let (sender, result) = mpsc::channel();
         let cancel = CancelToken::new();
         let token = cancel.clone();
@@ -169,7 +176,7 @@ impl Request {
         let thread = thread::Builder::new()
             .name("URL metadata".to_owned())
             .spawn(move || {
-                let result = match ModelStore::in_user_cache() {
+                let result = match cache.store() {
                     Ok(store) => {
                         let result = stem_split_media::inspect(&source, store.directory(), &token)
                             .map_err(Failure::Media);
@@ -209,13 +216,23 @@ mod tests {
         let context = egui::Context::default();
         let original = MediaUrl::new("https://example.org/first")?;
         preview.change(original.as_str(), now);
-        preview.poll(&context, true, now + Duration::from_millis(499));
+        preview.poll(
+            &context,
+            true,
+            now + Duration::from_millis(499),
+            &crate::settings::CacheLocation::UserCache,
+        );
         assert!(preview.request.is_none());
         preview.change(
             "https://example.org/second",
             now + Duration::from_millis(499),
         );
-        preview.poll(&context, true, now + Duration::from_millis(501));
+        preview.poll(
+            &context,
+            true,
+            now + Duration::from_millis(501),
+            &crate::settings::CacheLocation::UserCache,
+        );
         assert!(preview.request.is_none());
         assert!(
             matches!(&preview.state, State::Pending { url, .. } if url.as_str().ends_with("second"))

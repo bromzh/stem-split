@@ -86,6 +86,8 @@ pub(crate) enum Problem {
 /// was and is remembered in `problem` to be shown.
 #[derive(Debug)]
 pub(crate) struct Form {
+    cache_location: crate::settings::CacheLocation,
+    parallel_tracks: std::num::NonZeroUsize,
     source: Source,
     save_format: stem_split_media::SaveFormat,
     output_format: stem_split_core::domain::OutputFormat,
@@ -120,6 +122,8 @@ impl Form {
     /// A form with no file chosen and the remembered choices filled in.
     pub(crate) fn with(settings: &Settings) -> Self {
         Self {
+            cache_location: settings.cache_location.clone(),
+            parallel_tracks: settings.parallel_tracks,
             source: settings.source,
             save_format: settings.save_format,
             output_format: settings.output_format,
@@ -146,6 +150,8 @@ impl Form {
     pub(crate) fn settings(&self, locale: Locale) -> Settings {
         Settings {
             locale,
+            cache_location: self.cache_location.clone(),
+            parallel_tracks: self.parallel_tracks,
             save_format: self.save_format,
             output_format: self.output_format,
             model: self.model,
@@ -157,6 +163,22 @@ impl Form {
             mix: self.mix,
             cleanup: self.cleanup,
         }
+    }
+
+    pub(crate) const fn cache_location(&self) -> &crate::settings::CacheLocation {
+        &self.cache_location
+    }
+
+    pub(crate) fn set_cache_location(&mut self, location: crate::settings::CacheLocation) {
+        self.cache_location = location;
+    }
+
+    pub(crate) const fn parallel_tracks(&self) -> std::num::NonZeroUsize {
+        self.parallel_tracks
+    }
+
+    pub(crate) const fn set_parallel_tracks(&mut self, tracks: std::num::NonZeroUsize) {
+        self.parallel_tracks = tracks;
     }
 
     /// The ticked stems the current model has.
@@ -245,6 +267,7 @@ impl Form {
             context,
             enabled && self.source == Source::Url,
             std::time::Instant::now(),
+            &self.cache_location,
         );
         self.sync_playlist();
     }
@@ -606,7 +629,11 @@ impl Form {
                 overwrite,
                 self.output_kind(mode)?,
             )
-            .map(|batch| batch.with_output_format(self.output_format)),
+            .map(|batch| {
+                batch
+                    .with_output_format(self.output_format)
+                    .with_parallel_jobs(self.parallel_tracks)
+            }),
         )
     }
 
@@ -805,6 +832,8 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let settings = Settings {
+            cache_location: crate::settings::CacheLocation::UserCache,
+            parallel_tracks: std::num::NonZeroUsize::MIN.saturating_add(3),
             save_format: stem_split_media::SaveFormat::Mp3,
             output_format: stem_split_core::domain::OutputFormat::Mp3,
             source: Source::Files,

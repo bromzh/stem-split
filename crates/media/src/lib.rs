@@ -8,6 +8,7 @@ mod encoding;
 mod metadata;
 pub use encoding::{FfmpegEncoder, SaveFormat};
 mod process;
+pub mod tools;
 
 pub use metadata::{Inspected, MediaInfo, MediaItem, inspect};
 
@@ -402,14 +403,18 @@ fn safe_title(title: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Tool {
-    Downloader,
-    Ffmpeg,
+stem_split_core::closed_enum! {
+    /// Executables used for URL metadata, downloads and audio encoding.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Tool {
+        Downloader,
+        Ffmpeg,
+    }
 }
 
 impl Tool {
-    const fn name(self) -> &'static str {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Downloader => "yt-dlp",
             Self::Ffmpeg => "ffmpeg",
@@ -433,6 +438,24 @@ async fn install(
     if path.is_file() {
         return Ok(Some(path));
     }
+    match install_fresh(cache, tool, report, cancel).await {
+        Err(error) if path.is_file() => {
+            // A cancelled preview can publish the same tool while a download starts.
+            log::info!("using a concurrently installed media tool after: {error}");
+            Ok(Some(path))
+        }
+        outcome => outcome,
+    }
+}
+
+async fn install_fresh(
+    cache: &Path,
+    tool: Tool,
+    report: &impl Fn(Progress),
+    cancel: &CancelToken,
+) -> Result<Option<PathBuf>, DownloadError> {
+    fs::create_dir_all(cache)?;
+    let path = tools::path(cache, tool);
     if cancel.is_cancelled() {
         return Ok(None);
     }
@@ -457,13 +480,10 @@ async fn install(
             _ = tick.tick() => if cancel.is_cancelled() { return Ok(None); },
         }
     };
-    if let Err(error) = fs::rename(binary, &path) {
-        // A cancelled preview may finish installation while a download starts.
-        // Both install into private staging directories; accept a published tool.
-        if !path.is_file() {
-            return Err(error.into());
-        }
+    if cancel.is_cancelled() {
+        return Ok(None);
     }
+    fs::rename(binary, &path)?;
     Ok(Some(path))
 }
 

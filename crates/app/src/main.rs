@@ -13,6 +13,7 @@ mod playlist;
 mod preview;
 mod settings;
 mod timing;
+mod tools;
 mod tracker;
 mod view;
 mod worker;

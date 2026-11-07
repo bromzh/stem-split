@@ -21,6 +21,7 @@ Core functionality is complete. The current local work extends URL input and pla
 | 10 | Separate media crate, URL inspection/downloads and playlist selection | Implemented locally |
 | 11 | Native audio downloads, per-item progress/errors, two-file splitting and compact playlist controls | Implemented locally |
 | 12 | Saved Original/WAV/MP3 audio and WAV/MP3 stems/mixes, persistent format selectors | Implemented locally |
+| 13 | Settings page, media-tool management, selectable shared cache folder, saved parallel-track limit and muted error colors | Complete locally |
 | Documentation | English project/release prose, retained Russian interface translations | Complete |
 
 ## Current URL and playlist workflow
@@ -35,9 +36,19 @@ Core functionality is complete. The current local work extends URL input and pla
 - Downloads offer Original/WAV/MP3 beside the destination Browse button. Original keeps the source codec/container; WAV uses float32 and MP3 uses 320 kbit/s. The inference input retains source quality independently of this choice. Unsupported inference formats use disposable WAV decoding files in a shared cache directory, retained by their input owners and cleaned off the UI thread.
 - Completed source files remain in the chosen destination after cancellation or failure. Partial files have RAII owners. Selected native files and prepared inputs can be reused while the URL, folder, selection and files still match.
 - A second selector beside Split/Split and mix chooses WAV or MP3 for both stems and mixes. Overwrite checks and output paths use the selected extension; encoding completes before atomic publication. Both format choices are saved with the UI settings.
-- Separation runs two files concurrently, including cleanup jobs, with CPU threads shared between jobs. Model downloads happen once before the batch. GPU failures still fall back to CPU.
+- Separation uses the saved parallel-track count (1-8, default 2), including cleanup jobs, with CPU threads shared between actual jobs. Model downloads happen once before the batch. GPU failures still fall back to CPU.
 - yt-dlp and FFmpeg executables use the model cache. Metadata requires only yt-dlp; FFmpeg is installed when an inference input needs decoding. Cache deletion is blocked while tools are active.
 - Persist language, model/device, stem/cleanup settings, active source tab, independent destination folders, window geometry and disclosure state. Do not persist URL text, selected files, playlist contents or checkboxes.
+
+## Settings and tool management
+
+- A gear beside the language selector opens Settings, retaining all input and playlist choices.
+- Both languages expose the parallel-track count, yt-dlp/FFmpeg status, per-tool Download/Update/Delete actions, cancellation, and Back navigation.
+- Open, choose and reset the shared models/cache folder in Settings. Persist the location and pass it to every metadata, source-download and inference worker. Opening creates a missing default directory off the UI thread; switching leaves existing cached files in place.
+- Checked the dependency source: `yt-dlp` 2.10.0 installs only the latest release. Its optional string controls the executable filename. Release-version selection is not supported by its installer and is therefore not offered through this wrapper.
+- Metadata work is cancelled and reaped asynchronously before tool management starts. Installation, updates, deletion and cache measurements run on a dedicated worker; batch starts and cache clearing cannot overlap this page.
+- Updates stage the replacement before publication, preserving existing binaries on error/cancellation. Removal leaves the other tool and model files untouched.
+- The saved concurrency applies to local and URL separation and cleanup, capped by track count. Invalid saved values fall back to two. Both themes use muted error foreground colors.
 
 ## Validation
 
@@ -62,7 +73,7 @@ Latest Windows regression checks cover:
 - two-job scheduling and shared CPU threads, including both cleanup networks;
 - format-key roundtrips/fallbacks, selected-extension overwrite checks, MP3 publication rollback on error/cancellation, visible format controls, and real cached-FFmpeg encoding/decoding.
 
-Network/GPU/model-dependent tests remain ignored by default. No real site download, live-window automation, model inference run or macOS build is included in the current minimal local checks. Latest local result: formatting, strict Clippy, build and 302 tests passed (100 app, 197 core, 5 media; 5 external-resource tests ignored). The cached-FFmpeg integration test was also run manually: generated MP3 and WAV files decoded successfully.
+Network/GPU/model-dependent tests remain ignored by default. No real site download, model inference run or macOS build is included in the current minimal local checks. The updated Windows executable launched, but live-window inspection failed twice with capture timeouts; headless egui rendering covers settings layout in both languages. Latest settings regression checks include saved concurrency bounds/roundtrip, CPU sharing with cleanup, tool deletion isolation, cancelled updates, background status refresh, cache-location persistence/reset/fallback, switching without moving files, batch-worker cache routing, and headless layout in both languages. Formatting, strict Clippy and 311 tests passed (106 app, 198 core, 7 media; 5 external-resource tests ignored); the Windows debug executable also builds. The cached-FFmpeg integration test was also run manually: generated MP3 and WAV files decoded successfully.
 
 ### Earlier acceptance evidence
 
