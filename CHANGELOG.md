@@ -2,13 +2,14 @@
 
 Major milestones and features, grouped by their implementation dates in Git (including branch history). Version headings identify development milestones; published releases are marked explicitly.
 
-## 2026-11-08 - 2.0.1: Crate separation (unreleased)
+## 2026-11-08 - 2.0.1: Crate separation and macOS packaging
 
 - Split the workspace into audio, inference, separation, enhancement, media-fetching, core and app crates.
 - Isolated ONNX Runtime sessions/providers behind a shared borrowed-tensor interface, retaining independent HTDemucs and MDX-Net algorithms and catalogs.
 - Moved FFmpeg installation/conversion/encoding to audio, with optional external-tool dependencies; renamed the URL crate to media-fetching and removed its dependency on core.
 - Moved workers, metadata preview, tool/cache operations, progress tracking and timing into headless core services. UI supplies repaint callbacks and retains dialogs, localization and settings persistence.
 - Preserved model identifiers, saved settings, cache filenames, headless example commands and release-package names.
+- Fixed macOS packaging after adding yt-dlp: build its transitive liblzma statically so the standalone app does not depend on Homebrew. Retained the check rejecting non-system dynamic libraries.
 
 ## 2026-11-08 - 2.0.0: Release milestone
 

@@ -12,6 +12,9 @@ cd "$root"
 target=aarch64-apple-darwin
 # MLProgram requires Core ML 5 (macOS 12); use the same minimum for the app.
 export MACOSX_DEPLOYMENT_TARGET=12.0
+# yt-dlp pulls in xz2/lzma-sys. Build its bundled liblzma rather than linking
+# Homebrew's dylib, which is unavailable on a clean user's machine.
+export LZMA_API_STATIC=1
 cargo build --locked --release -p stem-split --target "$target"
 package_id="$(cargo pkgid -p stem-split)"
 version="${package_id##*@}"

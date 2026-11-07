@@ -585,13 +585,13 @@ Windows 10's system `DirectML.dll` is version 1.0 and cannot initialize the prov
 
 On Apple Silicon, `bash tools/package-macos.sh` builds `dist/stem-split-<version>-macos-arm64.dmg` and its SHA-256 checksum using `--locked`, explicit `aarch64-apple-darwin`, and macOS 12 minimum. The image contains the app, an Applications link, license, and English README.
 
-The app contains one executable plus Info.plist/icon resources. ONNX Runtime is static. Packaging rejects any `otool -L` dependency outside `/System/Library/` and `/usr/lib/`. Models are downloaded to `~/Library/Caches/stem-split/models`; settings/logs live in `~/Library/Application Support/stem-split/`.
+The app contains one executable plus Info.plist/icon resources. ONNX Runtime is static. The packaging script exports `LZMA_API_STATIC=1` so `lzma-sys`, pulled in through yt-dlp and xz2, builds its bundled liblzma instead of using a Homebrew dylib discovered through pkg-config. Packaging rejects any `otool -L` dependency outside `/System/Library/` and `/usr/lib/`. Models are downloaded to `~/Library/Caches/stem-split/models`; settings/logs live in `~/Library/Application Support/stem-split/`.
 
 The verified ad-hoc signature does not provide Developer ID or notarization. Gatekeeper may block downloads; instructions allow this particular application in Security settings, with removing quarantine from the installed app as a fallback. They do not require disabling Gatekeeper globally. Intel/universal builds and clean macOS 12 testing remain outstanding.
 
 ### Versions and publication
 
-The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. The published release is 2.0.0; the current local refactoring version is 2.0.1.
+The shared workspace version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. The current workspace version is 2.0.1.
 
 `rust-toolchain.toml` pins Rust 1.96.1 with rustfmt and Clippy. `.github/workflows/release.yml` runs version checks, formatting, Clippy, and tests for a `v<version>` tag on `windows-2022` and ARM64 `macos-15`, then packages with `--locked`. Both builds must succeed before uploading to an existing release or creating one. Manual dispatch also requires a tag. DMG format and ad-hoc signing are retained.
 
