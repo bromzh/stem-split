@@ -594,7 +594,7 @@ The verified ad-hoc signature does not provide Developer ID or notarization. Gat
 
 ### Versions and publication
 
-The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. Current local settings/UI work is version 1.3.0.
+The shared app/core version comes from `[workspace.package].version` in root `Cargo.toml`, synchronized with `Cargo.lock`. Bump once per local batch, then retain that version until the batch is committed and successfully pushed. A local commit alone does not start a new cycle. The first change selects MINOR with PATCH reset for features, PATCH for fixes, and MINOR for both. Documentation-only changes do not bump. `AGENTS.md` records this policy. The current release version is 2.0.0.
 
 `rust-toolchain.toml` pins Rust 1.96.1 with rustfmt and Clippy. `.github/workflows/release.yml` runs version checks, formatting, Clippy, and tests for a `v<version>` tag on `windows-2022` and ARM64 `macos-15`, then packages with `--locked`. Both builds must succeed before uploading to an existing release or creating one. Manual dispatch also requires a tag. DMG format and ad-hoc signing are retained.
 

@@ -3,7 +3,8 @@ stem-split — macOS / Apple Silicon
 
 
 Requirements: Apple Silicon Mac (M1 or newer), macOS 12 or newer.
-This is not an Intel or universal build. Rust, Python and ffmpeg are not needed.
+This is not an Intel or universal build. Rust and Python are not needed.
+yt-dlp and FFmpeg install automatically for URL downloads/audio encoding.
 The application contains one executable with ONNX Runtime linked into it;
 only macOS system frameworks are loaded. Models are downloaded on first use.
 Audio is processed locally. CoreML can use the GPU and Neural Engine; if the
@@ -37,8 +38,12 @@ Then open the app again. If you installed it elsewhere, adjust this path.
 Do not disable Gatekeeper globally. Managed Macs may require administrator
 approval; these steps do not override your organization's security policy.
 
-Models: ~/Library/Caches/stem-split/models
+Default models/cache: ~/Library/Caches/stem-split/models
 Log: ~/Library/Application Support/stem-split/stem-split.log
-Use the app's folder button to locate downloaded models.
+Use the gear beside the language selector to manage yt-dlp/FFmpeg, choose or
+open the models/cache folder, and configure 1-8 parallel tracks (default: 2).
+The URL tab supports recordings and playlist selection. Choose Original/WAV/MP3
+for downloaded audio and WAV/MP3 for separated stems and selected-stem mixes.
 Code: MIT (see LICENSE.txt). Model weights have separate licensing terms;
-this application is intended for personal, non-commercial use.
+this application is intended for personal, non-commercial use. URL tools
+have their own licensing terms; the Rust yt-dlp dependency is GPL-3.0-only.

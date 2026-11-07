@@ -6,7 +6,7 @@ A simple desktop application for splitting audio into stems: vocals, drums, bass
 
 ## Features
 
-- Choose one or more MP3, FLAC, WAV, OGG, or M4A files using a dialog, drag and drop, or command-line arguments. Files are processed two at a time.
+- Choose one or more MP3, FLAC, WAV, OGG, or M4A files using a dialog, drag and drop, or command-line arguments. The saved parallel-track limit is 1-8, with a default of two.
 - On the URL tab, enter the HTTP(S) address of a recording or playlist. After 500 ms without edits, a loading indicator appears, followed by the title. For a playlist, the right-aligned Playlist toggle beside its title opens a panel with a checkbox for every entry. All entries are selected initially; All/None checkboxes select or clear the whole list. Playlist titles show the total track count, and the panel also shows how many are selected. The list scrolls within the current window height. For playlists with more than five entries, starting Download or Split first opens the selection panel; press the action again after reviewing it. Playlists with five or fewer entries start directly. Choose a destination folder to download the best available audio for each selected entry, then run the usual separation, mixing, and cleanup. Live streams are not supported. Every entry has its own progress bar and error result. Unavailable entries are skipped while the others continue, using the normal cancellation button. Choose Original, WAV, or MP3 beside the destination Browse button. Original keeps the source codec/container; WAV uses 32-bit float and MP3 uses 320 kbit/s. Temporary decoding inputs preserve source quality independently of the saved format.
 - Download saves the source audio files without separation. After returning to the form, you can split or mix them without downloading again, provided the URL and folder have not changed and all downloaded files still exist.
 - Download sits next to the URL clear button. Collapse the Separation and mix section to show only the source and destination controls. The section state is remembered, and the window adjusts to its size.
@@ -31,13 +31,13 @@ A simple desktop application for splitting audio into stems: vocals, drums, bass
 - View progress and elapsed time for each file and the whole batch, cancel processing, and see each file's outcome and duration.
 - Choose WAV or MP3 to the right of Split/Split and mix. Stems and mixes use the selected extension: 32-bit float WAV or 320 kbit/s MP3 at 44.1 kHz. Download and output format choices are remembered independently.
 - Use English or Russian. Language, model, device, active tab, each tab's destination folder, selected stems, and cleanup settings are remembered. Selected files and URL text are not saved between launches.
-- Open or clear the shared cache using the small buttons beside the model selector. yt-dlp and FFmpeg download on first URL use into the model directory and are cleared together with the models.
+- Open Settings with the gear beside the language selector to install/update/remove yt-dlp and FFmpeg, choose or open the models/cache folder, and configure parallel tracks. Tools also install automatically when needed. The small buttons beside the model selector open or clear the shared cache.
 
 Limits: mono or stereo audio, up to three hours. With M4A/AAC, results can start 20–50 ms later than the source in other applications because the decoder does not remove encoder delay.
 
-Models download on first use and remain cached: `htdemucs` is 169 MB, `htdemucs_6s` is 110 MB, and `htdemucs_ft` is 675 MB. Cleanup networks are about 67 MB each. Every model file is verified with SHA-256. The cache is `%LOCALAPPDATA%\stem-split\cache\models` on Windows and `~/Library/Caches/stem-split/models` on macOS.
+Models download on first use and remain cached: `htdemucs` is 169 MB, `htdemucs_6s` is 110 MB, and `htdemucs_ft` is 675 MB. Cleanup networks are about 67 MB each. Every model file is verified with SHA-256. The default cache is `%LOCALAPPDATA%\stem-split\cache\models` on Windows and `~/Library/Caches/stem-split/models` on macOS.
 
-Cleanup adds processing time: about 0.5 s for Reverb HQ or 0.25 s for vocal bleed on the GPU per 6–12 seconds of audio in each cleaned stem or mix; CPU processing takes 15–20 times longer. Batches, including cleanup, run two files at a time. These measurements are from Windows; cleanup has not been validated on macOS.
+Cleanup adds processing time: about 0.5 s for Reverb HQ or 0.25 s for vocal bleed on the GPU per 6–12 seconds of audio in each cleaned stem or mix; CPU processing takes 15–20 times longer. Batches, including cleanup, use the configured parallel-track limit. These measurements are from Windows; cleanup has not been validated on macOS.
 
 ## How it works
 
@@ -146,6 +146,6 @@ See [CHANGELOG.md](CHANGELOG.md) for the feature history and major milestones, w
 
 The project's own code is distributed under [MIT](LICENSE), which permits use, modification, and redistribution with few restrictions.
 
-The local 1.2.0 URL integration uses `yt-dlp` 2.10 under GPL-3.0-only. The MIT license of the project's own sources does not replace this dependency's license. Downloaded yt-dlp and FFmpeg binaries also have their own licensing terms.
+The URL integration uses `yt-dlp` 2.10 under GPL-3.0-only. The MIT license of the project's own sources does not replace this dependency's license. Downloaded yt-dlp and FFmpeg binaries also have their own licensing terms.
 
 Neural-network weights are not included in the repository. The application downloads them from the [ONNX export](https://huggingface.co/HRSadeghi/demucs-onnx) and [UVR model collection](https://huggingface.co/Politrees/UVR_resources), independently of the project's license. MDX-Net models are distributed with UVR, whose code is MIT, but no separate weight-license statement is available. Demucs code is MIT; its repository likewise has no separate statement for weights, and some third-party exports treat them as CC BY-NC 4.0 for non-commercial use. The application is therefore intended for personal, non-commercial use. The model weights, rather than the project's MIT license, impose that limitation.

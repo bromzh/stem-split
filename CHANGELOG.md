@@ -2,6 +2,16 @@
 
 Major milestones and features, grouped by their implementation dates in Git (including branch history). Version headings identify development milestones; published releases are marked explicitly.
 
+## 2026-11-08 - 2.0.0: Release milestone
+
+This release brings together the URL/audio-format and settings work recorded below for 1.2.0 and 1.3.0.
+
+- Download recordings or selected playlist entries, inspect metadata automatically, reuse downloaded audio and continue after individual failures.
+- Save original audio, WAV or MP3 downloads, and choose WAV/MP3 output for stems and mixes.
+- Manage yt-dlp/FFmpeg, choose the shared models/cache folder and configure 1-8 parallel tracks from the new settings page.
+- Retain English/Russian localization, compact playlist controls, saved choices, background cancellation and muted error colors.
+- Prepare Windows x64 ZIP and Apple Silicon macOS DMG packages through the tagged release workflow.
+
 ## 2026-11-08 — 1.3.0: Settings
 
 - Added a settings page, opened by a gear beside the language selector, with English and Russian translations.
